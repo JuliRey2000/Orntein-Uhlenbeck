@@ -39,7 +39,7 @@ CONTRATO (a implementar) ``analyze_pair(a, b, config, exec_a=None, exec_b=None)`
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 
 import pandas as pd
 from pydantic import BaseModel, Field
@@ -54,7 +54,7 @@ from mrlab.stats.cointegration import Direction, EGResult, EGStability
 from mrlab.stats.integration import IntegrationResult
 
 
-class PairStatus(str, Enum):
+class PairStatus(StrEnum):
     EVIDENCE = "evidencia"
     INSUFFICIENT_EVIDENCE = "evidencia_insuficiente"
     DOUBTFUL_ASSUMPTIONS = "supuestos_dudosos"

@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
-from enum import Enum
+from enum import StrEnum
 
 import pandas as pd
 from pydantic import BaseModel
@@ -46,7 +46,7 @@ SUSPICIOUS_JUMP = 0.50
 MIN_TRAIN_OBS = 500
 
 
-class Severity(str, Enum):
+class Severity(StrEnum):
     INFO = "info"
     WARNING = "advertencia"
     ERROR = "error"

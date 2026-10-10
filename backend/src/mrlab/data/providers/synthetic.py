@@ -35,14 +35,14 @@ CONTRATO (a implementar):
 from __future__ import annotations
 
 from datetime import date
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel
 
 from mrlab.domain.models import AssetInfo, PriceSeries
 
 
-class SyntheticScenario(str, Enum):
+class SyntheticScenario(StrEnum):
     COINTEGRATED = "cointegrado"
     COINTEGRATED_LOW_CORRELATION = "cointegrado_baja_correlacion"
     CORRELATED_NOT_COINTEGRATED = "correlado_no_cointegrado"

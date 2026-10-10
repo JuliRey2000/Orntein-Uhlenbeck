@@ -24,13 +24,13 @@ CONTRATO (a implementar):
 from __future__ import annotations
 
 from datetime import date
-from enum import Enum
+from enum import StrEnum
 
 import pandas as pd
 from pydantic import BaseModel
 
 
-class Direction(str, Enum):
+class Direction(StrEnum):
     A_ON_B = "a_sobre_b"  # A dependiente: A = α + β·B + residuo
     B_ON_A = "b_sobre_a"  # B dependiente: B = α + β·A + residuo
 

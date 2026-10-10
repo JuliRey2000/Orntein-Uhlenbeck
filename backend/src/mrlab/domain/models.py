@@ -12,13 +12,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from dataclasses import replace as dc_replace
 from datetime import date, datetime
-from enum import Enum
+from enum import StrEnum
 
 import pandas as pd
 from pydantic import BaseModel, ConfigDict
 
 
-class AssetClass(str, Enum):
+class AssetClass(StrEnum):
     EQUITY = "accion"
     ETF = "etf"
     INDEX = "indice"
@@ -32,7 +32,7 @@ class AssetClass(str, Enum):
 NON_EXECUTABLE_CLASSES = frozenset({AssetClass.INDEX, AssetClass.FUTURE})
 
 
-class PriceType(str, Enum):
+class PriceType(StrEnum):
     ADJUSTED_CLOSE = "cierre_ajustado"  # ajustado por splits y dividendos
     CLOSE = "cierre"
     SYNTHETIC = "sintetico"
@@ -45,23 +45,23 @@ PRICE_TYPE_LABELS = {
 }
 
 
-class DataOrigin(str, Enum):
+class DataOrigin(StrEnum):
     HISTORICAL = "HISTORICO"
     SYNTHETIC = "SINTETICO"
 
 
-class CalendarType(str, Enum):
+class CalendarType(StrEnum):
     EXCHANGE = "bolsa"  # dos activos de bolsa: intersección de días de negociación
     CRYPTO_7D = "cripto_7d"  # dos criptomonedas: calendario de 7 días
     MIXED = "mixto"  # cripto + bolsa: solo días de negociación de la bolsa
 
 
-class SpreadType(str, Enum):
+class SpreadType(StrEnum):
     LOG = "log"
     PRICE = "precio"
 
 
-class Segment(str, Enum):
+class Segment(StrEnum):
     TRAIN = "formacion"
     VALIDATION = "validacion"
     TEST = "prueba"

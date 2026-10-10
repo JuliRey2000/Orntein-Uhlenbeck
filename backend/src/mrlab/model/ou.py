@@ -36,7 +36,7 @@ CONTRATO (a implementar, salvo ``simulate_ou_exact`` que ya está hecho):
 from __future__ import annotations
 
 import math
-from enum import Enum
+from enum import StrEnum
 
 import numpy as np
 import pandas as pd
@@ -51,7 +51,7 @@ HALF_LIFE_MIN_WARN = 1.0
 MIN_OBS_OU = 30
 
 
-class OUStatus(str, Enum):
+class OUStatus(StrEnum):
     VALID = "valido"
     NON_STATIONARY = "no_estacionario"  # b ≥ 1
     NON_POSITIVE_B = "b_no_positivo"  # b ≤ 0

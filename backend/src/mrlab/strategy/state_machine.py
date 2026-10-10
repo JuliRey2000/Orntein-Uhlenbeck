@@ -22,12 +22,12 @@ CONTRATO (a implementar): funciones puras usadas por el motor.
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 
 from mrlab.strategy.params import StrategyParams
 
 
-class PositionState(str, Enum):
+class PositionState(StrEnum):
     FLAT = "SIN_POSICION"
     LONG = "LARGO_SPREAD"
     SHORT = "CORTO_SPREAD"
@@ -35,12 +35,12 @@ class PositionState(str, Enum):
     COOLDOWN = "ENFRIAMIENTO"
 
 
-class Side(str, Enum):
+class Side(StrEnum):
     LONG = "largo_spread"  # largo A, corto β·B (si β > 0)
     SHORT = "corto_spread"  # corto A, largo β·B (si β > 0)
 
 
-class ExitReason(str, Enum):
+class ExitReason(StrEnum):
     STOP_MONEY = "stop_monetario"
     STOP_Z = "stop_z"
     MAX_TIME = "tiempo_maximo"
