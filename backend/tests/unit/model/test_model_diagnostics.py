@@ -1,0 +1,152 @@
+"""Pruebas del diagnóstico del OU (6.2): residuos AR(1), ACF, Ljung–Box y estabilidad."""
+
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pandas as pd
+import pytest
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.tsa.stattools import acf
+
+from mrlab.domain.errors import ConfigError, DataError, ModelError
+from mrlab.model.diagnostics import ar1_residuals, residual_diagnostics, rolling_ou_stability
+from mrlab.model.ou import OUStatus, fit_ou, simulate_ou_exact
+
+
+def _series(values: np.ndarray) -> pd.Series:
+    idx = pd.bdate_range("2016-01-01", periods=len(values), name="date")
+    return pd.Series(values, index=idx, name="spread")
+
+
+def _ou_spread(n: int = 1000, seed: int = 21, lam: float = 0.1) -> pd.Series:
+    return _series(simulate_ou_exact(lam, 0.0, 0.01, 0.0, n - 1, 1, seed)[0])
+
+
+def _ar2_spread(n: int = 1000, seed: int = 5) -> pd.Series:
+    e = np.random.default_rng(seed).standard_normal(n) * 0.01
+    x = np.zeros(n)
+    for t in range(2, n):
+        x[t] = 0.5 * x[t - 1] + 0.3 * x[t - 2] + e[t]
+    return _series(x)
+
+
+def test_ar1_residuals_definition_and_index():
+    spread = _ou_spread(300)
+    fit = fit_ou(spread)
+    resid = ar1_residuals(spread, fit)
+    x = spread.to_numpy()
+
+    assert resid.name == "residuo_ar1"
+    assert resid.index.equals(spread.index[1:])  # fecha del valor X_{t+1}
+    np.testing.assert_allclose(resid.to_numpy(), x[1:] - fit.a - fit.b * x[:-1])
+    assert abs(resid.mean()) < 1e-12  # MCO con constante
+
+
+def test_ar1_residuals_exist_for_invalid_fit_with_coefficients():
+    e = np.random.default_rng(3).standard_normal(500)
+    x = np.zeros(500)
+    for t in range(1, 500):
+        x[t] = -0.5 * x[t - 1] + e[t]
+    spread = _series(x)
+    fit = fit_ou(spread)
+    assert fit.status == OUStatus.NON_POSITIVE_B
+    assert len(ar1_residuals(spread, fit)) == 499
+
+    insufficient = fit_ou(spread.iloc[:10])
+    with pytest.raises(ModelError):
+        ar1_residuals(spread.iloc[:10], insufficient)
+
+
+def test_true_ou_residuals_show_no_autocorrelation():
+    spread = _ou_spread(2000, seed=21)
+    diag = residual_diagnostics(spread, fit_ou(spread))
+    assert [lb.lag for lb in diag.ljung_box] == [10, 20]
+    assert all(lb.pvalue > 0.05 for lb in diag.ljung_box)
+    assert not diag.autocorrelation_detected
+    assert "No se detecta autocorrelación" in diag.message
+
+
+def test_ar2_spread_autocorrelation_is_detected_with_message():
+    spread = _ar2_spread()
+    fit = fit_ou(spread)
+    assert fit.valid  # el AR(1) "funciona" en apariencia…
+    diag = residual_diagnostics(spread, fit)
+    assert diag.autocorrelation_detected  # …pero deja dinámica sin explicar
+    assert diag.ljung_box[-1].pvalue < 0.05
+    assert "no captura toda la dinámica" in diag.message
+
+
+def test_acf_20_lags_band_and_ljung_box_match_statsmodels():
+    spread = _ou_spread(1000)
+    fit = fit_ou(spread)
+    diag = residual_diagnostics(spread, fit, nlags=20)
+    resid = ar1_residuals(spread, fit).to_numpy()
+
+    assert diag.nlags == 20 and len(diag.acf) == 20
+    np.testing.assert_allclose(diag.acf, acf(resid, nlags=20, fft=False)[1:])
+    assert diag.conf_band == pytest.approx(1.96 / math.sqrt(resid.size))
+    ref = acorr_ljungbox(resid, lags=[10, 20], model_df=1, return_df=True)
+    np.testing.assert_allclose([lb.statistic for lb in diag.ljung_box], ref["lb_stat"])
+    np.testing.assert_allclose([lb.pvalue for lb in diag.ljung_box], ref["lb_pvalue"])
+    assert diag.residual_mean == pytest.approx(resid.mean())
+    assert diag.residual_std == pytest.approx(resid.std(ddof=1))
+
+
+def test_residual_diagnostics_input_checks():
+    spread = _ou_spread(200)
+    fit = fit_ou(spread)
+    with pytest.raises(ConfigError):
+        residual_diagnostics(spread, fit, lb_lags=(1, 10))
+    with pytest.raises(DataError):  # 19 residuos no alcanzan para 20 rezagos
+        residual_diagnostics(spread.iloc[:20], fit)
+
+
+def test_rolling_ou_stability_windows_and_cv_lambda():
+    spread = _ou_spread(1000)
+    stab = rolling_ou_stability(spread, window=252, step=63)
+
+    starts = list(range(0, 1000 - 252 + 1, 63))
+    assert len(stab.windows) == len(starts) == 12
+    for w, s in zip(stab.windows, starts, strict=True):
+        assert w.start == spread.index[s].date()
+        assert w.end == spread.index[s + 251].date()
+        assert w.nobs == 252
+        ref = fit_ou(spread.iloc[s : s + 252])
+        assert w.valid == ref.valid
+        assert w.lam == ref.lam and w.half_life == ref.half_life
+
+    lams = np.array([w.lam for w in stab.windows if w.valid])
+    assert stab.n_invalid == sum(not w.valid for w in stab.windows)
+    assert stab.cv_lambda == pytest.approx(lams.std(ddof=1) / lams.mean())
+    assert "12 ventanas" in stab.message and "α y β fijos" in stab.message
+
+
+def test_rolling_ou_stability_counts_invalid_windows():
+    calm = simulate_ou_exact(0.1, 0.0, 0.01, 0.0, 499, 1, seed=6)[0]
+    e = np.random.default_rng(6).standard_normal(500) * 0.01
+    choppy = np.zeros(500)
+    for t in range(1, 500):
+        choppy[t] = -0.5 * choppy[t - 1] + e[t]
+    stab = rolling_ou_stability(_series(np.concatenate([calm, choppy])), window=252, step=63)
+
+    assert len(stab.windows) == 12
+    tail = [w for w, s in zip(stab.windows, range(0, 749, 63), strict=True) if s >= 500]
+    assert len(tail) == 4 and not any(w.valid for w in tail)
+    assert all(w.lam is None and w.half_life is None for w in tail)
+    assert stab.n_invalid == sum(not w.valid for w in stab.windows) >= 4
+    assert "no fue válido" in stab.message
+
+
+def test_rolling_ou_stability_with_too_few_windows():
+    short = rolling_ou_stability(_ou_spread(200), window=252, step=63)
+    assert short.windows == [] and short.cv_lambda is None and short.n_invalid == 0
+    assert "menos que una ventana" in short.message
+
+    single = rolling_ou_stability(_ou_spread(300), window=252, step=63)
+    assert len(single.windows) == 1 and single.cv_lambda is None
+    assert "menos de 2 ventanas" in single.message
+
+    with pytest.raises(DataError):
+        rolling_ou_stability(pd.Series(np.zeros(300)), window=252, step=63)

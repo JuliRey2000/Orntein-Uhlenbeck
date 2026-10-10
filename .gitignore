@@ -18,6 +18,8 @@ data/studies/*
 data/uploads/*
 !data/uploads/.gitkeep
 examples/output/
+# Datos reales descargados con make fetch-example: no se redistribuyen (decisión D9)
+examples/data/real/
 
 # Node
 node_modules/

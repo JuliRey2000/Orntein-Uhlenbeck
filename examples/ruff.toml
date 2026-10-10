@@ -1,0 +1,2 @@
+# Los ejemplos siguen las mismas reglas de estilo que el paquete (backend/pyproject.toml).
+extend = "../backend/pyproject.toml"

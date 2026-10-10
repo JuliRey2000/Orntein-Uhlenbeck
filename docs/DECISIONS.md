@@ -442,3 +442,125 @@ el responsable del proyecto.
 - **Justificación:** Docker funciona igual en los tres sistemas; los comandos
   directos son transparentes.
 - **Fecha:** 2026-10-10
+
+## Integración de la fase 1
+
+### A1 — Causas del estado y razones de descarte
+- **Decisión:** `causes` contiene TODAS las causas activas del estado principal,
+  ordenadas por la precedencia E6; si no hay ninguna, el estado es ✅ y lleva una
+  única causa con el p-value ajustado de Engle–Granger. La validez del OU no es
+  un estado: un OU no válido (b fuera de (0, 1)) bloquea la estrategia y aparece
+  en «¿Por qué se descartó?» sin cambiar el estado. Lo mismo para la vida media
+  fuera de [1, 126], b indistinguible de 1 (`near_unit_root`), el filtro de
+  correlación y «costes superan el PnL bruto» en validación. Un error de datos
+  durante los cálculos (p. ej. una serie constante en formación) da ⛔ con la
+  causa `CALCULO_NO_POSIBLE`.
+- **Alternativas:** convertir el OU no válido en un sexto estado; mostrar solo la
+  causa que decide el estado.
+- **Justificación:** la especificación fija exactamente cinco estados y pide
+  listar todas las causas; separar estado (evidencia estadística) y descartes
+  (aptitud para operar) es más claro para el alumno.
+- **Fecha:** 2026-10-10
+
+### A2 — Proxy ejecutable: alineación por intersección
+- **Decisión:** con `exec_a`/`exec_b`, el análisis y el backtest usan solo las
+  fechas en que cotizan también los instrumentos ejecutables (nunca se rellena) y
+  se avisa cuántas fechas se excluyeron y del riesgo de base. El proxy debe estar
+  en la misma moneda que la serie analizada (si no, ⛔). Sin proxy, un índice o
+  futuro se opera sobre su propia serie con un aviso que sugiere el proxy.
+- **Alternativas:** reindexar el proxy y rellenar huecos; bloquear índices sin proxy.
+- **Justificación:** coherente con D1 y D6 (nunca sustituir en silencio, nunca
+  rellenar); el aviso mantiene el valor pedagógico del modo (b) de D1.
+- **Fecha:** 2026-10-10
+
+### A3 — `run_config.json` autosuficiente
+- **Decisión:** `run_pair` devuelve el RunConfig completado: cada referencia
+  queda fijada a la instantánea usada (`snapshot_id`, conservando las fechas
+  pedidas), `frozen_split`, `series`, `data_origin` según los datos (SINTETICO si
+  alguna serie lo es, aunque la configuración dijera otra cosa), `code_version` y
+  `config_hash`. Sin `snapshot_id` la referencia debe traer `start` y `end`. Una
+  instantánea cuyo proveedor o símbolo no coincide con la referencia se rechaza.
+  Un `run_config.json` escrito a mano sin `config_hash` se acepta y se le calcula;
+  uno con hash que no coincide se rechaza.
+- **Alternativas:** guardar solo la configuración de entrada y resolver los
+  datos en cada ejecución.
+- **Justificación:** guardar, cargar y volver a ejecutar debe dar los mismos
+  bytes sin tocar el proveedor (D7, sección 15).
+- **Fecha:** 2026-10-10
+
+### A4 — Formato de la exportación
+- **Decisión:** `tipo_datos` es la primera columna de cada CSV. Con datos
+  sintéticos TODOS los archivos (también `run_config.json` y `LEEME.txt`) y la
+  carpeta sugerida llevan el prefijo `SINTETICO_`. `pruebas_estadisticas.csv` va
+  en formato largo (`seccion, elemento, campo, valor`) e incluye estado, causas,
+  descartes y métricas por segmento. Booleanos «sí»/«no»; fracciones como
+  fracción; `-0` se escribe `0`. La opción «CSV para Excel en español» añade el
+  BOM de UTF-8. El ZIP fija fecha, sistema de origen y permisos de cada entrada.
+- **Alternativas:** prefijo solo en los CSV; una columna por prueba.
+- **Justificación:** la marca de datos sintéticos debe viajar con cualquier
+  archivo suelto (D5); sin BOM, Excel en Windows no muestra bien las tildes; un
+  formato largo admite pruebas con columnas distintas.
+- **Fecha:** 2026-10-10
+
+### A5 — Versión del código «-dirty»
+- **Decisión:** `-dirty` solo si hay archivos versionados modificados
+  (`git status --porcelain --untracked-files=no`), como `git describe --dirty`.
+- **Alternativas:** contar también los archivos sin versionar.
+- **Justificación:** las salidas y la caché locales no deben cambiar la versión
+  registrada.
+- **Fecha:** 2026-10-10
+
+### A6 — z móvil en el backtest
+- **Decisión:** con `zscore_mode="movil"` el runner calcula el z móvil sobre el
+  spread completo (ventana hacia atrás que incluye t) y cada backtest lleva el
+  aviso de que es solo una comparación pedagógica. `PairAnalysis.zscore` es
+  siempre el z con μ y σ_eq fijos de formación.
+- **Alternativas:** recalcular el z móvil dentro de cada segmento (perdería las
+  primeras observaciones de validación y prueba).
+- **Justificación:** usa solo información pasada y no desperdicia datos.
+- **Fecha:** 2026-10-10
+
+### A7 — Demo reproducible
+- **Decisión:** `examples/demo_ko_pep.py` lee los metadatos de `<archivo>.meta.json`
+  si existe (lo crean `make fetch-example` y el generador sintético); si no, exige
+  `--currency`, `--asset-class` y `--price-type` (D4). Usa la caché `data/cache`
+  (o `--cache-dir`), ejecuta la prueba solo con `--incluir-prueba` y admite
+  `--reproducir <run_config.json>` (solo caché, nunca descarga).
+- **Alternativas:** caché temporal en cada ejecución.
+- **Justificación:** con una caché persistente el `run_config.json` exportado se
+  puede reproducir más tarde.
+- **Fecha:** 2026-10-10
+
+### A8 — Umbral de evidencia y q de la FDR
+- **Decisión:** la evidencia se decide con el p-value AJUSTADO de la dirección
+  elegida frente a `alpha_level` (rechazo si p ≤ α). Los p-values ajustados de
+  BH/BY no dependen de `fdr_q`; por defecto ambos valen 0,05.
+- **Alternativas:** decidir con el conjunto rechazado por BH a nivel q.
+- **Justificación:** el usuario ve un único umbral, el mismo que en la interfaz.
+- **Fecha:** 2026-10-10
+
+### A9 — Decisiones de implementación de los módulos del núcleo
+- **Decisión:** se registran aquí las tomadas al implementar cada módulo:
+  - Yahoo: `yfinance` configurado para LANZAR sus errores
+    (`hide_exceptions = False`); si no, un fallo de red llega como tabla vacía y
+    se confundiría con «símbolo sin datos». `max_retries` son reintentos tras el
+    primer intento: con 4, hasta 5 llamadas y esperas de 1, 2, 4 y 8 s (D3).
+  - Caché: el hash de la instantánea combina el contenido con la identidad de la
+    serie (activo, moneda, tipo de precio, intervalo y rango pedido); la fecha de
+    descarga no entra en el hash.
+  - CSV: se relee en cada carga (el usuario puede subir un archivo corregido con
+    el mismo símbolo; cada versión queda como instantánea propia); si no es UTF-8
+    válido se interpreta como Windows-1252 (Excel en español).
+  - OU: `near_unit_root` (Dickey–Fuller al 5 % con constante) es solo un aviso;
+    la validez sigue siendo 0 < b < 1 (O5). Spread constante o determinista →
+    `INSUFFICIENT`. Con NaN en el spread solo se usan pares consecutivos finitos.
+    Ljung–Box con `model_df=1`. Simulación con horizonte máximo de 2.520 pasos.
+  - Backtest: salida forzada (`ExitReason.FORCED`, máxima prioridad, sin
+    enfriamiento ni rearme) si el capital se agota con posición abierta o si una
+    reducción de apalancamiento con unidades enteras dejaría una pierna en 0. La
+    reducción por apalancamiento solo se dispara si el límite se supera en más
+    de un 1 %.
+- **Alternativas:** documentarlas solo en los docstrings.
+- **Justificación:** son decisiones no especificadas que afectan resultados o
+  mensajes; deben quedar auditables en un único lugar.
+- **Fecha:** 2026-10-10

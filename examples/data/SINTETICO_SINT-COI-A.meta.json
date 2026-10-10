@@ -1,0 +1,11 @@
+{
+  "symbol": "SINT-COI-A",
+  "name": "SINTÉTICO — Par cointegrado, serie A",
+  "currency": "USD",
+  "asset_class": "accion",
+  "price_type": "sintetico",
+  "origin": "SINTETICO",
+  "notes": [
+    "SINTÉTICO — escenario «Par cointegrado», semilla 7. log A = 0 + 1·log B + X, con X un OU exacto (λ=0.1, μ=0, σ=0.01, X₀=0); log B es un paseo aleatorio (deriva 0.0002, volatilidad 0.01). Parámetros: {\"a_drift\": 0.0002, \"a_start_price\": 100.0, \"a_vol\": 0.01, \"alpha\": 0.0, \"b_drift\": 0.0002, \"b_start_price\": 100.0, \"b_vol\": 0.01, \"beta\": 1.0, \"n_obs\": 1500, \"ou_lambda\": 0.1, \"ou_mu\": 0.0, \"ou_sigma\": 0.01, \"rho\": 0.9, \"scenario\": \"cointegrado\", \"seed\": 7, \"start\": \"2018-01-01\", \"x0\": null}"
+  ]
+}

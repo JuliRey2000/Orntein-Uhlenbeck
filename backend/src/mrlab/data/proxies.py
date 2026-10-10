@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pydantic import BaseModel
 
+from mrlab.domain.models import NON_EXECUTABLE_CLASSES, AssetClass, AssetInfo, DataOrigin
+
 
 class ProxySuggestion(BaseModel):
     reference: str  # símbolo de la referencia (Yahoo)
@@ -75,3 +77,56 @@ def looks_non_executable(symbol: str) -> bool:
     """Heurística por símbolo de Yahoo: ``^…`` = índice, ``…=F`` = futuro."""
     s = symbol.upper()
     return s.startswith("^") or s.endswith("=F")
+
+
+def build_asset_info(
+    symbol: str,
+    asset_class: AssetClass,
+    *,
+    name: str | None,
+    currency: str | None,
+    provider: str,
+    exchange: str | None = None,
+    timezone: str | None = None,
+    origin: DataOrigin = DataOrigin.HISTORICAL,
+    notes: tuple[str, ...] = (),
+) -> AssetInfo:
+    """AssetInfo con la política de proxies: índices y futuros quedan como no
+    ejecutables y se SUGIERE un proxy (con la explicación en ``notes``), sin
+    sustituirlo nunca en silencio."""
+    suggestion = suggest_proxy(symbol)
+    executable = asset_class not in NON_EXECUTABLE_CLASSES
+    extra: list[str] = []
+    if not executable:
+        kind = "un índice" if asset_class == AssetClass.INDEX else "un futuro continuo"
+        if suggestion:
+            extra.append(
+                f"{symbol} es {kind}: no se puede comprar ni vender directamente. Se sugiere "
+                f"{suggestion.proxy} como instrumento ejecutable, pero debes confirmarlo (nunca "
+                f"se sustituye en silencio). {suggestion.note}"
+            )
+        else:
+            extra.append(
+                f"{symbol} es {kind}: no se puede comprar ni vender directamente y no hay un proxy "
+                "sugerido. Elige un instrumento ejecutable que lo replique (por ejemplo, un ETF)."
+            )
+    elif suggestion:
+        extra.append(suggestion.note)
+    elif asset_class == AssetClass.CRYPTO:
+        extra.append(
+            "Cripto spot: vender en corto requiere derivados (perpetuos con funding), fuera del "
+            "alcance de la v1."
+        )
+    return AssetInfo(
+        symbol=symbol,
+        name=name or (suggestion.name if suggestion else symbol),
+        asset_class=asset_class,
+        currency=currency.strip() if currency and currency.strip() else None,
+        provider=provider,
+        exchange=exchange or None,
+        timezone=timezone or None,
+        origin=origin,
+        executable=executable,
+        suggested_proxy=suggestion.proxy if suggestion and not executable else None,
+        notes=(*notes, *extra),
+    )

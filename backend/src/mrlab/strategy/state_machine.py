@@ -17,11 +17,22 @@ Reglas (convención de ejecución en ``mrlab.backtest.engine``):
   (corto: z ≤ +entrada; largo: z ≥ −entrada) en algún cierre posterior a la
   señal de salida. El lado contrario no se bloquea.
 
-CONTRATO (a implementar): funciones puras usadas por el motor.
+Nota: con salidas direccionales y salida < entrada < stop, el stop por z y la
+salida normal son mutuamente excluyentes (corto: z ≥ stop y z ≤ salida no pueden
+cumplirse a la vez). En una misma observación pueden coincidir como máximo tres
+condiciones «normales»: stop monetario, una de las dos de z y tiempo máximo.
+
+Además de las cuatro razones de la especificación existe ``FORCED`` (salida
+forzada), que solo decide el motor: capital agotado con posición abierta, o una
+reducción por apalancamiento que dejaría una pierna en 0 unidades enteras. Tiene
+la máxima prioridad y no activa enfriamiento ni rearme.
+
+Funciones puras usadas por el motor; no conocen el estado (eso lo hace el motor).
 """
 
 from __future__ import annotations
 
+import math
 from enum import StrEnum
 
 from mrlab.strategy.params import StrategyParams
@@ -45,9 +56,13 @@ class ExitReason(StrEnum):
     STOP_Z = "stop_z"
     MAX_TIME = "tiempo_maximo"
     NORMAL = "salida_normal"
+    FORCED = (
+        "salida_forzada"  # solo la decide el motor (capital agotado, apalancamiento no reducible)
+    )
 
 
 EXIT_PRIORITY: tuple[ExitReason, ...] = (
+    ExitReason.FORCED,
     ExitReason.STOP_MONEY,
     ExitReason.STOP_Z,
     ExitReason.MAX_TIME,
@@ -64,12 +79,34 @@ EXIT_REASON_LABELS = {
     ExitReason.STOP_Z: "Stop por z",
     ExitReason.MAX_TIME: "Tiempo máximo",
     ExitReason.NORMAL: "Salida normal (reversión)",
+    ExitReason.FORCED: "Salida forzada",
 }
+
+SIDE_LABELS = {
+    Side.LONG: "largo spread",
+    Side.SHORT: "corto spread",
+}
+
+STATE_FOR_SIDE = {
+    Side.LONG: PositionState.LONG,
+    Side.SHORT: PositionState.SHORT,
+}
+
+
+def side_sign(side: Side) -> int:
+    """+1 para largo spread (largo A), −1 para corto spread (corto A)."""
+    return 1 if side == Side.LONG else -1
 
 
 def entry_signal(z: float, params: StrategyParams) -> Side | None:
     """Lado de entrada que indica z (o None). No mira el estado: eso lo hace el motor."""
-    raise NotImplementedError
+    if not math.isfinite(z):
+        return None
+    if z > params.entry_z:
+        return Side.SHORT
+    if z < -params.entry_z:
+        return Side.LONG
+    return None
 
 
 def active_exit_conditions(
@@ -80,15 +117,43 @@ def active_exit_conditions(
     max_bars: int,
     params: StrategyParams,
 ) -> list[ExitReason]:
-    """Todas las condiciones de salida activas en esta observación, en orden de prioridad."""
-    raise NotImplementedError
+    """Todas las condiciones de salida activas en esta observación, en orden de prioridad.
+
+    Con z no finito (p. ej. z móvil sin historia suficiente) solo se evalúan el
+    stop monetario y el tiempo máximo.
+    """
+    active: list[ExitReason] = []
+    if trade_net_pnl <= -params.stop_loss_pct * params.initial_capital:
+        active.append(ExitReason.STOP_MONEY)
+    stop_hit = normal_hit = False
+    if math.isfinite(z):
+        if side == Side.SHORT:
+            stop_hit = z >= params.stop_z
+            normal_hit = z <= params.exit_z
+        else:
+            stop_hit = z <= -params.stop_z
+            normal_hit = z >= -params.exit_z
+    if stop_hit:
+        active.append(ExitReason.STOP_Z)
+    if bars_held >= max_bars:
+        active.append(ExitReason.MAX_TIME)
+    if normal_hit:
+        active.append(ExitReason.NORMAL)
+    return active
 
 
 def select_exit(active: list[ExitReason]) -> ExitReason | None:
     """La condición de mayor prioridad (EXIT_PRIORITY) o None."""
-    raise NotImplementedError
+    for reason in EXIT_PRIORITY:
+        if reason in active:
+            return reason
+    return None
 
 
 def rearm_cleared(side: Side, z: float, params: StrategyParams) -> bool:
     """True si z volvió dentro de la banda de entrada para ese lado."""
-    raise NotImplementedError
+    if not math.isfinite(z):
+        return False
+    if side == Side.SHORT:
+        return z <= params.entry_z
+    return z >= -params.entry_z
