@@ -24,6 +24,8 @@ class Settings(BaseSettings):
     yahoo_backoff_base_seconds: float = 1.0
     cors_origins: str = "http://localhost:5173,http://localhost:8080"
     log_level: str = "INFO"
+    job_workers: int = 2
+    max_upload_mb: float = 10.0
 
 
 def get_settings() -> Settings:
