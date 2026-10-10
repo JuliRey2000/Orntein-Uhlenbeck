@@ -7,12 +7,13 @@ import math
 import numpy as np
 import pandas as pd
 import pytest
+from conftest import cointegrated_log_prices
 from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.tsa.stattools import acf
 
 from mrlab.domain.errors import ConfigError, DataError, ModelError
 from mrlab.model.diagnostics import ar1_residuals, residual_diagnostics, rolling_ou_stability
-from mrlab.model.ou import OUStatus, fit_ou, simulate_ou_exact
+from mrlab.model.ou import OUStatus, adf_unit_root_test, fit_ou, simulate_ou_exact
 
 
 def _series(values: np.ndarray) -> pd.Series:
@@ -113,17 +114,17 @@ def test_rolling_ou_stability_windows_and_cv_lambda():
         assert w.start == spread.index[s].date()
         assert w.end == spread.index[s + 251].date()
         assert w.nobs == 252
-        ref = fit_ou(spread.iloc[s : s + 252])
-        assert w.valid == ref.valid
-        assert w.lam == ref.lam and w.half_life == ref.half_life
+        ref = fit_ou(spread.iloc[s : s + 252], require_unit_root_rejection=False)
+        assert w.estimable == ref.valid
+        assert w.lam == ref.lam and w.half_life == ref.half_life and w.b == ref.b
 
-    lams = np.array([w.lam for w in stab.windows if w.valid])
-    assert stab.n_invalid == sum(not w.valid for w in stab.windows)
+    lams = np.array([w.lam for w in stab.windows if w.estimable])
+    assert stab.n_invalid == sum(not w.estimable for w in stab.windows)
     assert stab.cv_lambda == pytest.approx(lams.std(ddof=1) / lams.mean())
     assert "12 ventanas" in stab.message and "α y β fijos" in stab.message
 
 
-def test_rolling_ou_stability_counts_invalid_windows():
+def test_rolling_ou_stability_counts_windows_without_parameters():
     calm = simulate_ou_exact(0.1, 0.0, 0.01, 0.0, 499, 1, seed=6)[0]
     e = np.random.default_rng(6).standard_normal(500) * 0.01
     choppy = np.zeros(500)
@@ -133,10 +134,10 @@ def test_rolling_ou_stability_counts_invalid_windows():
 
     assert len(stab.windows) == 12
     tail = [w for w, s in zip(stab.windows, range(0, 749, 63), strict=True) if s >= 500]
-    assert len(tail) == 4 and not any(w.valid for w in tail)
-    assert all(w.lam is None and w.half_life is None for w in tail)
-    assert stab.n_invalid == sum(not w.valid for w in stab.windows) >= 4
-    assert "no fue válido" in stab.message
+    assert len(tail) == 4 and not any(w.estimable for w in tail)
+    assert all(w.lam is None and w.half_life is None and w.b < 0 for w in tail)
+    assert stab.n_invalid == sum(not w.estimable for w in stab.windows) >= 4
+    assert "no se pudieron estimar" in stab.message
 
 
 def test_rolling_ou_stability_with_too_few_windows():
@@ -152,22 +153,75 @@ def test_rolling_ou_stability_with_too_few_windows():
         rolling_ou_stability(pd.Series(np.zeros(300)), window=252, step=63)
 
 
-def test_rolling_ou_stability_applies_the_unit_root_rule_of_the_full_fit():
-    """Decisión O7: cada ventana usa la misma regla de validez que el ajuste completo (con los
-    valores críticos del residuo estimado cuando el pipeline lo pide)."""
+def test_window_unit_root_test_is_reported_apart_and_does_not_filter_parameters():
+    """Hallazgo de la verificación: exigir el rechazo de la raíz unitaria en cada ventana (con
+    N = 2) dejaba sin parámetros a la mayoría de las ventanas de un OU verdadero. Ahora los
+    parámetros no dependen del nivel de la prueba; el ADF de cada ventana (N = 1) va aparte."""
     spread = _ou_spread(1000, lam=0.05)
-    lenient = rolling_ou_stability(spread, window=252, step=63)
-    strict = rolling_ou_stability(
-        spread, window=252, step=63, estimated_residual=True, unit_root_alpha=0.01
-    )
+    lenient = rolling_ou_stability(spread, window=252, step=63, unit_root_alpha=0.10)
+    strict = rolling_ou_stability(spread, window=252, step=63, unit_root_alpha=0.01, maxlag=6)
     for w, s in zip(strict.windows, range(0, 1000 - 252 + 1, 63), strict=True):
-        ref = fit_ou(spread.iloc[s : s + 252], estimated_residual=True, unit_root_alpha=0.01)
-        assert w.valid == ref.valid and w.half_life == ref.half_life
-    assert strict.n_invalid > lenient.n_invalid
-    assert "no se distingue de 1" in strict.message
+        ref = adf_unit_root_test(spread.iloc[s : s + 252], alpha=0.01, maxlag=6)
+        assert ref is not None and not ref.estimated_residual  # N = 1: α y β no se re-estiman
+        assert (w.df_stat, w.df_pvalue, w.df_lags) == (ref.stat, ref.pvalue, ref.lags)
+        assert w.unit_root_rejected == ref.rejected == (ref.pvalue <= 0.01)
+    params = ("estimable", "lam", "mu", "sigma", "half_life")
+    lenient_params = [[getattr(w, k) for k in params] for w in lenient.windows]
+    strict_params = [[getattr(w, k) for k in params] for w in strict.windows]
+    assert lenient_params == strict_params and all(w.estimable for w in strict.windows)
+    assert strict.cv_lambda == lenient.cv_lambda is not None
+    assert strict.n_unit_root_rejected < lenient.n_unit_root_rejected
+    assert strict.n_unit_root_tested == lenient.n_unit_root_tested == 12
+    assert strict.unit_root_alpha == 0.01
+    assert f"en {strict.n_unit_root_rejected} de 12 ventanas" in strict.message
+    assert "poca potencia" in strict.message
+    assert "no prueba que la dinámica sea inestable" in strict.message
 
-    # ``scale`` también llega a cada ventana: ruido de redondeo → ninguna ventana válida.
+    # ``scale`` también llega a cada ventana: ruido de redondeo → ninguna ventana con parámetros.
     tiny = _series(_ou_spread(600, lam=0.3).to_numpy() * 1e-14)
     assert rolling_ou_stability(tiny, window=252, step=63).n_invalid == 0
     scaled = rolling_ou_stability(tiny, window=252, step=63, scale=1.0)
     assert scaled.windows and scaled.n_invalid == len(scaled.windows)
+
+
+def _training_residual(log_a: np.ndarray, log_b: np.ndarray, n_train: int = 900) -> pd.Series:
+    """Spread de formación como en el análisis: residuo de la MCO de log A sobre log B."""
+    y, x = log_a[:n_train], log_b[:n_train]
+    design = np.column_stack([np.ones(n_train), x])
+    return _series(y - design @ np.linalg.lstsq(design, y, rcond=None)[0])
+
+
+def test_true_ou_windows_have_parameters_and_unbiased_half_life_range():
+    """OU verdadero (λ = 0,05, vida media 13,9): antes el 83 % de las ventanas quedaba «no
+    válido», el 48 % de los pares no tenía CV(λ) y la vida media de las ventanas que pasaban
+    era ≈ 6,5 días (solo pasaban las de λ alto)."""
+    lam = 0.05
+    true_half_life = math.log(2) / lam
+    with_cv, fractions, half_lives = 0, [], []
+    for seed in range(50):
+        stab = rolling_ou_stability(
+            _training_residual(*cointegrated_log_prices(1500, seed, lam=lam))
+        )
+        with_cv += stab.cv_lambda is not None
+        fractions.append(1 - stab.n_invalid / len(stab.windows))
+        half_lives += [w.half_life for w in stab.windows if w.estimable]
+    assert with_cv >= 45  # ≥ 90 % de las semillas
+    assert np.mean(fractions) >= 0.9  # la mayoría de las ventanas tiene parámetros
+    # Mediana cerca del valor verdadero (el AR(1) en 252 obs. sobrestima λ un poco).
+    assert 0.7 * true_half_life <= np.median(half_lives) <= 1.3 * true_half_life
+
+
+@pytest.mark.slow
+def test_window_unit_root_rejections_are_near_alpha_for_independent_walks():
+    """Paseos independientes (H0 cierta): cada ventana es un tramo de un spread con α y β fijos,
+    así que corresponde la tabla N = 1. Con N = 2 solo rechazaba el 1,6 % (5 % nominal)."""
+    rejected = tested = 0
+    for seed in range(400):
+        rng = np.random.default_rng(seed)
+        log_a = np.cumsum(rng.normal(0, 0.01, 900))
+        log_b = np.cumsum(rng.normal(0, 0.01, 900))
+        stab = rolling_ou_stability(_training_residual(log_a, log_b))
+        rejected += stab.n_unit_root_rejected
+        tested += stab.n_unit_root_tested
+    assert tested == 400 * 11
+    assert 0.03 <= rejected / tested <= 0.08

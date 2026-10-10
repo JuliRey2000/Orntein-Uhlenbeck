@@ -52,7 +52,9 @@ def make_series(
     )
     meta = SeriesMeta(
         asset=asset,
-        price_type=PriceType.SYNTHETIC if origin == DataOrigin.SYNTHETIC else PriceType.ADJUSTED_CLOSE,
+        price_type=PriceType.SYNTHETIC
+        if origin == DataOrigin.SYNTHETIC
+        else PriceType.ADJUSTED_CLOSE,
         coverage_start=cs,
         coverage_end=ce,
         n_obs=n,

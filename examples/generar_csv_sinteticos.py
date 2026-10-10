@@ -16,10 +16,14 @@ archivos byte a byte.
 Uso (desde la raíz del repositorio):  python examples/generar_csv_sinteticos.py [carpeta]
 (por defecto escribe en ``examples/data/``; con ``carpeta`` escribe allí, p. ej. para
 comprobar que los archivos versionados coinciden con lo que genera el script).
+``-h``/``--help`` muestra la ayuda sin escribir nada. Una carpeta cuyo nombre empieza
+por «-» se rechaza (se confundiría con una opción); si de verdad se llama así,
+escríbela como ``./-carpeta``.
 """
 
 from __future__ import annotations
 
+import argparse
 import sys
 from datetime import date
 from pathlib import Path
@@ -27,6 +31,8 @@ from pathlib import Path
 EXAMPLES_DIR = Path(__file__).resolve().parent
 DATA_DIR = EXAMPLES_DIR / "data"
 
+if str(EXAMPLES_DIR) not in sys.path:  # con python -P (o PYTHONSAFEPATH) no se añade solo
+    sys.path.insert(0, str(EXAMPLES_DIR))
 try:
     import mrlab  # noqa: F401
 except ImportError:  # permite ejecutarlo sin instalar el paquete
@@ -41,6 +47,8 @@ from mrlab.data.providers.synthetic import SyntheticProvider  # noqa: E402
 from mrlab.domain.errors import LabError  # noqa: E402
 from mrlab.domain.models import DataOrigin, PriceSeries, PriceType  # noqa: E402
 
+from _cli import SpanishArgumentParser  # noqa: E402
+
 SYMBOLS = ("SINT-COI-A", "SINT-COI-B")
 
 
@@ -53,12 +61,33 @@ def to_csv(series: PriceSeries) -> str:
     return "\n".join(lines) + "\n"
 
 
+def parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = SpanishArgumentParser(
+        description=(
+            "Regenera los CSV SINTÉTICOS del par de ejemplo (preset SINT-COI, semilla 7) con sus "
+            "archivos .meta.json. El resultado es idéntico byte a byte en cada ejecución."
+        ),
+    )
+    parser.add_argument(
+        "carpeta",
+        nargs="?",
+        help=(
+            "Carpeta de destino (por defecto, examples/data/). No puede empezar por «-»: si de "
+            "verdad se llama así, escríbela como ./-carpeta"
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.carpeta is not None and args.carpeta.startswith("-"):
+        parser.error(
+            f"la carpeta de destino «{args.carpeta}» empieza por «-» y se confundiría con una "
+            f"opción; si de verdad se llama así, escríbela como ./{args.carpeta}"
+        )
+    return args
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = sys.argv[1:] if argv is None else argv
-    if len(args) > 1:
-        print("Uso: python examples/generar_csv_sinteticos.py [carpeta]", file=sys.stderr)
-        return 2
-    directory = Path(args[0]) if args else DATA_DIR
+    args = parse_args(argv)
+    directory = Path(args.carpeta) if args.carpeta is not None else DATA_DIR
     generator = SyntheticProvider()
     target = CSVProvider(directory)
     try:

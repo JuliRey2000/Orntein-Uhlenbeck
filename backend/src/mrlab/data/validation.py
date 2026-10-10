@@ -364,8 +364,17 @@ _ERROR_SUMMARIES: dict[str, str] = {
 }
 
 
-def _usable_status(issues: list[ValidationIssue], n_aligned: int, n_train: int) -> str:
-    """Resumen de un par no bloqueado: «Datos aptos…» solo si no hay errores."""
+#: Clave de ``ValidationIssue.details`` que marca una incidencia de un instrumento ejecutable
+#: (proxy): su error no bloquea el análisis, pero sí la simulación.
+EXECUTABLE_ISSUE_KEY = "instrumento_ejecutable"
+
+
+def usable_status(issues: list[ValidationIssue], n_aligned: int, n_train: int) -> str:
+    """Resumen de un par no bloqueado: «Datos aptos…» solo si no hay errores (decisión D15).
+
+    Lo usa también el análisis del par para recalcular el resumen con las incidencias de los
+    instrumentos ejecutables y las fechas realmente usadas (A2).
+    """
     counts = f"{format_int(n_aligned)} observaciones comunes, {format_int(n_train)} en formación"
     errors = [i for i in issues if i.severity == Severity.ERROR]
     n_warn = sum(i.severity == Severity.WARNING for i in issues)
@@ -377,9 +386,16 @@ def _usable_status(issues: list[ValidationIssue], n_aligned: int, n_train: int) 
         if issue.code not in _ERROR_SUMMARIES:  # incidencia nueva: su primera frase
             described.append(issue.message.split(". ")[0].rstrip("."))
             continue
-        where = f" en «{issue.symbol}»" if issue.symbol else ""
+        executable = bool(issue.details.get(EXECUTABLE_ISSUE_KEY))
+        if not issue.symbol:
+            where = ""
+        elif executable:
+            where = f" en el instrumento ejecutable «{issue.symbol}»"
+        else:
+            where = f" en «{issue.symbol}»"
         dates = f" ({len(issue.dates)} fecha(s))" if issue.dates else ""
-        described.append(f"{_ERROR_SUMMARIES[issue.code]}{where}{dates}")
+        blocks = ", que bloquean la simulación" if executable else ""
+        described.append(f"{_ERROR_SUMMARIES[issue.code]}{where}{dates}{blocks}")
     warn = f"; además hay {n_warn} advertencia(s)" if n_warn else ""
     return (
         f"Datos utilizables con incidencias: {'; '.join(described)}{warn}. {counts}. Revisa las "
@@ -548,7 +564,7 @@ def validate_pair(
     if blocked:
         status = "Análisis bloqueado: " + "; ".join(block_reasons) + "."
     else:
-        status = _usable_status(issues, n_aligned, n_train)
+        status = usable_status(issues, n_aligned, n_train)
 
     report = ValidationReport(
         series=[val_a, val_b],

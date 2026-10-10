@@ -11,11 +11,14 @@ from conftest import make_series
 
 from mrlab.data.calendar import CLOSE_TIME_MISMATCH_WARNING
 from mrlab.data.validation import (
+    EXECUTABLE_ISSUE_KEY,
     Severity,
+    ValidationIssue,
     align_pair,
     clean_series,
     format_dates,
     format_int,
+    usable_status,
     validate_pair,
 )
 from mrlab.domain.models import AssetClass, CalendarType, SpreadType
@@ -235,6 +238,30 @@ def test_status_message_is_not_apt_when_there_are_error_issues():
     assert report.status_message.startswith("Datos utilizables con incidencias")
     assert "«B»" in report.status_message and "cero" in report.status_message
     assert "1.000 observaciones comunes, 600 en formación" in report.status_message
+
+
+def test_usable_status_names_executable_errors_as_simulation_blockers():
+    """Hallazgo de la verificación: con un precio ≤ 0 del instrumento ejecutable el resumen
+    decía «Datos aptos». ``usable_status`` (que también usa el análisis del par) lo nombra."""
+    dates = [D("2020-03-02")]
+    proxy_issue = ValidationIssue(
+        code="PRECIO_NO_POSITIVO",
+        severity=Severity.ERROR,
+        message="Instrumento ejecutable «SPY» (se opera en lugar de «^GSPC»): …",
+        symbol="SPY",
+        dates=dates,
+        details={EXECUTABLE_ISSUE_KEY: True},
+    )
+    warning = ValidationIssue(code="SALTO_SOSPECHOSO", severity=Severity.WARNING, message="x")
+    status = usable_status([proxy_issue, warning], 900, 540)
+    assert status.startswith("Datos utilizables con incidencias")
+    assert "en el instrumento ejecutable «SPY» (1 fecha(s)), que bloquean la simulación" in status
+    assert "además hay 1 advertencia(s)" in status
+    assert "900 observaciones comunes, 540 en formación" in status
+    # Sin la marca de ejecutable, la incidencia es de una serie del análisis.
+    plain = proxy_issue.model_copy(update={"details": {}})
+    assert "en «SPY» (1 fecha(s))." in usable_status([plain], 900, 540)
+    assert usable_status([warning], 900, 540).startswith("Datos aptos")
 
 
 def test_non_positive_price_outside_common_dates_does_not_block():

@@ -1,7 +1,11 @@
-"""La demo reproducible (criterio de terminado de la fase 1) se ejecuta de punta a punta."""
+"""La demo reproducible (criterio de terminado de la fase 1) se ejecuta de punta a punta.
+
+También cubre los otros scripts de ``examples/`` (generador de CSV sintéticos y descarga
+de Yahoo, solo su línea de órdenes: sin red) y su módulo común ``examples/_cli.py``."""
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shlex
@@ -19,6 +23,8 @@ from mrlab.config import REPO_ROOT
 
 DEMO = REPO_ROOT / "examples" / "demo_ko_pep.py"
 GENERATOR = REPO_ROOT / "examples" / "generar_csv_sinteticos.py"
+FETCH = REPO_ROOT / "examples" / "fetch_ko_pep.py"
+CLI_MODULE = REPO_ROOT / "examples" / "_cli.py"
 EXAMPLE_DATA = REPO_ROOT / "examples" / "data"
 SYNTHETIC_FOLDER = "SINTETICO_SINT-COI-A_SINT-COI-B"
 EXPORTED = (
@@ -38,32 +44,62 @@ ENGLISH_TRACES = (
     "For further information",
     "usage:",
     "invalid choice",
+    "ignored explicit",
+    "unrecognized arguments",
+    "show this help",
+    "positional arguments",
 )
 
 
-def run(script: Path, *args: str | Path) -> subprocess.CompletedProcess:
+def run_command(command: list[str], cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess:
     env = {**os.environ, "PYTHONIOENCODING": "utf-8", "GIT_COMMIT": "prueba-demo"}
     return subprocess.run(
-        [sys.executable, str(script), *map(str, args)],
+        command,
         capture_output=True,
         text=True,
         encoding="utf-8",
         env=env,
-        cwd=REPO_ROOT,
+        cwd=cwd,
         timeout=180,
     )
+
+
+def run(script: Path, *args: str | Path, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess:
+    return run_command([sys.executable, str(script), *map(str, args)], cwd=cwd)
 
 
 def run_demo(*args: str | Path) -> subprocess.CompletedProcess:
     return run(DEMO, *args)
 
 
-def reproduce_args(stdout: str) -> list[str]:
-    """Argumentos de la orden «Para reproducir» que imprime la demo (sin «python <script>»)."""
+def reproduce_command(stdout: str) -> list[str]:
+    """Orden «Para reproducir» que imprime la demo, separada en argumentos."""
     line = next(ln for ln in stdout.splitlines() if "Para reproducir" in ln)
-    parts = shlex.split(line.split("byte a byte):", 1)[1])
-    assert parts[:2] == ["python", "examples/demo_ko_pep.py"]
+    text = line.split("byte a byte):", 1)[1]
+    if os.name != "nt":
+        return shlex.split(text)
+    # Windows: comillas dobles de subprocess.list2cmdline (rutas sin comillas internas).
+    return [p[1:-1] if p[:1] == p[-1:] == '"' else p for p in shlex.split(text, posix=False)]
+
+
+def reproduce_args(stdout: str) -> list[str]:
+    """Argumentos de la orden «Para reproducir» (sin el intérprete ni el script).
+
+    La orden usa el intérprete actual y la ruta absoluta de la demo (hallazgo: antes era
+    «python examples/demo_ko_pep.py», que solo funcionaba desde la raíz del repositorio)."""
+    parts = reproduce_command(stdout)
+    assert parts[0] == sys.executable
+    assert Path(parts[1]) == DEMO.resolve()
     return parts[2:]
+
+
+def load_cli_module():
+    """``examples/_cli.py`` cargado por su ruta (sin tocar sys.path)."""
+    spec = importlib.util.spec_from_file_location("examples_cli", CLI_MODULE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def assert_same_files(original: Path, copy: Path) -> None:
@@ -103,7 +139,9 @@ def test_demo_runs_on_synthetic_csv_and_exports(tmp_path):
     assert "Vida media" in stdout and "Formación" in stdout and "Validación" in stdout
     assert "Prueba: NO ejecutada" in stdout  # la prueba solo con --incluir-prueba
     assert "Prueba contaminada: no aplica: la prueba no se ejecutó." in stdout
-    assert "Dickey–Fuller del AR(1)" in stdout and "se rechaza la raíz unitaria" in stdout
+    # O7 refinada: la validez del OU se decide con el ADF aumentado (rezagos por AIC).
+    assert "Dickey–Fuller aumentada (ADF" in stdout and "rezago(s) por AIC" in stdout
+    assert "se rechaza la raíz unitaria" in stdout and "Dickey–Fuller del AR(1)" not in stdout
     assert "Semilla del generador: 7" in stdout
 
     folder = out / SYNTHETIC_FOLDER
@@ -236,8 +274,17 @@ def test_invalid_metadata_is_a_spanish_message_without_traceback(
         (("--start", "2020-13-01"), "fecha no válida «2020-13-01»"),
         (("--reproducir", "x.json", "--csv-a", "a.csv"), "--reproducir no admite --csv-a"),
         (("--exec-a", "x.csv"), "úsalos junto con --csv-a y --csv-b"),
+        (("--excel-es=1",), "argumento --excel-es: esta opción no admite un valor; se recibió '1'"),
+        (("--opcion-inventada",), "argumentos no reconocidos: --opcion-inventada"),
     ],
-    ids=["clase_no_valida", "fecha_no_valida", "reproducir_con_csv", "exec_sin_csv"],
+    ids=[
+        "clase_no_valida",
+        "fecha_no_valida",
+        "reproducir_con_csv",
+        "exec_sin_csv",
+        "bandera_con_valor",
+        "opcion_desconocida",
+    ],
 )
 def test_argument_errors_are_in_spanish(tmp_path, args, fragment):
     proc = run_demo(*args, "--cache-dir", tmp_path / "cache", "--output-dir", tmp_path / "out")
@@ -356,3 +403,250 @@ def test_index_with_executable_proxy_runs_the_backtest(tmp_path, index_csvs):
     proc2 = run_demo(*reproduce_args(stdout), "--output-dir", replay)
     assert proc2.returncode == 0, proc2.stderr
     assert_same_files(folder, replay / folder.name)
+
+
+def test_the_other_leg_as_executable_is_rejected_or_blocked(tmp_path, index_csvs):
+    """Hallazgo de la verificación: con la otra pierna como ejecutable (o una copia suya con
+    otro nombre) la demo operaba el mismo activo contra sí mismo y mostraba ✅ y un retorno."""
+    common = (
+        "--csv-a", index_csvs["idx"], "--csv-b", index_csvs["stk"], *INDEX_FLAGS,
+        "--price-type", "cierre", "--asset-class-exec-a", "accion",
+        "--output-dir", tmp_path / "salida", "--cache-dir", tmp_path / "cache",
+    )  # fmt: skip
+    same = run_demo(*common, "--exec-a", index_csvs["stk"])
+    assert same.returncode == 2 and "DEMO_SIMBOLO_REPETIDO" not in same.stdout
+    assert "tienen el mismo símbolo" in same.stderr
+    assert "no puede usarse en las dos piernas" in same.stderr  # no invita solo a renombrar
+    assert_no_english_trace(same.stderr)
+
+    copy = index_csvs["stk"].with_name("STK2.csv")
+    copy.write_bytes(index_csvs["stk"].read_bytes())
+    renamed = run_demo(*common, "--exec-a", copy)
+    assert renamed.returncode == 0, renamed.stderr
+    assert "Bloqueo de la simulación:" in renamed.stdout
+    assert "EJECUTABLES_IDENTICOS" in renamed.stdout
+    assert "Backtest NO ejecutado" in renamed.stdout and "Retorno neto" not in renamed.stdout
+
+
+# --------------------------------------------------------------------------- historial de la prueba
+
+
+def _read_config(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _edited_thresholds(config: dict, target: Path) -> Path:
+    """Copia del run_config con los umbrales cambiados a mano (sin hash, como haría un alumno)."""
+    edited = json.loads(json.dumps(config))
+    edited["strategy"]["entry_z"] = 1.5
+    edited.pop("config_hash", None)
+    target.write_text(json.dumps(edited, ensure_ascii=False), encoding="utf-8")
+    return target
+
+
+def test_new_run_keeps_the_test_history_of_the_destination_folder(tmp_path):
+    """Hallazgo: una ejecución nueva en la misma carpeta sobrescribía run_config.json con el
+    historial vacío, y después de ver la prueba y cambiar los umbrales salía «contaminada: no».
+    Ahora el historial de la carpeta de destino se conserva (también al ramificar desde un
+    run_config.json anterior a la prueba y exportar en la misma carpeta)."""
+    out, cache = tmp_path / "salida", tmp_path / "cache"
+    common = ("--output-dir", out, "--cache-dir", cache)
+    config_path = out / SYNTHETIC_FOLDER / "SINTETICO_run_config.json"
+
+    # 0. Ejecución sin prueba: el alumno guarda este run_config.json (anterior a la prueba).
+    assert run_demo(*common).returncode == 0
+    before_test = _read_config(config_path)
+    assert before_test["test_history"] == []
+
+    # 1. La prueba se ejecuta una vez.
+    proc1 = run_demo(*common, "--incluir-prueba")
+    assert proc1.returncode == 0, proc1.stderr
+    seen = _read_config(config_path)["test_history"]
+    assert len(seen) == 1
+
+    # 2. Nueva ejecución SIN prueba en la misma carpeta: el historial se conserva y se avisa.
+    proc2 = run_demo(*common)
+    assert proc2.returncode == 0, proc2.stderr
+    assert "se conserva en el nuevo run_config.json" in proc2.stdout
+    after = _read_config(config_path)
+    assert after["include_test"] is False and after["test_history"] == seen
+
+    # 3. Umbrales editados en ese run_config.json y prueba otra vez: contaminada.
+    edited = _edited_thresholds(after, tmp_path / "editado.json")
+    proc3 = run_demo(
+        "--reproducir", edited, "--incluir-prueba",
+        "--output-dir", tmp_path / "editada", "--cache-dir", cache,
+    )  # fmt: skip
+    assert proc3.returncode == 0, proc3.stderr
+    assert "Prueba contaminada: SÍ" in proc3.stdout
+
+    # 4. Ramificar desde el run_config.json anterior a la prueba y exportar en la misma carpeta:
+    #    el historial de la carpeta se fusiona y la prueba sale contaminada.
+    branch = _edited_thresholds(before_test, tmp_path / "rama.json")
+    proc4 = run_demo("--reproducir", branch, "--incluir-prueba", *common)
+    assert proc4.returncode == 0, proc4.stderr
+    assert "Prueba contaminada: SÍ" in proc4.stdout
+    final = _read_config(config_path)["test_history"]
+    assert final[0] == seen[0] and len(final) == 2
+    # La limitación que queda (otra carpeta) se explica junto a la marca.
+    assert "o una exportación en otra carpeta" in proc4.stdout  # nota de alcance (exportación)
+    assert "El historial de OTRAS carpetas no se consulta" in proc4.stdout  # nota de la demo
+
+
+@pytest.mark.parametrize(
+    ("content", "code"),
+    [
+        ('{"pair": ', "DEMO_HISTORIAL_ILEGIBLE"),
+        (
+            json.dumps(
+                {
+                    "pair": {
+                        "a": {"provider": "csv", "symbol": "OTRO"},
+                        "b": {"provider": "csv", "symbol": "SINT-COI-B"},
+                    },
+                    "test_history": ["a" * 64],
+                }
+            ),
+            "DEMO_CARPETA_DE_OTRO_PAR",
+        ),
+    ],
+    ids=["ilegible", "otro_par_con_historial"],
+)
+def test_destination_history_that_cannot_be_kept_is_not_overwritten_silently(
+    tmp_path, content, code
+):
+    """Un run_config.json que no se puede leer (o de otro par, con historial) no se sobrescribe
+    sin avisar: hace falta otra carpeta o --reiniciar-historial (acción consciente)."""
+    out, cache = tmp_path / "salida", tmp_path / "cache"
+    folder = out / SYNTHETIC_FOLDER
+    folder.mkdir(parents=True)
+    stored = folder / "SINTETICO_run_config.json"
+    stored.write_text(content, encoding="utf-8")
+
+    proc = run_demo("--output-dir", out, "--cache-dir", cache)
+    assert proc.returncode == 2
+    assert f"ERROR ({code})" in proc.stderr
+    assert "--output-dir" in proc.stderr and "--reiniciar-historial" in proc.stderr
+    assert_no_english_trace(proc.stderr)
+    assert stored.read_text(encoding="utf-8") == content
+    assert sorted(folder.iterdir()) == [stored]
+
+    proc2 = run_demo("--output-dir", out, "--cache-dir", cache, "--reiniciar-historial")
+    assert proc2.returncode == 0, proc2.stderr
+    assert "sin conservar su historial de la prueba (--reiniciar-historial)" in proc2.stdout
+    assert _read_config(stored)["test_history"] == []
+
+
+# --------------------------------------------------------------------------- orden «Para reproducir»
+
+
+def test_printed_reproduce_command_works_from_another_folder(tmp_path):
+    """Hallazgo: la orden impresa era «python examples/demo_ko_pep.py …» con rutas relativas,
+    así que fallaba fuera de la raíz del repositorio. Ahora usa el intérprete actual y rutas
+    absolutas: ejecutada desde OTRA carpeta reproduce los mismos bytes."""
+    origin, elsewhere = tmp_path / "carpeta de origen", tmp_path / "otra carpeta"
+    origin.mkdir()
+    elsewhere.mkdir()
+    proc = run(DEMO, "--output-dir", "salida", "--cache-dir", "caché", "--excel-es", cwd=origin)
+    assert proc.returncode == 0, proc.stderr
+    command = reproduce_command(proc.stdout)
+    args = reproduce_args(proc.stdout)
+    for flag in ("--reproducir", "--cache-dir", "--output-dir"):
+        assert Path(args[args.index(flag) + 1]).is_absolute(), flag
+    assert "--excel-es" in args
+
+    folder = origin / "salida" / SYNTHETIC_FOLDER
+    original = {p.name: p.read_bytes() for p in folder.iterdir()}
+    # Tal como se imprime (vuelve a escribir en la misma carpeta): los mismos bytes.
+    in_place = run_command(command, cwd=elsewhere)
+    assert in_place.returncode == 0, in_place.stderr
+    assert {p.name: p.read_bytes() for p in folder.iterdir()} == original
+    # En otra carpeta de salida: los mismos archivos, byte a byte.
+    replay = tmp_path / "reproducción"
+    proc2 = run_command([*command, "--output-dir", str(replay)], cwd=elsewhere)
+    assert proc2.returncode == 0, proc2.stderr
+    assert_same_files(folder, replay / SYNTHETIC_FOLDER)
+    assert not any(elsewhere.iterdir())  # nada se escribe en la carpeta desde la que se ejecuta
+
+
+def test_quote_command_uses_double_quotes_on_windows_and_shlex_on_posix():
+    cli = load_cli_module()
+    parts = [
+        r"C:\Program Files\Python313\python.exe",
+        r"C:\Users\Juan Pérez\mrlab\examples\demo_ko_pep.py",
+        "--reproducir",
+        r"C:\Users\Juan Pérez\mrlab\out\run_config.json",
+        "--excel-es",
+    ]
+    windows = cli.quote_command(parts, windows=True)
+    assert windows == (
+        r'"C:\Program Files\Python313\python.exe" '
+        r'"C:\Users\Juan Pérez\mrlab\examples\demo_ko_pep.py" --reproducir '
+        r'"C:\Users\Juan Pérez\mrlab\out\run_config.json" --excel-es'
+    )
+    assert "'" not in windows  # cmd.exe no entiende las comillas simples
+    # Metacaracteres de cmd.exe sin espacios («&» separa órdenes): también se citan.
+    special = cli.quote_command(
+        [r"C:\Python313\python.exe", r"C:\Users\ana\R&D\demo_ko_pep.py", "--reproducir"],
+        windows=True,
+    )
+    assert special == r'C:\Python313\python.exe "C:\Users\ana\R&D\demo_ko_pep.py" --reproducir'
+
+    posix_parts = ["/usr/bin/python3", "/home/juan/mis datos/run_config.json", "--excel-es"]
+    posix = cli.quote_command(posix_parts, windows=False)
+    assert shlex.split(posix) == posix_parts
+    # Sin indicarlo, se elige según el sistema.
+    expected = windows if os.name == "nt" else cli.quote_command(parts, windows=False)
+    assert cli.quote_command(parts) == expected
+
+
+# --------------------------------------------------------------------------- otros scripts de examples
+
+
+@pytest.mark.parametrize("script", [DEMO, GENERATOR, FETCH], ids=["demo", "generador", "descarga"])
+def test_help_of_every_example_is_in_spanish_and_writes_nothing(tmp_path, script):
+    """Hallazgos: el generador tomaba «--help» como carpeta de destino y escribía en ella;
+    la descarga mostraba la ayuda de argparse en inglés."""
+    proc = run(script, "--help", cwd=tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.startswith("uso:")
+    assert "opciones:" in proc.stdout and "Muestra esta ayuda y termina" in proc.stdout
+    assert_no_english_trace(proc.stdout)
+    assert "options:" not in proc.stdout
+    assert "observaciones" not in proc.stdout  # el generador no escribió nada
+    assert not any(tmp_path.iterdir())
+
+
+def test_generator_rejects_a_destination_that_looks_like_an_option(tmp_path):
+    for args in (("-h",), ("--", "-x"), ("a", "b"), ("--carpeta",)):
+        proc = run(GENERATOR, *args, cwd=tmp_path)
+        if args == ("-h",):
+            assert proc.returncode == 0 and proc.stdout.startswith("uso:")
+        else:
+            assert proc.returncode == 2, args
+            assert "Consulta las opciones con --help" in proc.stderr
+            assert_no_english_trace(proc.stderr)
+        assert not any(tmp_path.iterdir()), args
+    proc = run(GENERATOR, "--", "-x", cwd=tmp_path)
+    assert "la carpeta de destino «-x» empieza por «-»" in proc.stderr
+    assert "./-x" in proc.stderr
+
+
+@pytest.mark.parametrize(
+    ("args", "fragment"),
+    [
+        (("--start", "2020-13-01"), "argumento --start: fecha no válida «2020-13-01»"),
+        (("--bogus",), "argumentos no reconocidos: --bogus"),
+        (("--symbols",), "argumento --symbols: falta al menos un valor"),
+        (("--start", "2020-01-02", "--end", "2020-01-01"), "es anterior a la inicial"),
+    ],
+    ids=["fecha_no_valida", "opcion_desconocida", "simbolos_vacios", "fechas_invertidas"],
+)
+def test_fetch_argument_errors_are_in_spanish(tmp_path, args, fragment):
+    """Los errores de argumentos salen antes de cualquier descarga (sin red)."""
+    proc = run(FETCH, *args, "--output-dir", tmp_path / "real", cwd=tmp_path)
+    assert proc.returncode == 2
+    assert fragment in proc.stderr
+    assert "Consulta las opciones con --help" in proc.stderr
+    assert_no_english_trace(proc.stderr)
+    assert not (tmp_path / "real").exists()

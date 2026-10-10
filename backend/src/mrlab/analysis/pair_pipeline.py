@@ -51,21 +51,42 @@ Precisiones de la implementación:
 - La validez del OU NO es un estado (la especificación fija cinco): un OU no
   válido bloquea la estrategia y aparece en ``discard_reasons`` con
   ``status=None``, igual que la vida media fuera de rango y el filtro de
-  correlación. Decisión O7: el OU solo es válido si 0 < b < 1 y Dickey–Fuller
-  rechaza la raíz unitaria al nivel ``alpha_level``, con los valores críticos
-  del residuo de una regresión estimada (N = 2), también en la estabilidad
-  del OU por ventanas. Si no la rechaza → ``OU_NO_ESTACIONARIO``.
+  correlación. Decisión O7: el OU solo es válido si 0 < b < 1 y la prueba de
+  Dickey–Fuller aumentada (rezagos por AIC hasta ``maxlag``) rechaza la raíz
+  unitaria al nivel ``alpha_level``. Como el spread de formación es el residuo
+  de la regresión de cointegración, la prueba es EXACTAMENTE el paso interno
+  de ``coint`` (ADF sin constante sobre el residuo, p-values de MacKinnon
+  N = 2): el OU es válido si y solo si 0 < b < 1 y el p-value de Engle–Granger
+  SIN AJUSTAR de la dirección elegida es ≤ α. Si no la rechaza →
+  ``OU_NO_ESTACIONARIO``. En la estabilidad del OU por ventanas los parámetros
+  se estiman con 0 < b < 1 y la prueba ADF de cada ventana (N = 1: α y β no
+  se re-estiman en ella) se informa aparte, sin condicionar λ ni CV(λ).
 - Dirección colineal (Engle–Granger con estadístico −∞): no se ajusta el OU
   (``INSUFFICIENT`` con el motivo) y se descarta con ``SERIES_COLINEALES``.
   Además ``fit_ou`` recibe como escala absoluta la desviación de f(y) en
   formación: un spread que es solo ruido de redondeo nunca es un OU válido.
 - Índice o futuro sin instrumento ejecutable → ``PROXY_REQUERIDO`` (se sugiere
-  el proxy, nunca se sustituye); el análisis estadístico se muestra igual.
+  el proxy, nunca se sustituye; si el proxy sugerido es la otra pierna del par,
+  se dice y se pide otro instrumento); el análisis estadístico se muestra
+  igual. Se decide con ``executable`` Y con la clase del activo (un índice o
+  futuro nunca es ejecutable, aunque sus metadatos digan lo contrario); un
+  índice o futuro elegido como ejecutable → ``PROXY_NO_EJECUTABLE``.
+- Si, tras resolver ``exec_a``/``exec_b``, las dos piernas se operarían con el
+  mismo instrumento (mismo proveedor y símbolo, sin distinguir mayúsculas ni
+  espacios) o con precios proporcionales en las fechas usadas (desviación de
+  ln(Pa/Pb) < 1e-10·escala) → ``EJECUTABLES_IDENTICOS``, que bloquea la
+  simulación: comprar y vender el mismo activo solo genera costes.
 - Precios EJECUTABLES (series o proxy) ≤ 0 en cualquier tramo →
   ``PRECIO_EJECUTABLE_NO_POSITIVO`` (la simulación necesita precios positivos
   para dimensionar y valorar las piernas). Esas fechas no se excluyen.
 - Las incidencias de la limpieza de cada instrumento ejecutable se añaden al
   ``ValidationReport`` con el símbolo y la etiqueta «instrumento ejecutable».
+  El resumen (``status_message``), ``n_aligned`` y ``n_train_estimate`` se
+  recalculan con las fechas realmente usadas (tras la intersección con los
+  ejecutables y con la división efectiva) y con TODAS las incidencias: un
+  error del ejecutable (p. ej. un precio ≤ 0) nunca se resume como «Datos
+  aptos». Si la formación queda por debajo del mínimo, el informe queda
+  bloqueado con ``DATOS_INSUFICIENTES``.
 - El calendario se determina con las clases de TODOS los instrumentos usados
   (análisis + ejecutables): cripto analizado + ejecutable de bolsa → mixto
   (252 periodos, día de negociación, aviso de desfase de cierre).
@@ -97,6 +118,7 @@ from pydantic import BaseModel, Field, model_validator
 from mrlab.backtest.split import SampleSplit, SplitConfig, compute_split, segment_slice
 from mrlab.data.calendar import CLOSE_TIME_MISMATCH_WARNING, calendar_type, time_unit_label
 from mrlab.data.validation import (
+    EXECUTABLE_ISSUE_KEY,
     AlignedPair,
     Severity,
     ValidationIssue,
@@ -104,10 +126,17 @@ from mrlab.data.validation import (
     clean_series,
     format_dates,
     format_int,
+    usable_status,
     validate_pair,
 )
 from mrlab.domain.errors import AnalysisBlocked, ConfigError, DataError
-from mrlab.domain.models import CalendarType, PriceSeries, Segment, SpreadType
+from mrlab.domain.models import (
+    NON_EXECUTABLE_CLASSES,
+    CalendarType,
+    PriceSeries,
+    Segment,
+    SpreadType,
+)
 from mrlab.model.diagnostics import (
     OUStability,
     ResidualDiagnostics,
@@ -205,8 +234,13 @@ STRATEGY_BLOCKING_CODES = frozenset(
         "PROXY_REQUERIDO",
         "PROXY_NO_EJECUTABLE",
         "PRECIO_EJECUTABLE_NO_POSITIVO",
+        "EJECUTABLES_IDENTICOS",
     }
 )
+
+#: Precios ejecutables con desviación de ln(Pa/Pb) menor que esta fracción de la escala de los
+#: log-precios: son la misma serie salvo escala (misma tolerancia que el spread en ``fit_ou``).
+PROPORTIONAL_REL_TOL = 1e-10
 
 #: Observaciones exigidas por encima del mínimo técnico de Engle–Granger en cada ventana.
 STABILITY_WINDOW_MARGIN = 30
@@ -468,15 +502,44 @@ def _non_executable_kind(series: PriceSeries) -> str:
     return kinds.get(series.meta.asset.asset_class.value, "un instrumento no ejecutable")
 
 
-def _proxy_required_cause(series: PriceSeries) -> Cause:
+def _is_non_executable(series: PriceSeries) -> bool:
+    """Índice, futuro o activo marcado como no ejecutable (D1). La clase manda aunque los
+    metadatos digan ``executable=True`` (p. ej. un ``AssetInfo`` copiado sin validar)."""
     asset = series.meta.asset
-    suggestion = (
-        f" El proxy sugerido es «{asset.suggested_proxy}»: indícalo de forma explícita como "
-        "instrumento ejecutable (nunca se sustituye en silencio)."
-        if asset.suggested_proxy
-        else " Elige un instrumento ejecutable que lo replique (por ejemplo, un ETF); nunca se "
-        "sustituye en silencio."
-    )
+    return not asset.executable or asset.asset_class in NON_EXECUTABLE_CLASSES
+
+
+def _norm_symbol(symbol: str) -> str:
+    return symbol.strip().upper()
+
+
+def _instrument_key(series: PriceSeries) -> tuple[str, str]:
+    """Identidad de un instrumento: proveedor y símbolo, sin mayúsculas ni espacios."""
+    return series.meta.provider.strip().lower(), _norm_symbol(series.symbol)
+
+
+def _proxy_required_cause(series: PriceSeries, other_leg_symbols: Iterable[str]) -> Cause:
+    """``PROXY_REQUERIDO``; nunca sugiere como proxy un instrumento de la otra pierna."""
+    asset = series.meta.asset
+    proxy = asset.suggested_proxy
+    if proxy and _norm_symbol(proxy) in {_norm_symbol(s) for s in other_leg_symbols}:
+        suggestion = (
+            f" Su proxy habitual es «{proxy}», pero «{proxy}» ya se usa en la otra pierna de este "
+            "par: operar las dos piernas con el mismo instrumento no tiene sentido (las compras y "
+            "las ventas se compensan y el resultado solo reflejaría costes). Elige otro instrumento "
+            f"ejecutable que replique «{asset.symbol}» (por ejemplo, otro ETF sobre el mismo "
+            "índice) o analiza otro par; nunca se sustituye en silencio."
+        )
+    elif proxy:
+        suggestion = (
+            f" El proxy sugerido es «{proxy}»: indícalo de forma explícita como instrumento "
+            "ejecutable (nunca se sustituye en silencio)."
+        )
+    else:
+        suggestion = (
+            " Elige un instrumento ejecutable que lo replique (por ejemplo, un ETF); nunca se "
+            "sustituye en silencio."
+        )
     return Cause(
         code="PROXY_REQUERIDO",
         status=None,
@@ -484,6 +547,61 @@ def _proxy_required_cause(series: PriceSeries) -> Cause:
             f"«{asset.symbol}» es {_non_executable_kind(series)}: no se puede comprar ni vender "
             f"directamente, así que la simulación necesita un instrumento ejecutable.{suggestion} "
             f"{SIMULATION_BLOCKED_NOTE}"
+        ),
+    )
+
+
+def _fmt_sci(x: float) -> str:
+    return f"{x:.2e}".replace(".", ",")
+
+
+def _identical_executables_cause(
+    series: tuple[PriceSeries, PriceSeries],
+    traded: tuple[PriceSeries, PriceSeries],
+    exec_prices: pd.DataFrame,
+) -> Cause | None:
+    """``EJECUTABLES_IDENTICOS`` si las dos piernas se operarían con el mismo instrumento
+    (mismo proveedor y símbolo) o con precios proporcionales en las fechas usadas."""
+    fix = (
+        "Comprar uno y vender el otro a la vez se compensa exactamente, así que el resultado de la "
+        "simulación solo reflejaría costes. Elige como ejecutable un instrumento distinto para una "
+        f"de las piernas. {SIMULATION_BLOCKED_NOTE}"
+    )
+
+    def role(analysis: PriceSeries, operated: PriceSeries) -> str:
+        if operated is analysis:
+            return f"la propia serie de la pierna «{analysis.symbol}»"
+        return f"el instrumento ejecutable elegido para «{analysis.symbol}»"
+
+    (sa, sb), (ta, tb) = series, traded
+    if _instrument_key(ta) == _instrument_key(tb):
+        return Cause(
+            code="EJECUTABLES_IDENTICOS",
+            status=None,
+            message=(
+                f"Las dos piernas se operarían con el mismo instrumento, «{ta.symbol}» del "
+                f"proveedor «{ta.meta.provider}»: es {role(sa, ta)} y también {role(sb, tb)}. "
+                f"{fix}"
+            ),
+        )
+    pa = exec_prices["a"].to_numpy(dtype=float)
+    pb = exec_prices["b"].to_numpy(dtype=float)
+    ok = np.isfinite(pa) & np.isfinite(pb) & (pa > 0) & (pb > 0)
+    if ok.sum() < 2:
+        return None
+    log_a, log_b = np.log(pa[ok]), np.log(pb[ok])
+    scale = max(float(np.std(log_a)), float(np.std(log_b)))
+    ratio_sd = float(np.std(log_a - log_b))
+    if not (scale > 0 and ratio_sd < PROPORTIONAL_REL_TOL * scale):
+        return None
+    return Cause(
+        code="EJECUTABLES_IDENTICOS",
+        status=None,
+        message=(
+            f"Los precios de los instrumentos que se operarían, «{ta.symbol}» ({role(sa, ta)}) y "
+            f"«{tb.symbol}» ({role(sb, tb)}), son proporcionales en todas las fechas usadas "
+            f"(desviación de ln(Pa/Pb) de {_fmt_sci(ratio_sd)} frente a una escala de "
+            f"{_fmt_sci(scale)}): son la misma serie salvo escala. {fix}"
         ),
     )
 
@@ -504,6 +622,7 @@ def _exec_issue(issue: ValidationIssue, exec_symbol: str, analysis_symbol: str) 
                 f"Instrumento ejecutable «{exec_symbol}» (se opera en lugar de "
                 f"«{analysis_symbol}»): {body}"
             ),
+            "details": {**issue.details, EXECUTABLE_ISSUE_KEY: True, "serie": analysis_symbol},
         }
     )
 
@@ -529,19 +648,23 @@ def _executable_prices(
     exec_symbols: list[str | None] = []
     issues: list[ValidationIssue] = []
     classes = [s.meta.asset.asset_class for s in series]
-    for leg, analysis_series, exec_series in zip(("a", "b"), series, execs, strict=True):
+    traded = (execs[0] or series[0], execs[1] or series[1])  # lo que realmente se opera
+    for k, (leg, analysis_series, exec_series) in enumerate(
+        zip(("a", "b"), series, execs, strict=True)
+    ):
         asset = analysis_series.meta.asset
         if exec_series is None:
             exec_symbols.append(None)
-            if not asset.executable:
-                discards.append(_proxy_required_cause(analysis_series))
+            if _is_non_executable(analysis_series):
+                others = {series[1 - k].symbol, traded[1 - k].symbol}
+                discards.append(_proxy_required_cause(analysis_series, others))
             continue
         exec_asset = exec_series.meta.asset
         exec_symbols.append(exec_series.symbol)
         classes.append(exec_asset.asset_class)
         clean, report = clean_series(exec_series)
         issues.extend(_exec_issue(i, exec_series.symbol, asset.symbol) for i in report.issues)
-        if not exec_asset.executable:
+        if _is_non_executable(exec_series):
             discards.append(
                 Cause(
                     code="PROXY_NO_EJECUTABLE",
@@ -597,6 +720,10 @@ def _executable_prices(
         )
     exec_prices = pd.DataFrame({k: v.reindex(index) for k, v in columns.items()}, index=index)
     exec_prices.index.name = "date"
+    if any(e is not None for e in execs):
+        identical = _identical_executables_cause(series, traded, exec_prices)
+        if identical is not None:
+            discards.append(identical)
     calendar = calendar_type(classes)
     if dropped or calendar != aligned.calendar:
         aligned = dc_replace(aligned, prices=prices.loc[index], calendar=calendar)
@@ -610,9 +737,24 @@ def _executable_prices(
 
 
 def _report_with_execution(
-    report: ValidationReport, execution: _Execution, warnings: list[str]
+    report: ValidationReport,
+    execution: _Execution,
+    warnings: list[str],
+    *,
+    n_train: int,
+    min_train_obs: int,
+    insufficient_message: str | None = None,
+    blocking: Iterable[Cause] = (),
 ) -> ValidationReport:
-    """Informe de validación con las incidencias de los proxies y el calendario efectivo."""
+    """Informe de validación con las fechas REALMENTE usadas y todas las incidencias.
+
+    Añade las incidencias de los proxies y el calendario efectivo, y recalcula ``n_aligned``,
+    ``n_train_estimate`` y ``status_message`` tras la intersección con los ejecutables y la
+    división efectiva (A2, D15): un error del ejecutable nunca se resume como «Datos aptos».
+    Queda bloqueado si la formación no llega al mínimo o si hay causas ⛔ de los ejecutables
+    (``blocking``: p. ej. su moneda es distinta o desconocida).
+    """
+    blocking = list(blocking)
     added = list(execution.issues)
     if execution.calendar != report.calendar and execution.calendar == CalendarType.MIXED:
         added.append(
@@ -623,19 +765,66 @@ def _report_with_execution(
             )
         )
         warnings.append(EFFECTIVE_MIXED_CALENDAR_WARNING)
-    if not added and execution.calendar == report.calendar:
+    n_aligned = len(execution.aligned.prices)
+    insufficient = n_train < min_train_obs
+    unchanged = (
+        not added
+        and not blocking
+        and execution.calendar == report.calendar
+        and n_aligned == report.n_aligned
+        and n_train == report.n_train_estimate
+        and not insufficient
+    )
+    if unchanged:
         return report
-    n_exec = sum(i.severity != Severity.INFO for i in execution.issues)
-    status = report.status_message
-    if n_exec:
-        status += (
-            f" Además, los instrumentos ejecutables tienen {n_exec} incidencia(s) que conviene "
-            "revisar."
+    issues = [*report.issues, *added]
+    block_reasons: list[str] = []
+    for cause in blocking:
+        issues.append(
+            ValidationIssue(
+                code=cause.code,
+                severity=Severity.ERROR,
+                message=cause.message,
+                details={EXECUTABLE_ISSUE_KEY: True},
+            )
         )
+        block_reasons.append(cause.message.split(". ")[0].rstrip("."))
+    if insufficient:
+        issues.append(
+            ValidationIssue(
+                code="DATOS_INSUFICIENTES",
+                severity=Severity.ERROR,
+                details={
+                    "n_alineadas": n_aligned,
+                    "n_formacion": n_train,
+                    "minimo_formacion": min_train_obs,
+                },
+                message=insufficient_message
+                or (
+                    f"Datos insuficientes: la muestra de formación tiene {format_int(n_train)} "
+                    f"observaciones; se necesitan al menos {format_int(min_train_obs)}."
+                ),
+            )
+        )
+        block_reasons.append(
+            f"solo {format_int(n_train)} observaciones en formación con las fechas realmente "
+            f"usadas (mínimo {format_int(min_train_obs)})"
+        )
+    if block_reasons:
+        status = "Análisis bloqueado: " + "; ".join(block_reasons) + "."
+    else:
+        status = usable_status(issues, n_aligned, n_train)
+        n_exec = sum(i.severity != Severity.INFO for i in execution.issues)
+        if n_exec:
+            status += f" Incluye {n_exec} incidencia(s) de los instrumentos ejecutables."
     return report.model_copy(
         update={
             "calendar": execution.calendar,
-            "issues": [*report.issues, *added],
+            "issues": issues,
+            "n_aligned": n_aligned,
+            "n_train_estimate": n_train,
+            "insufficient_data": report.insufficient_data or insufficient,
+            "blocked": report.blocked or bool(block_reasons),
             "status_message": status,
         }
     )
@@ -865,35 +1054,52 @@ def analyze_pair(
     discards: list[Cause] = []
     execution = _executable_prices(aligned, (a, b), (exec_a, exec_b), warnings, causes, discards)
     aligned = execution.aligned
-    out.validation = _report_with_execution(report, execution, warnings)
     out.calendar = execution.calendar
     out.aligned, out.exec_prices = aligned, execution.prices
     out.exec_symbol_a, out.exec_symbol_b = execution.symbols
     prices = aligned.prices
     if len(prices) == 0:
-        causes.append(
-            Cause(
-                code="DATOS_INSUFICIENTES",
-                status=PairStatus.INSUFFICIENT_DATA,
-                message="No quedan fechas comunes entre las series de análisis y las ejecutables.",
-            )
+        no_dates = Cause(
+            code="DATOS_INSUFICIENTES",
+            status=PairStatus.INSUFFICIENT_DATA,
+            message="No quedan fechas comunes entre las series de análisis y las ejecutables.",
+        )
+        causes.append(no_dates)
+        out.validation = _report_with_execution(
+            report,
+            execution,
+            warnings,
+            n_train=0,
+            min_train_obs=cfg.min_train_obs,
+            insufficient_message=no_dates.message,
+            blocking=[c for c in causes if c is not no_dates],
         )
         return _finish(out, causes, discards, warnings)
+    exec_blocking = [c for c in causes if c.status == PairStatus.INSUFFICIENT_DATA]
     split = frozen_split or compute_split(prices.index, cfg.split)
     out.split = split
     train = segment_slice(prices, split, Segment.TRAIN)
+    short_train: str | None = None
     if len(train) < cfg.min_train_obs:
+        short_train = (
+            f"Datos insuficientes: la muestra de formación ({split.train_start} a "
+            f"{split.train_end}) tiene {format_int(len(train))} observaciones comunes; se "
+            f"necesitan al menos {format_int(cfg.min_train_obs)}."
+        )
         causes.append(
             Cause(
-                code="DATOS_INSUFICIENTES",
-                status=PairStatus.INSUFFICIENT_DATA,
-                message=(
-                    f"Datos insuficientes: la muestra de formación ({split.train_start} a "
-                    f"{split.train_end}) tiene {format_int(len(train))} observaciones comunes; se "
-                    f"necesitan al menos {format_int(cfg.min_train_obs)}."
-                ),
+                code="DATOS_INSUFICIENTES", status=PairStatus.INSUFFICIENT_DATA, message=short_train
             )
         )
+    out.validation = _report_with_execution(
+        report,
+        execution,
+        warnings,
+        n_train=len(train),
+        min_train_obs=cfg.min_train_obs,
+        insufficient_message=short_train,
+        blocking=exec_blocking,
+    )
     if any(c.status == PairStatus.INSUFFICIENT_DATA for c in causes):
         return _finish(out, causes, discards, warnings)
     exec_names = {
@@ -985,7 +1191,7 @@ def _statistics(
     spread_train = segment_slice(spread, out.split, Segment.TRAIN)
 
     # OU con formación (sección 6). El spread es el RESIDUO de la regresión de cointegración
-    # estimada con estos datos: valores críticos N = 2 (decisión O7).
+    # estimada con estos datos: la prueba ADF es la de Engle–Granger en esta dirección (O7).
     assert out.calendar is not None
     time_unit = time_unit_label(out.calendar)
     if collinear:
@@ -1014,7 +1220,8 @@ def _statistics(
             half_life_max=cfg.half_life_max,
             half_life_min=cfg.half_life_min,
             unit_root_alpha=cfg.alpha_level,
-            estimated_residual=True,
+            estimated_residual=True,  # = paso interno de coint en esta dirección (O7)
+            maxlag=cfg.maxlag,
             scale=scale_arg,
         )
         out.ou = ou
@@ -1034,7 +1241,7 @@ def _statistics(
                 cfg.stability_step,
                 time_unit=time_unit,
                 unit_root_alpha=cfg.alpha_level,
-                estimated_residual=True,
+                maxlag=cfg.maxlag,
                 scale=scale_arg,
             )
             warnings.extend([PARAMETER_UNCERTAINTY_NOTE, MU_REFERENCE_NOTE])

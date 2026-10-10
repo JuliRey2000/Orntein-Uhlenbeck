@@ -219,11 +219,12 @@ cointegrado y no sirve para operar en un horizonte de semanas. Un spread con vid
 media menor que un día no se puede operar con datos diarios. La aptitud para OU se
 evalúa con:
 
-- ajuste OU válido: `0 < b < 1` **y** la prueba de Dickey–Fuller sobre el AR(1)
+- ajuste OU válido: `0 < b < 1` **y** la prueba de Dickey–Fuller aumentada (ADF)
   rechaza la raíz unitaria (sección 8.5, decisión O7);
 - vida media dentro de un rango útil (avisos si supera 126 días o si es menor que 1);
 - residuos sin autocorrelación (Ljung–Box, sección 8.7);
-- estabilidad de `λ` entre ventanas (sección 8.7);
+- estabilidad de `λ` entre ventanas (sección 8.7: se estima en cada ventana con
+  `0 < b < 1`; la prueba de raíz unitaria por ventana es un dato aparte);
 - costes pequeños frente a `σ_eq` (sección 15).
 
 **En el código:** `mrlab.stats.correlation` (correlaciones),
@@ -550,8 +551,9 @@ las dos piernas).
 
 El estado describe la **evidencia estadística**. Aparte, el panel «¿Por qué se
 descartó este par?» lista las razones de aptitud para operar (OU no válido, vida
-media fuera de [1, 126], series colineales, proxy ejecutable requerido, precios
-ejecutables ≤ 0, costes que superan el PnL bruto…). Cualquier razón de ese panel,
+media fuera de [1, 126], series colineales, proxy ejecutable requerido, las dos
+piernas operadas con el mismo instrumento, precios ejecutables ≤ 0, costes que
+superan el PnL bruto…). Cualquier razón de ese panel,
 o un estado distinto de ✅, hace que el backtest sea **solo ilustrativo**, con un
 aviso que cita los motivos (decisión O5a).
 
@@ -820,58 +822,105 @@ bandas ni z-score. Sin z no hay estrategia (decisión O5).
 Si la validez fuera solo `0 < b̂ < 1`, un paseo aleatorio saldría como «OU
 válido» con una vida media finita y engañosa (por ejemplo, `b̂ = 0,99` da una vida
 media de 69 días). Por eso el laboratorio exige además que la prueba de
-Dickey–Fuller sobre ese mismo AR(1) **rechace** la raíz unitaria:
+Dickey–Fuller **aumentada** (ADF, sección 3.2) **rechace** la raíz unitaria:
 
 ```text
-τ = (b̂ − 1) / EE(b̂)          (AR(1) con constante, sin rezagos)
-Válido  ⇔  0 < b̂ < 1   y   τ ≤ c_α        (c_α: valor crítico de MacKinnon con constante, nivel α)
+Δx_t = [c] + γ·x_{t−1} + Σ_{j=1..p} φ_j·Δx_{t−j} + e_t     (p elegido por AIC, máximo 12)
+τ = γ̂ / EE(γ̂)
+
+Válido  ⇔  0 < b̂ < 1   y   p-value(τ) ≤ α            (equivale a τ ≤ c_α)
 ```
 
-`α` es el nivel de evidencia del análisis (`alpha_level`, 0,05 por defecto). Para
-1 %, 5 % y 10 % se usan los valores críticos de MacKinnon con corrección de
-muestra finita; para otros niveles, el valor asintótico.
+`α` es el nivel de evidencia del análisis (`alpha_level`, 0,05 por defecto). La
+constante `[c]` solo se incluye para una serie observada (ver la tabla de valores
+críticos más abajo). El reparto de tareas es claro: el AR(1) de la sección 8.3 **estima** `a`, `b`, `λ`,
+`μ` y `σ`; el ADF **decide** si hay evidencia de que el spread revierta.
 
-**¿Qué valor crítico?** Depende de cómo se obtuvo la serie, por la misma razón de
-la sección 4.2:
+**¿Por qué con rezagos?** Si los cambios del spread tienen memoria, la prueba sin
+rezagos (`τ = (b̂ − 1)/EE(b̂)` del AR(1)) se equivoca. El caso típico es el ruido
+de microestructura: un cierre con un pequeño error de medición. Si
+`x_t = paseo_t + ruido_t`, los cambios `Δx_t` tienen autocorrelación negativa (con
+la misma volatilidad en el paseo y en el ruido, `ρ₁ = −1/3`): el ruido de hoy se
+deshace mañana, y eso parece reversión. Los términos `Δx_{t−j}` del ADF absorben
+esa memoria de corto plazo.
 
-| Serie a la que se ajusta el AR(1) | Valores críticos | `c` al 5 % (899 transiciones) |
-|---|---|---|
-| Serie observada (p. ej. una simulación) | Dickey–Fuller, N = 1 | −2,86 |
-| Spread del par: **residuo** de la regresión de formación (α y β estimados con los mismos datos) | Engle–Granger, N = 2 | −3,34 |
+**Ejemplo** (paseo aleatorio con volatilidad diaria del 1 % más un ruido de
+medición del 1 %, 900 observaciones, semilla 11; lo reproduce el código del
+laboratorio):
+
+| Prueba | Estadístico | Rezagos | p-value | Conclusión al 5 % |
+|---|---|---|---|---|
+| Dickey–Fuller sin rezagos (regla anterior) | −3,93 | 0 | 0,0018 | «OU válido», vida media 20,0 días |
+| ADF con rezagos por AIC (regla actual) | −2,31 | 2 | 0,170 | No se distingue de un paseo aleatorio |
+
+La autocorrelación de los cambios es −0,34: el AR(1) ve un `b̂ = 0,966` que no
+significa nada, porque la serie no tiene ningún nivel al que volver.
+
+**¿Qué valores críticos?** Dependen de cómo se obtuvo la serie, por la misma
+razón de la sección 4.2:
+
+| Serie a la que se aplica la prueba | Regresión ADF | p-values de MacKinnon | `c` al 5 % |
+|---|---|---|---|
+| Serie observada (p. ej. una simulación) | con constante | Dickey–Fuller, N = 1 | −2,86 |
+| Spread del par: **residuo** de la regresión de formación (α y β estimados con los mismos datos) | sin constante (el residuo de MCO ya tiene media cero) | Engle–Granger, N = 2 | −3,34 |
 
 MCO elige `α` y `β` para que el residuo sea lo más pequeño posible, así que el
-spread de un par parece más estacionario de lo que es. Con la tabla N = 1 la
-prueba lo aceptaría demasiadas veces. El laboratorio usa N = 2 para el spread del
-par (también en las ventanas de estabilidad del OU) y N = 1 cuando el AR(1) se
-ajusta a una serie observada.
+spread de un par parece más estacionario de lo que es: con la tabla N = 1 la
+prueba lo aceptaría demasiadas veces. Para el spread del par, la prueba del
+laboratorio es **exactamente el paso interno de Engle–Granger** (`coint` aplica
+ese mismo ADF sin constante al residuo y usa esa misma tabla). Por eso:
 
-**Comprobación por simulación** (2.000 repeticiones, 900 observaciones, como una
-formación de 1.500 con la división 60/20/20):
+```text
+OU válido sobre el spread de formación  ⇔  0 < b̂ < 1  y  p de Engle–Granger SIN AJUSTAR (dirección elegida) ≤ α
+```
 
-| Caso | `0 < b̂ < 1` (regla anterior) | Válido con N = 1 | Válido con N = 2 |
-|---|---|---|---|
-| Paseo aleatorio observado | 95,3 % | 4,6 % | 0,9 % |
-| Residuo de MCO entre dos paseos aleatorios independientes | 99,0 % | 13,8 % | 4,6 % |
+Se decide con el p-value. El valor crítico que se muestra es el que corresponde
+exactamente a ese p-value (se obtiene invirtiendo la fórmula de MacKinnon), así
+que «estadístico ≤ valor crítico» y «p-value ≤ α» nunca se contradicen. La tabla
+con corrección de muestra finita da casi lo mismo (con 899 transiciones, −3,343
+frente a −3,336 al 5 % con N = 2), pero haría discrepar al OU de Engle–Granger
+justo en esa franja.
 
-Con la regla anterior, casi todos los paseos aleatorios pasaban como OU válidos.
-Con la tabla correcta, la tasa de falsos «OU válidos» queda cerca del nivel
-nominal del 5 %. En el análisis completo de 200 pares de paseos aleatorios
-independientes de 1.500 observaciones, con la regla anterior los 200 daban un OU
-«válido»; con la regla actual, 17 (8,5 %): algo más del 5 % porque el laboratorio
-elige la dirección de Engle–Granger con menor p-value, y eso favorece el spread
-que más parece estacionario.
+**Ejemplo** (la demo con el par sintético SINT-COI): Engle–Granger de A sobre B da
+un estadístico −6,611 con 0 rezagos; el ADF del spread da −6,61 con 0 rezagos,
+frente a un valor crítico de −3,34 al 5 % y un p-value < 0,0001. Es el mismo
+número porque es el mismo cálculo.
+
+**Relación con el estado del par.** Engle–Granger decide el estado con el p-value
+**ajustado** por Benjamini–Hochberg (sección 5.4), que nunca es menor que el p sin
+ajustar. Por tanto, un par ✅ siempre supera la prueba de raíz unitaria del OU.
+Lo contrario no es cierto: si `p sin ajustar ≤ α < p ajustado`, el OU es válido
+pero el estado es ⚠️ Evidencia insuficiente, y el backtest se muestra solo como
+ilustración (decisión O5).
+
+**Comprobación por simulación** (2.000 repeticiones de 900 observaciones, como una
+formación de 1.500 con la división 60/20/20; porcentaje de casos que salen «OU
+válido»; lo ideal es ≈ 5 %):
+
+| Caso | `0 < b̂ < 1` (regla original) | Tabla | Sin rezagos (regla anterior) | ADF (regla actual) |
+|---|---|---|---|---|
+| Paseo aleatorio observado | 96,2 % | N = 1 | 4,8 % | 5,3 % |
+| Residuo de MCO entre dos paseos independientes | 99,1 % | N = 1 (incorrecta) | 13,3 % | 14,3 % |
+| Residuo de MCO entre dos paseos independientes | 99,1 % | N = 2 | 4,8 % | 5,4 % |
+| Paseo aleatorio + ruido de medición del 0,5 % | 98,8 % | N = 1 | 11,9 % | 5,2 % |
+| Paseo aleatorio + ruido de medición del 1 % | 100,0 % | N = 1 | 38,0 % | 5,7 % |
+
+Con la regla original, casi todos los paseos aleatorios pasaban como OU válidos.
+Con la tabla correcta y los rezagos, la tasa de falsos «OU válidos» queda cerca
+del 5 % nominal, también con ruido de microestructura. En el análisis completo de
+200 pares de paseos aleatorios independientes de 1.500 observaciones, con la regla
+original los 200 daban un OU «válido»; con la regla actual, 21 (10,5 %) y ninguno
+✅. Supera el 5 % porque el laboratorio elige la dirección de Engle–Granger con
+menor p-value, y eso favorece el spread que más parece estacionario. En los 200
+casos la validez del OU coincidió con Engle–Granger sin ajustar.
 
 **Si la prueba no rechaza** (`near_unit_root`: `0 < b̂ < 1` pero `b̂` no se
-distingue de 1): el estado del ajuste es «no estacionario», se muestran `b̂`, `τ`
-y el valor crítico, y no se calculan `λ`, `μ`, `σ`, vida media ni bandas. El par
-recibe la razón de descarte `OU_NO_ESTACIONARIO`, que bloquea la estrategia.
-
-**Relación con Engle–Granger.** Las dos pruebas usan las mismas tablas (N = 2),
-pero no son la misma prueba: Engle–Granger elige rezagos por AIC (un ADF) y el OU
-usa un AR(1) sin rezagos. Pueden discrepar, por ejemplo si el spread tiene más
-memoria que un AR(1). El laboratorio muestra las dos: Engle–Granger decide el
-estado del par (evidencia de cointegración) y la prueba del AR(1) decide si el
-modelo OU se puede usar.
+distingue de 1): el estado del ajuste es «no estacionario», se muestran `b̂`, el
+estadístico, sus rezagos, su p-value y el valor crítico, y no se calculan `λ`,
+`μ`, `σ`, vida media ni bandas. El par recibe la razón de descarte
+`OU_NO_ESTACIONARIO`, que bloquea la estrategia. Si la prueba no se puede calcular
+(por ejemplo, con faltantes se usa el tramo continuo más largo, y tiene menos de
+30 observaciones), el ajuste es «datos insuficientes».
 
 **Ruido de redondeo.** Si las dos piernas son idénticas o proporcionales, el
 spread es casi nulo y solo contiene ruido numérico. El laboratorio compara la
@@ -945,23 +994,53 @@ Ljung–Box:  Q(m) = n·(n + 2)·Σ_{k=1..m} ρ̂_k² / (n − k)  ~  χ² con m
 - No detectar autocorrelación es compatible con el modelo, pero no prueba que sea
   correcto.
 
-**Estabilidad del OU (decisión E8).** Se ajusta el OU en las mismas ventanas de
-la sección 6 (252 observaciones, paso 63) sobre el spread de formación con `α` y
-`β` **fijos** (el spread que realmente se opera). Cada ventana usa la misma regla
-de validez que el ajuste completo (sección 8.5: `0 < b̂ < 1` y Dickey–Fuller con
-valores críticos N = 2):
+**Estabilidad del OU (decisión E8).** Se ajusta el AR(1) en las mismas ventanas
+de la sección 6 (252 observaciones, paso 63) sobre el spread de formación con `α`
+y `β` **fijos** (el spread que realmente se opera). En cada ventana con
+`0 < b̂ < 1` se calculan `λ`, `μ`, `σ` y la vida media, **sin exigir** que la
+prueba de raíz unitaria rechace:
 
 ```text
-CV(λ) = desviación estándar(λ_ventanas) / media(λ_ventanas)     (ddof = 1, solo ventanas válidas)
+CV(λ) = desviación estándar(λ_ventanas) / media(λ_ventanas)     (ddof = 1, ventanas con 0 < b̂ < 1)
 ```
 
 Cuanto mayor es el CV, menos estable es la velocidad de reversión. Con pocas
 observaciones por ventana es esperable cierta variación (ver la tabla de la
 sección 8.6).
 
-**En el código:** `mrlab.model.ou` (`fit_ou`, `conditional_mean`,
-`conditional_variance`, `forecast`, `simulate_ou_exact`,
-`simulate_paths_summary`), `mrlab.model.diagnostics`.
+La prueba ADF de cada ventana se informa **aparte** (rechaza o no, estadístico,
+rezagos y p-value), con los valores críticos de una serie observada (N = 1): la
+ventana es un tramo de un spread cuyos `α` y `β` se estimaron con toda la
+formación, no en la ventana, así que la corrección N = 2 no corresponde.
+
+¿Por qué no filtrar las ventanas con la prueba? Porque con 252 observaciones tiene
+poca potencia: en un OU verdadero muchas ventanas no rechazan, y las que sí lo
+hacen son las de `λ` más alto. Quedarse solo con ellas haría que la vida media
+pareciera más corta y el CV más pequeño de lo que son. Simulación (pares
+cointegrados de 1.500 observaciones; ventanas de 252 sobre los 900 datos de
+formación; 100 pares por fila, 400 en la de paseos):
+
+| Spread | Ventanas con parámetros | Mediana de la vida media en las ventanas | La prueba ADF rechaza en |
+|---|---|---|---|
+| OU con `λ = 0,05` (vida media 13,9 días) | 100 % | 10,8 días | 48 % de las ventanas |
+| OU con `λ = 0,1` (vida media 6,9 días) | 100 % | 6,1 días | 93 % de las ventanas |
+| Paseos aleatorios independientes (no hay OU) | — | — | 7,2 % de las ventanas |
+
+Lectura: con un OU lento, la mitad de las ventanas «no rechaza» aunque el spread
+revierta, así que no rechazar en una ventana no prueba que la dinámica haya
+cambiado. La vida media de las ventanas sale algo más corta que la verdadera
+porque el AR(1) sobrestima `λ` en muestras cortas. Si se exigiera el rechazo con
+los valores críticos N = 2 (regla anterior), con `λ = 0,05` solo el 17 % de las
+ventanas tenía parámetros, la mediana bajaba a 6,6 días y 48 de los 100 pares se
+quedaban sin CV(λ). Con paseos
+independientes la prueba rechaza algo más del 5 % nominal porque `α` y `β` se
+estimaron con toda la formación y por la selección de rezagos en muestras cortas.
+La validez del OU la decide siempre el ajuste de toda la formación (sección 8.5).
+
+**En el código:** `mrlab.model.ou` (`fit_ou`, `adf_unit_root_test`,
+`conditional_mean`, `conditional_variance`, `forecast`, `simulate_ou_exact`,
+`simulate_paths_summary`), `mrlab.model.diagnostics` (`residual_diagnostics`,
+`rolling_ou_stability`).
 
 ---
 

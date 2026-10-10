@@ -62,7 +62,9 @@ def compute_split(index: pd.DatetimeIndex, cfg: SplitConfig | None = None) -> Sa
     n_val = int(math.floor(n * cfg.validation)) if cfg.test > 0 else n - n_train
     n_test = n - n_train - n_val
     if n_train < 1:
-        raise ConfigError("No hay datos suficientes para la muestra de formación.", code="DATOS_INSUFICIENTES")
+        raise ConfigError(
+            "No hay datos suficientes para la muestra de formación.", code="DATOS_INSUFICIENTES"
+        )
 
     def _d(i: int) -> date:
         return idx[i].date()

@@ -25,14 +25,22 @@ class StrategyParams(BaseModel):
     entry_z: float = Field(2.0, gt=0, description="Entrada cuando |z| supera este umbral")
     exit_z: float = Field(0.5, ge=0, description="Salida normal al volver a este nivel")
     stop_z: float = Field(3.5, gt=0, description="Stop-loss en z")
-    stop_loss_pct: float = Field(0.05, gt=0, le=1, description="Stop monetario: fracción del capital asignado al par")
+    stop_loss_pct: float = Field(
+        0.05, gt=0, le=1, description="Stop monetario: fracción del capital asignado al par"
+    )
     max_holding_mult: float = Field(3.0, gt=0, description="Tiempo máximo = mult × vida media")
     max_holding_min: int = Field(5, ge=1, description="Mínimo del tiempo máximo, en observaciones")
-    max_holding_override: int | None = Field(None, ge=1, description="Fija el tiempo máximo (ignora la vida media)")
+    max_holding_override: int | None = Field(
+        None, ge=1, description="Fija el tiempo máximo (ignora la vida media)"
+    )
     cooldown_bars: int = Field(5, ge=0, description="Enfriamiento tras un stop, en observaciones")
-    rearm: bool = Field(True, description="Tras stop o tiempo máximo, exigir que z vuelva dentro de ±entrada")
+    rearm: bool = Field(
+        True, description="Tras stop o tiempo máximo, exigir que z vuelva dentro de ±entrada"
+    )
     initial_capital: float = Field(10_000.0, gt=0)
-    gross_exposure_target: float = Field(1.0, gt=0, description="Exposición bruta objetivo / capital")
+    gross_exposure_target: float = Field(
+        1.0, gt=0, description="Exposición bruta objetivo / capital"
+    )
     max_leverage: float = Field(2.0, gt=0, description="Exposición bruta máxima / capital")
     allow_short: bool = True
     integer_units: bool = Field(False, description="Redondear cantidades a enteros (hacia cero)")

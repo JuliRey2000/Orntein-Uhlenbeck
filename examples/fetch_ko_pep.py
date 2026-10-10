@@ -24,7 +24,10 @@ from pathlib import Path
 EXAMPLES_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT = EXAMPLES_DIR / "data" / "real"
 DEFAULT_SYMBOLS = ("KO", "PEP")
+DEFAULT_START = date(2010, 1, 1)
 
+if str(EXAMPLES_DIR) not in sys.path:  # con python -P (o PYTHONSAFEPATH) no se añade solo
+    sys.path.insert(0, str(EXAMPLES_DIR))
 try:
     import mrlab  # noqa: F401
 except ImportError:  # permite ejecutarlo sin instalar el paquete
@@ -36,6 +39,8 @@ from mrlab.data.providers.csv_provider import CSVProvider, build_metadata  # noq
 from mrlab.data.providers.yahoo import YahooProvider  # noqa: E402
 from mrlab.domain.errors import LabError  # noqa: E402
 from mrlab.domain.models import DataOrigin, PriceSeries, PriceType  # noqa: E402
+
+from _cli import SpanishArgumentParser, iso_date  # noqa: E402
 
 COLUMNS = ("close", "open", "high", "low", "volume")
 
@@ -81,15 +86,56 @@ def fetch(
     )
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Descarga series de Yahoo Finance a CSV para la demo. " + DISCLAIMER
+def parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = SpanishArgumentParser(
+        description=(
+            "Descarga series de Yahoo Finance (fuente gratuita y no oficial; requiere internet) a "
+            "CSV con su archivo .meta.json, listas para la demo. " + DISCLAIMER
+        ),
+        epilog=(
+            "Los datos descargados son solo para tu uso local: no los subas al repositorio "
+            "(examples/data/real/ está en .gitignore)."
+        ),
     )
-    parser.add_argument("--symbols", nargs="+", default=list(DEFAULT_SYMBOLS))
-    parser.add_argument("--start", type=date.fromisoformat, default=date(2010, 1, 1))
-    parser.add_argument("--end", type=date.fromisoformat, default=None, help="Por defecto, hoy")
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--symbols",
+        nargs="+",
+        default=list(DEFAULT_SYMBOLS),
+        metavar="SÍMBOLO",
+        help=f"Símbolos de Yahoo Finance que se descargan (por defecto, {' '.join(DEFAULT_SYMBOLS)})",
+    )
+    parser.add_argument(
+        "--start",
+        type=iso_date,
+        default=DEFAULT_START,
+        metavar="AAAA-MM-DD",
+        help=f"Fecha inicial AAAA-MM-DD (por defecto, {DEFAULT_START.isoformat()})",
+    )
+    parser.add_argument(
+        "--end",
+        type=iso_date,
+        default=None,
+        metavar="AAAA-MM-DD",
+        help="Fecha final AAAA-MM-DD (por defecto, hoy)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT,
+        metavar="CARPETA",
+        help="Carpeta donde se guardan los CSV (por defecto, examples/data/real/)",
+    )
     args = parser.parse_args(argv)
+    if args.end is not None and args.end < args.start:
+        parser.error(
+            f"la fecha final ({args.end.isoformat()}) es anterior a la inicial "
+            f"({args.start.isoformat()})"
+        )
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
 
     settings = get_settings()
     provider = YahooProvider(

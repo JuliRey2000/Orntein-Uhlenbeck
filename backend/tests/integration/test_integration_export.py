@@ -230,6 +230,28 @@ def test_statistics_file_names_every_ou_field_in_spanish(historical_result):
     } <= ou_fields
 
 
+def test_statistics_file_names_the_adf_fields_and_the_ou_windows_in_spanish(historical_result):
+    # O7 refinada: df_pvalue y df_lags del OU, y la prueba ADF de cada ventana de estabilidad
+    # (unit_root_rejected, df_*), salían con su nombre en inglés. El resumen decía
+    # «ventanas_no_validas» aunque ahora cuenta las ventanas sin parámetros (0 < b < 1).
+    from mrlab.model.diagnostics import OUWindow
+
+    rows = csv_rows(export_files(historical_result)["pruebas_estadisticas.csv"])
+    ou_fields = {r[3] for r in rows if r[1] == "ou"}
+    assert {"p_valor_dickey_fuller", "rezagos_dickey_fuller"} <= ou_fields
+    window_fields = {r[3] for r in rows if r[1] == "estabilidad_ou" and r[2].startswith("ventana")}
+    english = (set(OUWindow.model_fields) - MATH_FIELDS - {"estimable"}) & window_fields
+    assert not english, f"campos de las ventanas del OU sin traducir: {sorted(english)}"
+    assert {"rechaza_raiz_unitaria", "p_valor_dickey_fuller", "estimable"} <= window_fields
+    summary = {r[3]: r[4] for r in rows if r[1] == "estabilidad_ou" and r[2] == "resumen"}
+    assert "ventanas_no_validas" not in summary
+    stability = historical_result.analysis.ou_stability
+    assert summary["ventanas_sin_parametros"] == str(stability.n_invalid)
+    assert summary["ventanas_con_prueba_dickey_fuller"] == str(stability.n_unit_root_tested)
+    assert summary["ventanas_que_rechazan_raiz_unitaria"] == str(stability.n_unit_root_rejected)
+    assert stability.n_unit_root_tested == len(stability.windows) > 0
+
+
 def test_statistics_file_reports_non_evaluable_stability_windows(tmp_path):
     # Una ventana de estabilidad no evaluable (tramo plano) se exporta con su motivo.
     log_a, log_b = cointegrated_log_prices(n=1500, seed=11, lam=0.1)

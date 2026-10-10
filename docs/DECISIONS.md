@@ -90,7 +90,9 @@ el responsable del proyecto.
   proveedor y mismo símbolo, sin distinguir mayúsculas ni espacios) producen el
   estado «⛔ Datos insuficientes», con la causa concreta explicada. El mismo
   símbolo de proveedores distintos no es ⛔, pero queda bloqueado por
-  colinealidad (O8).
+  colinealidad (O8). Si lo que coincide son los instrumentos que se OPERAN (tras
+  los proxies ejecutables), el estado no cambia y la simulación queda bloqueada
+  con `EJECUTABLES_IDENTICOS` (A2a).
 - **Alternativas:** crear un sexto estado «Datos no aptos»; para el mismo activo,
   solo un aviso.
 - **Justificación:** la especificación exige exactamente cinco estados; ⛔ es el
@@ -221,6 +223,28 @@ el responsable del proyecto.
   2.3; lo que no se puede simular lo bloquea el análisis (S12).
 - **Fecha:** 2026-10-10
 
+### D15a — Resumen de validación con las fechas realmente usadas (complementa D15 y A2)
+- **Decisión:** con instrumentos ejecutables (o con un `frozen_split` cuyos
+  conteos difieran), el informe de validación se recalcula con las fechas
+  realmente usadas: `n_aligned` = observaciones tras la intersección con los
+  ejecutables, `n_train_estimate` = formación efectiva, y `status_message` con
+  `validation.usable_status` (antes `_usable_status`) sobre TODAS las incidencias.
+  Las incidencias de un ejecutable llevan `details["instrumento_ejecutable"] =
+  True`; su error se resume como «… en el instrumento ejecutable «X» (n fecha(s)),
+  que bloquean la simulación» y se añade «Incluye N incidencia(s) de los
+  instrumentos ejecutables». El informe queda bloqueado («Análisis bloqueado: …»,
+  `blocked = True`, con su incidencia) si la formación queda por debajo del
+  mínimo tras la intersección (`DATOS_INSUFICIENTES`) o si la moneda del proxy es
+  distinta o desconocida (`MONEDA_PROXY_DISTINTA`, `MONEDA_DESCONOCIDA`). Si nada
+  cambia respecto de `validate_pair`, el informe se conserva idéntico.
+- **Alternativas:** conservar el resumen de `validate_pair` y añadir una frase
+  sobre los ejecutables (versión anterior).
+- **Justificación:** con un proxy que empezaba más tarde, el resumen decía
+  «1.500 observaciones comunes, 900 en formación» cuando el análisis usaba 900 y
+  540; con un precio del proxy ≤ 0 (error que bloquea la simulación) decía «Datos
+  aptos». Ambas cosas contradicen D15 y la sección 2.3.
+- **Fecha:** 2026-10-10
+
 ### D16 — Logger de yfinance (complementa A9)
 - **Decisión:** al importar `yfinance`, el logger «yfinance» sube a ERROR (solo
   se sube: si alguien lo fijó más alto se respeta), salvo que esté activo el modo
@@ -315,7 +339,35 @@ el responsable del proyecto.
 - **Alternativas:** re-estimar el hedge ratio en cada ventana.
 - **Justificación:** interesa la estabilidad de la dinámica del spread que
   realmente se opera.
-- **Fecha:** 2026-10-10
+- **Actualización (2026-10-10), parámetros y prueba de raíz unitaria por
+  ventana:** λ, μ, σ, la vida media y CV(λ) se calculan en toda ventana con
+  `0 < b̂ < 1` (`fit_ou(..., require_unit_root_rejection=False)`;
+  `OUWindow.valid` pasó a llamarse `OUWindow.estimable` y se añade `b`). La
+  prueba ADF de cada ventana se informa APARTE y no filtra los parámetros:
+  `unit_root_rejected`, `df_stat`, `df_pvalue`, `df_lags`, más el resumen
+  `n_unit_root_tested`, `n_unit_root_rejected` y `unit_root_alpha`. Usa los
+  valores críticos de una serie observada (N = 1), porque α y β se estimaron con
+  toda la formación y no se re-estiman en la ventana. `OUStability.n_invalid`
+  cuenta las ventanas sin parámetros. El mensaje da la mediana de la vida media,
+  cuántas ventanas rechazan, la baja potencia con 252 observaciones y aclara que
+  no rechazar en una ventana no prueba inestabilidad: la validez del OU la decide
+  el ajuste de toda la formación (O7).
+  - *Alternativas:* aplicar en cada ventana la regla completa de O7 con N = 2
+    (versión anterior); aplicarla con N = 1.
+  - *Justificación:* con N = 2 en tramos de un residuo con α y β fijos, la prueba
+    solo rechazaba el 1,6 % de las ventanas de paseos independientes (5 %
+    nominal). Con OU verdaderos (λ = 0,05), el 83 % de las ventanas quedaba «no
+    válido», el 48 % de los pares no tenía CV(λ) y, como solo pasaban las
+    ventanas con λ alto, la mediana de la vida media salía 6,6 días frente a
+    13,9 verdaderos. Exigir el rechazo con N = 1 seguiría seleccionando por λ.
+    Medido con la regla actual (MATEMATICAS §8.7): con 400 pares de paseos
+    independientes, el ADF de la ventana rechaza en el 7,2 % de las 4.400
+    ventanas (algo más del 5 % porque α y β se estimaron con toda la formación y
+    por la selección de rezagos en muestras cortas). Con 100 pares OU verdaderos
+    (λ = 0,05, 1.500 observaciones), el 100 % de las ventanas tiene parámetros,
+    hay CV(λ) en los 100 pares, la mediana de la vida media es 10,8 días frente a
+    13,9 verdaderos (sesgo del AR(1) con 252 observaciones) y el ADF rechaza solo
+    en el 48 % de las ventanas: por eso no puede usarse como filtro.
 
 ### E9 — Correlaciones por par sobre fechas comunes
 - **Decisión:** los log-rendimientos de cada par se calculan sobre la intersección
@@ -413,7 +465,9 @@ el responsable del proyecto.
   banner rojo permanente «El par no superó los filtros: resultado solo
   ilustrativo».
 - **Actualización (2026-10-10):** «OU válido» significa `0 < b < 1` **y** que la
-  prueba de Dickey–Fuller del AR(1) rechace la raíz unitaria (O7). El banner
+  prueba de Dickey–Fuller aumentada (ADF, rezagos por AIC) rechace la raíz
+  unitaria (O7); sobre el spread de formación equivale a que Engle–Granger SIN
+  AJUSTAR de la dirección elegida rechace al nivel α. El banner
   también se muestra si el par es ✅ pero tiene alguna razón de descarte, y cita
   los motivos (O5a).
 - **Alternativas:** bloquear siempre que el par no sea ✅.
@@ -450,37 +504,68 @@ el responsable del proyecto.
   de cruce y vida media es en sí una lección.
 - **Fecha:** 2026-10-10
 
-### O7 — Validez del OU: 0 < b < 1 y Dickey–Fuller rechaza la raíz unitaria
-- **Decisión:** un ajuste OU solo es VÁLIDO si `0 < b̂ < 1` **y** la prueba de
-  Dickey–Fuller sobre el AR(1) (estadístico `(b̂ − 1)/EE(b̂)`, sin rezagos, con
-  constante) rechaza la raíz unitaria al nivel α (0,05 por defecto; en el análisis
-  del par, α = `alpha_level`). Valores críticos de MacKinnon: N = 1 para una serie
-  observada (valor por defecto de `fit_ou`) y N = 2 cuando el spread es el
-  RESIDUO de la regresión de cointegración estimada con los mismos datos (el
-  análisis del par, también en la estabilidad del OU por ventanas). Para 1/5/10 %
-  se usan los valores con corrección de muestra finita; para otros niveles, el
-  asintótico (invirtiendo `mackinnonp`). Si no se rechaza: estado
-  `NON_STATIONARY`, `valid = False`, `near_unit_root = True` (significa «0 < b̂ < 1
-  pero b̂ no se distingue de 1»), sin λ, μ, σ, σ_eq, vida media, EE(μ̂) ni bandas.
-  Se conservan a, b, el estadístico y el valor crítico, y el mensaje en español los
-  muestra. La razón de descarte `RAIZ_UNITARIA_CERCANA` desaparece: ahora es
-  `OU_NO_ESTACIONARIO`, que bloquea la estrategia. Sustituye la parte de A9 que
-  decía que `near_unit_root` es solo un aviso y precisa O5.
-- **Alternativas:** mantener solo `0 < b < 1` con un aviso (regla anterior); usar
-  siempre N = 1; decidir con el p-value asintótico.
-- **Justificación:** con la regla anterior un paseo aleatorio salía «válido» casi
-  siempre por el sesgo de Dickey–Fuller (MCO subestima b cuando b = 1). Simulación
-  con 900 observaciones (una formación de 1.500) y 2.000 repeticiones: un paseo
-  aleatorio observado tiene `0 < b̂ < 1` en el 95,3 % de los casos y la prueba con
-  N = 1 lo acepta en el 4,6 %; el residuo de MCO entre dos paseos aleatorios
-  independientes tiene `0 < b̂ < 1` en el 99,0 %, la tabla N = 1 lo acepta en el
-  13,8 % y la tabla N = 2 en el 4,6 % (≈ nominal). En el análisis completo de 200
-  pares de paseos independientes de 1.500 observaciones (verificación de la
-  revisión), con la regla anterior los 200 daban un OU válido (156 con el aviso de
-  raíz unitaria y 44 sin ningún aviso); con O7, 17 (8,5 %, algo más del 5 % porque
-  se elige la dirección de menor p-value). Además, la prueba obligatoria de la sección 14 dependía de una semilla
-  elegida. La sección 0/17 prohíbe sugerir reversión sin evidencia. Detalle en
-  MATEMATICAS §8.5.
+### O7 — Validez del OU: 0 < b < 1 y la prueba ADF rechaza la raíz unitaria
+- **Decisión:** un ajuste OU solo es VÁLIDO si `0 < b̂ < 1` **y** una prueba de
+  Dickey–Fuller AUMENTADA (ADF) rechaza la raíz unitaria al nivel α (0,05 por
+  defecto; en el análisis del par, α = `alpha_level`): se rechaza si el p-value
+  es ≤ α. El AR(1) por MCO (O1) solo estima a, b, λ, μ, σ, σ_eq y la vida media;
+  la decisión la toma el ADF, con los rezagos de las diferencias elegidos por AIC
+  hasta `maxlag` (`AnalysisConfig.maxlag` en el análisis, el mismo de
+  Engle–Granger, E3; 12 por defecto en `fit_ou`).
+  - Serie observada (`estimated_residual=False`, valor por defecto de `fit_ou`):
+    `adfuller(x, regression="c", autolag="AIC")`, p-value de MacKinnon con N = 1.
+  - Residuo de la regresión de cointegración estimada con los mismos datos
+    (`estimated_residual=True`: el spread de formación del análisis del par):
+    `adfuller(resid, regression="n", autolag="aic")` y p-value de MacKinnon N = 2
+    con constante, que es exactamente el paso interno de `statsmodels.coint`. Por
+    eso, en formación, OU válido ⟺ `0 < b̂ < 1` y p-value de Engle–Granger SIN
+    AJUSTAR de la dirección elegida ≤ α (mismo estadístico, mismos rezagos y mismo
+    p-value; una prueba lo verifica). Engle–Granger decide el estado con el p-value
+    AJUSTADO (A8), que es mayor o igual: un par ✅ siempre rechaza aquí, y un par
+    con p sin ajustar ≤ α < p ajustado tiene un OU válido pero queda ⚠️ (backtest
+    solo ilustrativo, O5).
+  - `df_crit` es el valor crítico que corresponde exactamente a ese p-value
+    (inversión de `mackinnonp`), así que «estadístico ≤ valor crítico» y «p-value
+    ≤ α» nunca se contradicen. La tabla de muestra finita (`mackinnoncrit`) difiere
+    en menos de 0,01 con n ≥ 252 (al 5 % con 899 transiciones: −2,865 frente a
+    −2,862 con N = 1; −3,343 frente a −3,336 con N = 2), pero haría discrepar la
+    validez del OU y Engle–Granger en esa franja.
+  - Si no se rechaza: estado `NON_STATIONARY`, `valid = False`,
+    `near_unit_root = True` (significa «0 < b̂ < 1 pero b̂ no se distingue de 1»),
+    sin λ, μ, σ, σ_eq, vida media, EE(μ̂) ni bandas. Se conservan a, b y la prueba
+    (`df_stat`, `df_crit`, `df_pvalue`, `df_lags`, `df_alpha`,
+    `df_estimated_residual`), y el mensaje en español la describe con sus rezagos.
+    La razón de descarte es `OU_NO_ESTACIONARIO`, que bloquea la estrategia
+    (sustituye a la antigua `RAIZ_UNITARIA_CERCANA`, que solo avisaba).
+  - Si la prueba no se puede calcular, el ajuste es `INSUFFICIENT` (A9).
+  - `fit_ou(require_unit_root_rejection=False)` calcula e informa la prueba igual,
+    pero la validez solo exige `0 < b̂ < 1`. Lo usan las ventanas de estabilidad
+    (E8), donde la prueba de cada ventana es un dato aparte con N = 1.
+  - Sustituye la parte de A9 que decía que `near_unit_root` es solo un aviso y
+    precisa O5.
+- **Alternativas:** mantener solo `0 < b < 1` con un aviso (regla original);
+  Dickey–Fuller SIN rezagos sobre el AR(1), con la tabla de muestra finita
+  (primera versión de esta decisión); Phillips–Perron; usar siempre N = 1.
+- **Justificación:** simulación con 900 observaciones (una formación de 1.500 con
+  la división 60/20/20) y 2.000 repeticiones (MATEMATICAS §8.5):
+  - Con la regla original, un paseo aleatorio observado tiene `0 < b̂ < 1` en el
+    96,2 % de los casos (sesgo de Dickey–Fuller); la prueba lo acepta en el 5,3 %.
+  - El residuo de MCO entre dos paseos independientes tiene `0 < b̂ < 1` en el
+    99,1 %; la tabla N = 1 lo acepta en el 14,3 % y la N = 2 en el 5,4 % (≈
+    nominal).
+  - Sin rezagos, la prueba rechazaba de más cuando los incrementos tienen
+    autocorrelación, como con ruido de microestructura: un paseo aleatorio más un
+    ruido de medición iid de 0,5 % o 1 % salía «OU válido» en el 11,9 % y el
+    38,0 % de los casos. Con el ADF, en el 5,2 % y el 5,7 %.
+  - En el análisis completo de 200 pares de paseos independientes de 1.500
+    observaciones: con la regla original los 200 daban un OU válido; con la
+    primera versión de O7, 17; con la actual, 21 (10,5 %, ninguno ✅). Supera el
+    5 % porque se elige la dirección de Engle–Granger con menor p-value, y en los
+    200 casos la validez coincide con Engle–Granger sin ajustar.
+  - Que el OU y Engle–Granger usen el mismo cálculo evita que el alumno vea dos
+    veredictos distintos sobre la misma serie. La sección 0/17 prohíbe sugerir
+    reversión sin evidencia, y la prueba obligatoria de la sección 14 («random
+    walk → no estacionario») ya no depende de una semilla elegida.
 - **Fecha:** 2026-10-10
 
 ### O8 — Series colineales y escala absoluta del spread
@@ -609,6 +694,39 @@ el responsable del proyecto.
   historial viaja con la configuración y detecta el caso real reproducido con la
   demo (editar los umbrales del `run_config.json` y volver a ejecutar). Se declara
   su límite: si se borra el historial a mano, no se detecta.
+- **Actualización (2026-10-10), límite de la fase 1:** tampoco se detecta si una
+  ejecución nueva parte de una configuración sin ese historial: exportar en otra
+  carpeta (`--output-dir`) o partir de un `run_config.json` copiado antes de
+  ejecutar la prueba y exportar fuera de la carpeta original. La nota de alcance
+  (`TEST_HISTORY_NOTE`, también en el `LEEME.txt` exportado) y el README lo dicen;
+  la demo conserva el historial de la carpeta de destino (S10b). La solución
+  completa es el registro persistente de estudios de la fase 2 (S10).
+- **Fecha:** 2026-10-10
+
+### S10b — Historial de la prueba en la demo (complementa S10a y A7)
+- **Decisión:** antes de exportar, la demo fusiona el `test_history` del
+  `run_config.json` (con o sin prefijo `SINTETICO_`) que ya haya en la carpeta de
+  destino cuando es del mismo par (mismo proveedor y símbolo de A y B; los
+  proxies ejecutables y las fechas no cuentan, para no perder historial). Lo hace
+  en ejecuciones nuevas y también con `--reproducir`. El archivo existente se lee
+  de forma tolerante, sin verificar el hash, porque `test_history` está fuera de
+  él. Si la fusión añade hashes, `run_pair` se vuelve a llamar con el historial
+  fusionado, para que `export_basename` siga siendo la única fuente del nombre de
+  la carpeta y la marca se calcule con el historial completo. Un
+  `run_config.json` ilegible da `DEMO_HISTORIAL_ILEGIBLE`; uno de otro par con
+  historial, `DEMO_CARPETA_DE_OTRO_PAR` (código de salida 2, sin sobrescribir).
+  Uno de otro par sin historial se reemplaza con aviso. La opción
+  `--reiniciar-historial` descarta a conciencia el historial de la carpeta de
+  destino y lo avisa.
+- **Alternativas:** un registro mínimo por carpeta de salida
+  (`historial_prueba.json`); solo avisar y no sobrescribir un historial no vacío;
+  esperar al registro de la fase 2.
+- **Justificación:** una ejecución normal de la demo creaba un `RunConfig` con el
+  historial vacío y sobrescribía el `run_config.json` de la misma carpeta (la
+  carpeta por defecto es la misma para el mismo par). Así, tras ver la prueba,
+  bastaba volver a ejecutar la demo y editar los umbrales para que la prueba
+  saliera «no contaminada». Leer el historial que ya está en la carpeta de destino
+  cierra ese camino sin introducir un archivo nuevo.
 - **Fecha:** 2026-10-10
 
 ### S11 — Avisos del motor: corto de cripto spot y capital agotado
@@ -693,7 +811,9 @@ el responsable del proyecto.
 - **Decisión:** puntaje = Σ wᵢ·sᵢ con sᵢ ∈ [0, 1], fórmulas visibles:
   cointegración `clip(1 − p_aj/0,10)`; estabilidad `1 − fracción de ventanas
   fallidas` (0 si β cambia de signo); vida media 1 en [5, 63] días, lineal hasta 0
-  en 1 y 126; calidad OU `½·min(1, p_LB/0,05) + ½·(1 − min(1, CV de λ))`; costes
+  en 1 y 126; calidad OU `½·min(1, p_LB/0,05) + ½·(1 − min(1, CV de λ))`, con
+  el CV de λ de las ventanas con `0 < b̂ < 1` (E8; la prueba ADF por ventana no lo
+  filtra); costes
   `clip(1 − coste ida y vuelta / ((z_entrada − z_salida)·σ_eq))`; validación
   `clip(Sharpe_validación/2)` (×½ si hay menos de 10 operaciones). Pesos por
   defecto 0,25 / 0,20 / 0,15 / 0,15 / 0,10 / 0,15. Los pares no ✅ o con OU
@@ -701,11 +821,18 @@ el responsable del proyecto.
   columna aparte y no entra en el puntaje.
 - **Alternativas:** ordenar por p-value; ordenar por PnL.
 - **Justificación:** la especificación prohíbe ordenar por PnL retrospectivo.
+  Calcular el CV de λ solo con las ventanas que rechazan la raíz unitaria lo
+  sesgaría (solo quedan las de λ alto; ver E8).
 - **Fecha:** 2026-10-10
 
 ### R2 — Walk-forward
 - **Decisión:** la posición se cierra al final de cada ventana de prueba; si en una
-  ventana el OU es inválido, no se opera en ella y se registra.
+  ventana el OU es inválido, no se opera en ella y se registra. Cada ventana de
+  formación del walk-forward re-estima α y β, así que su OU sigue la regla
+  completa de O7 (residuo estimado, N = 2: equivale a Engle–Granger sin ajustar en
+  esa ventana). Con 504 observaciones la prueba tiene menos potencia que con toda
+  la formación, y la interfaz lo explicará (a diferencia de las ventanas de
+  estabilidad de E8, aquí sí se decide si se opera).
 - **Alternativas:** arrastrar la posición entre ventanas.
 - **Justificación:** ventanas independientes y auditables.
 - **Fecha:** 2026-10-10
@@ -806,6 +933,20 @@ el responsable del proyecto.
   `AssertionError`.
 - **Fecha:** 2026-10-10
 
+### I8 — Metadatos del paquete dentro de `backend/`
+- **Decisión:** `backend/tests/unit/test_packaging.py` lee `backend/pyproject.toml`
+  con `tomllib` y comprueba que `project.readme`, `license`, `license-files` y
+  todas las rutas de `[tool.setuptools]` (`where`, `package-dir`, `data-files`,
+  `dynamic.*.file`…) quedan dentro de `backend/`: sin rutas absolutas ni «..».
+  Incluye una autoverificación con la configuración que rompió la instalación
+  (`readme = "../README.md"`).
+- **Alternativas:** un paso de CI con `pip install --dry-run -e ./backend` en un
+  clon limpio.
+- **Justificación:** es la regresión del fallo de `pip install -e "backend[dev]"`
+  en un clon nuevo (corregido en el commit ac0c276): sin prueba, la ruta podía
+  volver sin que la suite lo detectara. La prueba no necesita red ni un clon.
+- **Fecha:** 2026-10-10
+
 ## Integración de la fase 1
 
 ### A1 — Causas del estado y razones de descarte
@@ -813,13 +954,14 @@ el responsable del proyecto.
   ordenadas por la precedencia E6; si no hay ninguna, el estado es ✅ y lleva una
   única causa con el p-value ajustado de Engle–Granger. La validez del OU no es
   un estado: un OU no válido (O7: b fuera de (0, 1) o b que no se distingue de 1
-  según Dickey–Fuller, `OU_NO_ESTACIONARIO`) aparece en «¿Por qué se descartó?»
+  según la prueba ADF, `OU_NO_ESTACIONARIO`) aparece en «¿Por qué se descartó?»
   sin cambiar el estado. Lo mismo para la vida media fuera de [1, 126], el filtro
   de correlación, «costes superan el PnL bruto» en validación y un segmento que no
   se pudo simular (A10). Bloquean la simulación, sin cambiar el estado, las
   razones de `STRATEGY_BLOCKING_CODES`: OU no válido (`OU_NO_ESTACIONARIO`,
   `OU_B_NO_POSITIVO`, `OU_DATOS_INSUFICIENTES`), `SERIES_COLINEALES`,
-  `PROXY_REQUERIDO`, `PROXY_NO_EJECUTABLE` y `PRECIO_EJECUTABLE_NO_POSITIVO`.
+  `PROXY_REQUERIDO`, `PROXY_NO_EJECUTABLE`, `PRECIO_EJECUTABLE_NO_POSITIVO` y
+  `EJECUTABLES_IDENTICOS` (A2a).
   `strategy_allowed` = no ⛔, OU válido y ninguna de esas razones. Cualquier razón
   de descarte hace el resultado solo ilustrativo (O5a). Un error de datos durante
   los cálculos (p. ej. una serie constante en formación) da ⛔ con la causa
@@ -840,20 +982,51 @@ el responsable del proyecto.
   (a) una pierna no ejecutable (índice o futuro) sin proxy recibe la razón de
   descarte `PROXY_REQUERIDO`, que sugiere el proxy sin sustituirlo y bloquea la
   simulación; el análisis estadístico se muestra completo. Si el instrumento
-  elegido como ejecutable tampoco es ejecutable: `PROXY_NO_EJECUTABLE`.
+  elegido como ejecutable tampoco es ejecutable: `PROXY_NO_EJECUTABLE`. «No
+  ejecutable» significa `not AssetInfo.executable` **o** clase de activo en
+  `NON_EXECUTABLE_CLASSES` (índice, futuro), tanto para la serie analizada como
+  para el proxy: es una defensa además del validador de `AssetInfo`, que
+  `model_copy` no ejecuta. `PROXY_REQUERIDO` nunca sugiere un proxy que coincida
+  con la serie o el ejecutable de la otra pierna: lo dice y pide otro instrumento
+  (A2a).
   (b) Las incidencias de la limpieza del proxy (duplicados, faltantes, saltos,
   huecos, precios ≤ 0) se añaden al informe de validación con su símbolo y la
-  etiqueta «Instrumento ejecutable», y el resumen las menciona.
+  etiqueta «Instrumento ejecutable», y el resumen se recalcula con las fechas
+  realmente usadas (D15a).
   (c) Las fechas con precio del proxy ≤ 0 ya no se excluyen: bloquean la
   simulación (S12).
   (d) El calendario se decide con todos los instrumentos (D17).
 - **Alternativas:** operar el índice sobre su propia serie con un aviso (versión
   anterior de esta decisión); reindexar el proxy y rellenar huecos; excluir las
-  fechas con precio ≤ 0.
+  fechas con precio ≤ 0; decidir «no ejecutable» solo con `AssetInfo.executable`
+  (un índice construido sin el validador se simulaba sin proxy).
 - **Justificación:** D1 confirmada exige ejecutar con un proxy elegido
   explícitamente: un índice no se puede comprar ni vender, así que simularlo como
   si se pudiera presentaba un PnL imposible. Las incidencias del proxy alimentan el
   PnL y deben verse. Coherente con D6 (nunca rellenar).
+- **Fecha:** 2026-10-10
+
+### A2a — Ejecutables idénticos (complementa A1 y A2)
+- **Decisión:** nueva razón de descarte `EJECUTABLES_IDENTICOS`, incluida en
+  `STRATEGY_BLOCKING_CODES`. Se activa si, tras resolver `exec_a`/`exec_b`, las dos
+  piernas se operarían con el mismo instrumento (mismo proveedor y símbolo, sin
+  distinguir mayúsculas ni espacios) o con precios proporcionales en las fechas
+  usadas (desviación estándar de `ln(Pa/Pb)` < `10⁻¹⁰·máx(desv. ln Pa, desv. ln Pb)`,
+  la misma tolerancia que O8). Solo se evalúa si hay algún ejecutable: sin
+  ejecutables ya lo cubren `MISMO_ACTIVO` (D8) y `SERIES_COLINEALES` (O8). El
+  estado del par no cambia y el análisis estadístico se muestra. Además,
+  `PROXY_REQUERIDO` nunca sugiere como proxy el símbolo de la serie o del
+  ejecutable de la otra pierna, y el error `DEMO_SIMBOLO_REPETIDO` de la demo ya
+  no invita solo a renombrar: explica que el mismo instrumento no puede usarse en
+  las dos piernas.
+- **Alternativas:** comparar solo las series de análisis (versión anterior); un
+  estado ⛔ (el análisis índice frente a ETF es legítimo: lo que no tiene sentido
+  es la simulación).
+- **Justificación:** `^GSPC`/`SPY` con `exec_a = SPY` salía ✅ con la estrategia
+  permitida y operaba SPY contra sí mismo (el PnL eran solo costes), y el propio
+  mensaje de `PROXY_REQUERIDO` sugería `SPY`. En la demo, una copia del mismo CSV
+  con otro nombre pasaba sin aviso. Es la misma clase de error que O8, en la capa
+  ejecutable.
 - **Fecha:** 2026-10-10
 
 ### A3 — `run_config.json` autosuficiente
@@ -918,10 +1091,16 @@ el responsable del proyecto.
   fracción; `-0` se escribe `0`. La opción «CSV para Excel en español» añade el
   BOM de UTF-8. El ZIP fija fecha, sistema de origen y permisos de cada entrada.
   Todos los campos llevan nombre en español, también los nuevos del OU
-  (`valor_critico_dickey_fuller`, `nivel_dickey_fuller`,
-  `valores_criticos_residuo_estimado`); las ventanas de estabilidad incluyen
-  `evaluable` y `motivo` (E10), y la sección `prueba` dice si la prueba se pidió,
-  si se ejecutó y si está contaminada (S10a).
+  (`valor_critico_dickey_fuller`, `p_valor_dickey_fuller`,
+  `rezagos_dickey_fuller`, `nivel_dickey_fuller`,
+  `valores_criticos_residuo_estimado`); las ventanas de estabilidad de
+  Engle–Granger incluyen `evaluable` y `motivo` (E10); las del OU, `estimable`,
+  `b` y la prueba ADF de la ventana (`rechaza_raiz_unitaria`,
+  `estadistico_dickey_fuller`, `p_valor_dickey_fuller`, `rezagos_dickey_fuller`),
+  y su resumen `ventanas_sin_parametros`, `cv_lambda`, `nivel_dickey_fuller`,
+  `ventanas_con_prueba_dickey_fuller` y `ventanas_que_rechazan_raiz_unitaria`
+  (E8). La sección `prueba` dice si la prueba se pidió, si se ejecutó y si está
+  contaminada (S10a).
 - **Alternativas:** prefijo solo en los CSV; una columna por prueba.
 - **Justificación:** la marca de datos sintéticos debe viajar con cualquier
   archivo suelto (D5); sin BOM, Excel en Windows no muestra bien las tildes; un
@@ -965,19 +1144,42 @@ el responsable del proyecto.
   - Errores siempre en español y sin trazas de Python (código de salida 2),
     también los de argparse (traducidos) y los de archivos.
   - `--reproducir` respeta `include_test` del `run_config.json` y no admite
-    `--csv-*`, `--exec-*`, `--start` ni `--end`. La orden «Para reproducir» que
-    imprime incluye `--cache-dir` y `--excel-es` si se usaron: reproduce los mismos
-    archivos byte a byte (comprobado por una prueba, también con la prueba
-    incluida y con proxy).
+    `--csv-*`, `--exec-*`, `--start` ni `--end`.
+  - Orden «Para reproducir»: usa el intérprete actual (`sys.executable`) y rutas
+    absolutas: el script, `--reproducir`, `--cache-dir` (si se dio o si no es el
+    predeterminado de Settings) y `--output-dir` (si no es `examples/output`), más
+    `--excel-es` si se usó. Cita con `subprocess.list2cmdline` en Windows
+    (`os.name == "nt"`), con una pista para PowerShell («& » delante), y con
+    `shlex.quote` en POSIX. Funciona desde cualquier carpeta; tal cual reescribe la
+    misma carpeta con los mismos bytes, y para comparar se añade al final
+    `--output-dir <otra carpeta>` (comprobado por pruebas, también con la prueba
+    incluida, con proxy y ejecutando la orden desde otra carpeta).
+  - Historial de la prueba: conserva el de la carpeta de destino y admite
+    `--reiniciar-historial` (S10b).
+  - argparse en español en los tres scripts de `examples/`: módulo común
+    `examples/_cli.py` (`SpanishArgumentParser` con `-h` en español, «uso:»,
+    «opciones:», «argumentos posicionales:» y la traducción de los errores,
+    incluida «ignored explicit argument» → «esta opción no admite un valor; se
+    recibió …» antes del reemplazo genérico; más `iso_date` y `quote_command`). Los
+    scripts añaden `examples/` a `sys.path` para funcionar también con `python -P`.
+    `generar_csv_sinteticos.py` acepta un argumento posicional opcional «carpeta»,
+    `-h/--help` no escribe nada y rechaza destinos que empiezan por «-» (sugiere
+    `./-nombre`). `fetch_ko_pep.py` rechaza `--end` anterior a `--start` antes de
+    cualquier descarga.
   - Muestra la marca «Prueba contaminada» con el texto de la exportación (S10a), el
-    banner «solo ilustrativo» con sus motivos una sola vez (O5a) y, en el OU, el
-    resultado de Dickey–Fuller frente a su valor crítico (O7).
+    banner «solo ilustrativo» con sus motivos una sola vez (O5a) y, en el OU, la
+    prueba de Dickey–Fuller aumentada con sus rezagos, su p-value y su valor
+    crítico (O7).
 - **Alternativas:** caché temporal en cada ejecución; heredar también la clase de
   activo en los ejecutables; imprimir la orden de reproducción sin las opciones de
-  caché y formato.
+  caché y formato, o con `python` y rutas relativas a la raíz del repositorio
+  (versión anterior); leer `sys.argv` a mano en el generador.
 - **Justificación:** con una caché persistente el `run_config.json` exportado se
   puede reproducir más tarde; la orden impresa debe reproducir exactamente lo
-  mismo (antes, con `--excel-es` o una caché propia, no lo hacía).
+  mismo (antes, con `--excel-es` o una caché propia, no lo hacía; ejecutada desde
+  otra carpeta o en `cmd.exe` con una ruta con espacios, fallaba). El generador
+  tomaba `--help` como carpeta de destino y escribía archivos en ella, y la
+  descarga mostraba su ayuda y sus errores en inglés.
 - **Fecha:** 2026-10-10
 
 ### A8 — Umbral de evidencia y q de la FDR
@@ -1004,12 +1206,17 @@ el responsable del proyecto.
     válido se interpreta como Windows-1252 (Excel en español). La columna
     opcional `tipo_datos` y el prefijo `SINTETICO_` del nombre marcan los datos
     como sintéticos (D10).
-  - OU: `near_unit_root` (b̂ entre 0 y 1 pero indistinguible de 1 según
-    Dickey–Fuller) hace el ajuste NO válido (O7; antes era solo un aviso). Spread
+  - OU: `near_unit_root` (b̂ entre 0 y 1 pero indistinguible de 1 según la
+    prueba ADF) hace el ajuste NO válido (O7; antes era solo un aviso). Spread
     constante, determinista o nulo frente a la escala de las series →
-    `INSUFFICIENT` (O8). Con NaN en el spread solo se usan pares consecutivos
-    finitos. Ljung–Box con `model_df=1`. Simulación con horizonte máximo de 2.520
-    pasos.
+    `INSUFFICIENT` (O8). Con NaN en el spread, el AR(1) solo usa pares
+    consecutivos finitos y la prueba ADF se aplica al tramo continuo sin NaN más
+    largo (nunca une tramos). Si ese tramo tiene menos de 30 puntos, si la
+    regresión ADF es de rango incompleto (p. ej. ruido de redondeo de ~10⁻¹⁶) o si
+    el estadístico no es finito, la prueba no es calculable y el ajuste es
+    `INSUFFICIENT`. En series cortas, `maxlag` se reduce al máximo que admite
+    `adfuller`. Ljung–Box con `model_df=1`. Simulación con horizonte máximo de
+    2.520 pasos.
   - Backtest: salida forzada (`ExitReason.FORCED`, máxima prioridad, sin
     enfriamiento ni rearme) si el capital se agota con posición abierta o si una
     reducción de apalancamiento con unidades enteras dejaría una pierna en 0. La
@@ -1047,4 +1254,20 @@ el responsable del proyecto.
 - **Justificación:** varias correcciones cambiaban contratos compartidos (OU,
   descartes, RunConfig); sin integrarlas, la exportación decía
   `solo_ilustrativo = no` con razones de descarte y exportaba campos en inglés.
+- **Fecha:** 2026-10-10
+
+### A12 — Integración de la segunda ronda de correcciones
+- **Decisión:** al integrar la segunda ronda (O7 con ADF aumentado, E8, A2a, D15a,
+  S10b, A7) se aplicaron las mismas reglas de convivencia que en A11: la
+  exportación traduce todos los campos nuevos (A4), la demo muestra la prueba ADF
+  con sus rezagos y su p-value, y las pruebas de otros módulos que dependían de la
+  regla anterior se actualizaron con escenarios que siguen probando lo mismo (p.
+  ej. «par sin evidencia con OU válido» pasa a usar una relación con ruptura cuyo
+  Engle–Granger sin ajustar rechaza: con O7, un OU válido sobre el spread de
+  formación exige ese rechazo).
+- **Alternativas:** mantener la prueba del runner con su escenario anterior
+  (p sin ajustar 0,067: ahora su OU no es válido y la prueba ya no comprobaba lo
+  que dice).
+- **Justificación:** las correcciones cambiaban contratos compartidos (`OUFit`,
+  `OUWindow`, `OUStability`, `STRATEGY_BLOCKING_CODES`, el informe de validación).
 - **Fecha:** 2026-10-10

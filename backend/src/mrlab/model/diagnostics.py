@@ -7,13 +7,19 @@ CONTRATO:
   banda ±1,96/√n, Ljung–Box en ``lb_lags`` (``acorr_ljungbox``). Si el p-value
   de Ljung–Box en el rezago mayor < 0,05 → ``autocorrelation_detected`` y
   ``message`` en español explicando que el AR(1) no captura toda la dinámica.
-- ``rolling_ou_stability(spread, window, step)``: ``fit_ou`` sobre cada
-  ventana del spread de FORMACIÓN (α, β fijos: es el spread que se opera).
-  ``cv_lambda`` = desviación/media de λ sobre las ventanas válidas (None si
-  hay < 2 válidas). ``message`` en español. ``unit_root_alpha``,
-  ``estimated_residual`` y ``scale`` se pasan tal cual a ``fit_ou`` (decisión
-  O7): el pipeline usa ``estimated_residual=True`` porque el spread es el
-  residuo de la regresión de cointegración de formación.
+- ``rolling_ou_stability(spread, window, step)``: AR(1)/OU sobre cada ventana
+  del spread de FORMACIÓN (α, β fijos: es el spread que se opera). En las
+  ventanas NO se exige el rechazo de la raíz unitaria para obtener parámetros
+  (``fit_ou(..., require_unit_root_rejection=False)``): λ, μ, σ y la vida media
+  se calculan en toda ventana con 0 < b < 1 (``estimable``). ``cv_lambda`` =
+  desviación/media de λ sobre las ventanas estimables (None si hay < 2). La
+  prueba ADF de cada ventana se informa APARTE (``unit_root_rejected``,
+  ``df_*``) con un resumen (``n_unit_root_rejected``): valores críticos de una
+  serie observada (N = 1), porque α y β se estimaron con toda la formación y no
+  se re-estiman en la ventana. ``message`` en español; explica que con ~252
+  observaciones la prueba tiene poca potencia y que no rechazar en una ventana
+  no prueba inestabilidad (decisión O7: la validez del OU la decide el ajuste de
+  toda la formación).
 
 Notas de implementación:
 - Los residuos se indexan con la fecha de X_{t+1} (el valor que se pronosticó)
@@ -37,7 +43,13 @@ from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.tsa.stattools import acf
 
 from mrlab.domain.errors import ConfigError, DataError, ModelError
-from mrlab.model.ou import TIME_UNIT_DEFAULT, UNIT_ROOT_ALPHA_DEFAULT, OUFit, fit_ou
+from mrlab.model.ou import (
+    TIME_UNIT_DEFAULT,
+    UNIT_ROOT_ALPHA_DEFAULT,
+    UNIT_ROOT_MAXLAG_DEFAULT,
+    OUFit,
+    fit_ou,
+)
 from mrlab.stats.windows import rolling_windows
 
 LB_ALPHA = 0.05
@@ -66,21 +78,30 @@ class OUWindow(BaseModel):
     start: date
     end: date
     nobs: int
-    valid: bool
+    estimable: bool  # 0 < b < 1: λ, μ, σ y vida media calculados (sin exigir la prueba ADF)
+    b: float | None = None
     lam: float | None = None
     mu: float | None = None
     sigma: float | None = None
     sigma_eq: float | None = None
     half_life: float | None = None
+    # Prueba ADF de la ventana (N = 1; solo informativa). None si no se pudo calcular.
+    unit_root_rejected: bool | None = None
+    df_stat: float | None = None
+    df_pvalue: float | None = None
+    df_lags: int | None = None
 
 
 class OUStability(BaseModel):
     window: int
     step: int
     windows: list[OUWindow]
-    n_invalid: int
+    n_invalid: int  # ventanas sin parámetros: b fuera de (0, 1) o datos insuficientes
     cv_lambda: float | None
     message: str
+    unit_root_alpha: float = UNIT_ROOT_ALPHA_DEFAULT
+    n_unit_root_tested: int = 0  # ventanas en las que se pudo calcular la prueba ADF
+    n_unit_root_rejected: int = 0  # ventanas en las que la prueba ADF rechaza la raíz unitaria
 
 
 def _fmt(x: float, decimals: int = 4) -> str:
@@ -90,6 +111,11 @@ def _fmt(x: float, decimals: int = 4) -> str:
 
 def _fmt_p(p: float) -> str:
     return "< 0,0001" if p < 1e-4 else _fmt(p)
+
+
+def _fmt_level(alpha: float) -> str:
+    """0.05 → «5 %», 0.025 → «2,5 %»."""
+    return f"{round(alpha * 100, 6):g}".replace(".", ",") + " %"
 
 
 def _plural(time_unit: str) -> str:
@@ -175,12 +201,14 @@ def rolling_ou_stability(
     *,
     time_unit: str = TIME_UNIT_DEFAULT,
     unit_root_alpha: float = UNIT_ROOT_ALPHA_DEFAULT,
-    estimated_residual: bool = False,
+    maxlag: int = UNIT_ROOT_MAXLAG_DEFAULT,
     scale: float | None = None,
 ) -> OUStability:
-    """``fit_ou`` por ventanas del spread de formación con α y β fijos (decisión E8).
+    """OU por ventanas del spread de formación con α y β fijos (decisiones E8 y O7).
 
-    Cada ventana usa la misma regla de validez que el ajuste completo (decisión O7).
+    Los parámetros se estiman en toda ventana con 0 < b < 1; la prueba ADF (N = 1) se
+    informa aparte y no condiciona λ, CV(λ) ni el rango de la vida media (si lo hiciera,
+    solo quedarían las ventanas con λ alto y la vida media saldría sesgada a la baja).
     """
     if not isinstance(spread.index, pd.DatetimeIndex):
         raise DataError("El spread debe estar indexado por fecha para evaluar su estabilidad.")
@@ -198,20 +226,29 @@ def rolling_ou_stability(
             dt=dt,
             time_unit=time_unit,
             unit_root_alpha=unit_root_alpha,
-            estimated_residual=estimated_residual,
+            estimated_residual=False,  # α y β no se re-estiman en la ventana
+            maxlag=maxlag,
             scale=scale,
+            require_unit_root_rejection=False,
         )
         windows.append(
             OUWindow(
                 start=spread.index[start].date(),
                 end=spread.index[end - 1].date(),
                 nobs=end - start,
-                valid=fit.valid,
+                estimable=fit.valid,
+                b=fit.b,
                 lam=fit.lam,
                 mu=fit.mu,
                 sigma=fit.sigma,
                 sigma_eq=fit.sigma_eq,
                 half_life=fit.half_life,
+                unit_root_rejected=(
+                    None if fit.df_pvalue is None else fit.df_pvalue <= unit_root_alpha
+                ),
+                df_stat=fit.df_stat,
+                df_pvalue=fit.df_pvalue,
+                df_lags=fit.df_lags,
             )
         )
 
@@ -222,39 +259,55 @@ def rolling_ou_stability(
             windows=[],
             n_invalid=0,
             cv_lambda=None,
+            unit_root_alpha=unit_root_alpha,
             message=(
                 f"El spread de formación tiene {len(spread)} observaciones, menos que una ventana "
                 f"de {window}: no se puede evaluar la estabilidad del OU entre ventanas."
             ),
         )
 
-    valid = [w for w in windows if w.valid]
-    n_invalid = len(windows) - len(valid)
+    estimable = [w for w in windows if w.estimable]
+    n_invalid = len(windows) - len(estimable)
+    tested = [w for w in windows if w.unit_root_rejected is not None]
+    n_rejected = sum(bool(w.unit_root_rejected) for w in tested)
     parts = [
-        f"Se ajustó el OU en {len(windows)} ventanas de {window} observaciones (paso {step}) "
-        "sobre el spread de formación, con α y β fijos."
+        f"Se ajustó el AR(1)/OU en {len(windows)} ventanas de {window} observaciones (paso "
+        f"{step}) sobre el spread de formación, con α y β fijos. En cada ventana λ, μ, σ y la "
+        "vida media se calculan si 0 < b < 1, sin exigir la prueba de raíz unitaria."
     ]
     if n_invalid:
         parts.append(
-            f"En {n_invalid} de ellas el OU no fue válido (b fuera de (0, 1), b que no se "
-            "distingue de 1 según Dickey–Fuller o datos insuficientes)."
+            f"En {n_invalid} de ellas no se pudieron estimar (b fuera de (0, 1) o datos "
+            "insuficientes)."
         )
 
     cv_lambda: float | None = None
-    if len(valid) >= 2:
-        lams = np.array([w.lam for w in valid], dtype=float)
+    if len(estimable) >= 2:
+        lams = np.array([w.lam for w in estimable], dtype=float)
         cv_lambda = float(lams.std(ddof=1) / lams.mean())
-        half_lives = [w.half_life for w in valid]
+        half_lives = np.array([w.half_life for w in estimable], dtype=float)
         parts.append(
-            f"Coeficiente de variación de λ entre las {len(valid)} ventanas válidas: "
+            f"Coeficiente de variación de λ entre las {len(estimable)} ventanas con parámetros: "
             f"{_fmt(cv_lambda, 2)} (desviación estándar / media; cuanto mayor, menos estable es la "
-            f"velocidad de reversión). La vida media osciló entre {_fmt(min(half_lives), 1)} y "
-            f"{_fmt(max(half_lives), 1)} {_plural(time_unit)}."
+            f"velocidad de reversión). La vida media osciló entre {_fmt(half_lives.min(), 1)} y "
+            f"{_fmt(half_lives.max(), 1)} {_plural(time_unit)} (mediana "
+            f"{_fmt(float(np.median(half_lives)), 1)})."
         )
     else:
-        parts.append("Hay menos de 2 ventanas con OU válido: no se puede medir la variación de λ.")
+        parts.append("Hay menos de 2 ventanas con 0 < b < 1: no se puede medir la variación de λ.")
+    if tested:
+        parts.append(
+            f"Prueba de Dickey–Fuller aumentada en cada ventana (valores críticos de una serie "
+            f"observada, porque α y β no se re-estiman en la ventana): rechaza la raíz unitaria "
+            f"al {_fmt_level(unit_root_alpha)} en {n_rejected} de {len(tested)} ventanas. Con "
+            f"{window} observaciones esta prueba tiene poca potencia: es habitual que no rechace "
+            "en una ventana aunque el spread revierta, así que no rechazar en una ventana no "
+            "prueba que la dinámica sea inestable. La validez del OU la decide el ajuste de toda "
+            "la formación."
+        )
     parts.append(
-        "Con pocas observaciones por ventana λ se estima con mucho ruido, así que es esperable "
+        "Con pocas observaciones por ventana λ se estima con mucho ruido (y con sesgo hacia "
+        "arriba, así que la vida media tiende a salir algo más corta), por lo que es esperable "
         "algo de variación aunque la dinámica no cambie."
     )
 
@@ -265,4 +318,7 @@ def rolling_ou_stability(
         n_invalid=n_invalid,
         cv_lambda=cv_lambda,
         message=" ".join(parts),
+        unit_root_alpha=unit_root_alpha,
+        n_unit_root_tested=len(tested),
+        n_unit_root_rejected=n_rejected,
     )

@@ -10,7 +10,9 @@ class LabError(Exception):
 
     default_code = "ERROR"
 
-    def __init__(self, message: str, *, code: str | None = None, details: dict[str, Any] | None = None):
+    def __init__(
+        self, message: str, *, code: str | None = None, details: dict[str, Any] | None = None
+    ):
         super().__init__(message)
         self.code = code or self.default_code
         self.message = message

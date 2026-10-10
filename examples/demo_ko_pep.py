@@ -9,6 +9,18 @@ con ``--incluir-prueba``: se ejecuta una sola vez, con la configuración congela
 si después se vuelve a ejecutar con otra configuración, queda marcada como
 contaminada.
 
+Historial de la prueba (fase 1): la marca «contaminada» se decide con el historial
+``test_history`` de ``run_config.json``. Antes de exportar, la demo conserva el
+historial del ``run_config.json`` que ya haya en la carpeta de destino si es del
+mismo par (mismos proveedores y símbolos de A y B), también al usar
+``--reproducir``; si ese archivo no se puede leer, o es de otro par y tiene
+historial, no lo sobrescribe salvo con ``--reiniciar-historial`` (acción
+consciente: la marca deja de ver las ejecuciones anteriores). Limitación: si
+exportas en otra carpeta (``--output-dir``) o partes de un ``run_config.json``
+copiado antes de ejecutar la prueba, el historial de la carpeta original no viaja
+con él y la marca no puede detectarlo; el registro persistente de estudios llega
+en la fase 2.
+
 Índices y futuros no se pueden comprar ni vender directamente: para simular la
 estrategia hay que indicar el CSV del instrumento ejecutable (proxy, p. ej. un
 ETF) con ``--exec-a`` / ``--exec-b``. Sin proxy, el análisis estadístico se
@@ -28,6 +40,9 @@ Ejemplos (desde la raíz del repositorio):
         --asset-class-exec-a etf --asset-class-exec-b etf
     python examples/demo_ko_pep.py --reproducir examples/output/<par>/run_config.json
 
+La orden «Para reproducir» que imprime usa el intérprete actual y rutas absolutas,
+así que funciona desde cualquier carpeta (en Windows, con comillas dobles).
+
 Errores: todos los mensajes son en español, sin trazas de Python; el programa
 termina con código 2 (argumentos no válidos: también 2).
 """
@@ -35,18 +50,22 @@ termina con código 2 (argumentos no válidos: también 2).
 from __future__ import annotations
 
 import argparse
-import shlex
+import json
+import os
 import sys
 import tempfile
 from collections.abc import Iterable
 from datetime import date
 from pathlib import Path
 
-EXAMPLES_DIR = Path(__file__).resolve().parent
+SCRIPT = Path(__file__).resolve()
+EXAMPLES_DIR = SCRIPT.parent
 DATA_DIR = EXAMPLES_DIR / "data"
 DEFAULT_OUTPUT = EXAMPLES_DIR / "output"
 DEFAULT_SYMBOLS = ("SINT-COI-A", "SINT-COI-B")
 
+if str(EXAMPLES_DIR) not in sys.path:  # con python -P (o PYTHONSAFEPATH) no se añade solo
+    sys.path.insert(0, str(EXAMPLES_DIR))
 try:
     import mrlab  # noqa: F401
 except ImportError:  # permite ejecutar la demo sin instalar el paquete
@@ -61,7 +80,7 @@ from mrlab.analysis.pair_pipeline import (  # noqa: E402
 )
 from mrlab.analysis.runner import RunResult, run_pair  # noqa: E402
 from mrlab.backtest.engine import EXECUTION_CONVENTION, BacktestResult  # noqa: E402
-from mrlab.config import get_settings  # noqa: E402
+from mrlab.config import Settings, get_settings  # noqa: E402
 from mrlab.data.cache import SnapshotCache  # noqa: E402
 from mrlab.data.providers.csv_provider import (  # noqa: E402
     META_SUFFIX,
@@ -84,12 +103,15 @@ from mrlab.domain.models import (  # noqa: E402
 )
 from mrlab.model.ou import BANDS_VS_INTERVALS_NOTE, OUFit  # noqa: E402
 from mrlab.reporting.export import (  # noqa: E402
+    CONFIG_FILE,
+    SYNTHETIC_PREFIX,
     TEST_CONTAMINATED_TEXT,
     TEST_HISTORY_NOTE,
     export_basename,
     export_run,
 )
 from mrlab.reporting.run_config import (  # noqa: E402
+    SCHEMA_VERSION,
     PairSpec,
     RunConfig,
     SeriesRef,
@@ -97,6 +119,8 @@ from mrlab.reporting.run_config import (  # noqa: E402
 )
 from mrlab.stats.integration import INTEGRATION_LABELS, format_pvalue  # noqa: E402
 from pydantic import ValidationError  # noqa: E402
+
+from _cli import SpanishArgumentParser, iso_date, quote_command  # noqa: E402
 
 WIDE = "=" * 78
 SEGMENT_TITLES = {
@@ -109,6 +133,9 @@ CONTAMINATED_TEST_TITLE = (
     "fuera de muestra)"
 )
 WIDE_RANGE = (date(1900, 1, 1), date(2100, 12, 31))
+#: Caché por defecto (la de Settings sin variables de entorno): la orden «Para reproducir»
+#: solo nombra --cache-dir si la caché usada es otra.
+DEFAULT_CACHE = Settings.model_fields["cache_dir"].default
 
 #: Roles de las series: A y B se analizan; exec_a y exec_b son los proxies ejecutables.
 ROLES = ("a", "b", "exec_a", "exec_b")
@@ -287,7 +314,11 @@ def build_config(
                 other = seen[key]
                 raise ConfigError(
                     f"{ROLE_FLAGS[other]} y {ROLE_FLAGS[role]} tienen el mismo símbolo "
-                    f"(«{meta.symbol}»): usa --symbol-{ROLE_SUFFIX[other]} y "
+                    f"(«{meta.symbol}»). Si son el mismo instrumento, no puede usarse en las "
+                    "dos piernas: operar un activo contra sí mismo solo genera costes, así que "
+                    "elige otro instrumento (renombrarlo no cambia nada: el análisis bloquea la "
+                    "simulación de dos piernas con precios proporcionales). Si de verdad son "
+                    f"instrumentos distintos, usa --symbol-{ROLE_SUFFIX[other]} y "
                     f"--symbol-{ROLE_SUFFIX[role]} para distinguirlos.",
                     code="DEMO_SIMBOLO_REPETIDO",
                 )
@@ -391,22 +422,27 @@ def print_status(an: PairAnalysis) -> None:
 
 
 def _unit_root_line(ou: OUFit) -> str | None:
-    """Resultado de la prueba de raíz unitaria del AR(1) que decide la validez (decisión O7)."""
+    """Resultado de la prueba de raíz unitaria (ADF) que decide la validez del OU (decisión O7)."""
     if ou.df_stat is None or ou.df_crit is None:
         return None
     critical = (
-        "valor crítico de Engle–Granger (N = 2): el spread es el residuo de una regresión estimada"
+        "valores críticos de Engle–Granger, N = 2: el spread es el residuo de una regresión "
+        "estimada, así que es el mismo cálculo que Engle–Granger sin ajustar"
         if ou.df_estimated_residual
-        else "valor crítico de Dickey–Fuller (N = 1)"
+        else "valores críticos de Dickey–Fuller para una serie observada, N = 1"
     )
+    rejected = ou.df_pvalue <= ou.df_alpha if ou.df_pvalue is not None else ou.df_stat <= ou.df_crit
     verdict = (
         "se rechaza la raíz unitaria"
-        if ou.df_stat <= ou.df_crit
+        if rejected
         else "NO se rechaza la raíz unitaria: b no se distingue de 1"
     )
+    lags = "" if ou.df_lags is None else f", {ou.df_lags} rezago(s) por AIC"
+    pvalue = "" if ou.df_pvalue is None else f", p-value {p_value(ou.df_pvalue)}"
     return (
-        f"Dickey–Fuller del AR(1): estadístico {num(ou.df_stat, 2)} frente a {num(ou.df_crit, 2)} "
-        f"al {num(100 * ou.df_alpha, 0)} % ({critical}) → {verdict}."
+        f"Dickey–Fuller aumentada (ADF{lags}): estadístico {num(ou.df_stat, 2)} frente a "
+        f"{num(ou.df_crit, 2)} al {num(100 * ou.df_alpha, 0)} %{pvalue} ({critical}) → "
+        f"{verdict}."
     )
 
 
@@ -505,6 +541,7 @@ def print_test_mark(result: RunResult) -> None:
     print(f"\n  Prueba contaminada: {contamination_text(result)}")
     if result.test_contaminated is not None:
         print(TEST_HISTORY_NOTE)
+        print(DEMO_HISTORY_NOTE)
 
 
 def print_backtests(result: RunResult) -> None:
@@ -570,50 +607,11 @@ def print_report(result: RunResult, notices: list[str]) -> None:
 
 # --------------------------------------------------------------------------- argumentos
 
-#: Traducción de los mensajes de error de argparse (vienen en inglés).
-_ARGPARSE_ES = (
-    ("the following arguments are required: ", "faltan los argumentos obligatorios: "),
-    ("unrecognized arguments: ", "argumentos no reconocidos: "),
-    ("invalid choice: ", "opción no válida: "),
-    ("(choose from ", "(elige entre "),
-    ("expected one argument", "falta el valor del argumento"),
-    ("not allowed with argument", "no se puede usar junto con el argumento"),
-    ("ambiguous option: ", "opción ambigua: "),
-    (" could match ", " puede corresponder a "),
-    ("argument ", "argumento "),
-)
-
-
-class SpanishArgumentParser(argparse.ArgumentParser):
-    """argparse con la ayuda y los errores en español."""
-
-    def error(self, message: str):  # type: ignore[override]
-        for english, spanish in _ARGPARSE_ES:
-            message = message.replace(english, spanish)
-        self.exit(2, f"{self.prog}: error: {message}. Consulta las opciones con --help.\n")
-
-    def format_usage(self) -> str:
-        return super().format_usage().replace("usage:", "uso:", 1)
-
-    def format_help(self) -> str:
-        text = super().format_help().replace("usage:", "uso:", 1)
-        return text.replace("\noptions:\n", "\nopciones:\n", 1)
-
-
-def _iso_date(text: str) -> date:
-    try:
-        return date.fromisoformat(text)
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"fecha no válida «{text}»: usa el formato AAAA-MM-DD (p. ej. 2020-01-31)"
-        ) from None
-
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     classes = [c.value for c in AssetClass]
     prices = [p.value for p in PriceType]
     parser = SpanishArgumentParser(
-        add_help=False,
         description=(
             "Análisis completo de un par desde CSV. Sin argumentos usa el par SINTÉTICO de "
             "examples/data/. " + DISCLAIMER
@@ -624,10 +622,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
             "no, declara --currency, --asset-class y --price-type (y, si la serie B difiere, "
             "--currency-b, --asset-class-b, --price-type-b). Un índice o futuro necesita un "
             "instrumento ejecutable para simular la estrategia: --exec-a/--exec-b con la clase "
-            "de activo --asset-class-exec-a/--asset-class-exec-b (o su .meta.json)."
+            "de activo --asset-class-exec-a/--asset-class-exec-b (o su .meta.json). "
+            "Prueba contaminada: cada exportación conserva el historial de la prueba del "
+            "run_config.json que ya haya en la carpeta de destino si es del mismo par (también "
+            "con --reproducir). Si exportas en otra carpeta (--output-dir) o partes de un "
+            "run_config.json copiado antes de ejecutar la prueba, ese historial no viaja con él y "
+            "la marca no puede detectarlo (el registro persistente llega en la fase 2)."
         ),
     )
-    parser.add_argument("-h", "--help", action="help", help="Muestra esta ayuda y termina")
     parser.add_argument("--csv-a", type=Path, help="CSV de la serie A")
     parser.add_argument("--csv-b", type=Path, help="CSV de la serie B")
     parser.add_argument(
@@ -670,8 +672,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
             choices=prices,
             help=f"Tipo de precio solo de {name}",
         )
-    parser.add_argument("--start", type=_iso_date, help="Fecha inicial AAAA-MM-DD")
-    parser.add_argument("--end", type=_iso_date, help="Fecha final AAAA-MM-DD")
+    parser.add_argument(
+        "--start", type=iso_date, metavar="AAAA-MM-DD", help="Fecha inicial AAAA-MM-DD"
+    )
+    parser.add_argument("--end", type=iso_date, metavar="AAAA-MM-DD", help="Fecha final AAAA-MM-DD")
     parser.add_argument(
         "--incluir-prueba",
         action="store_true",
@@ -687,10 +691,26 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--output-dir", type=Path, default=DEFAULT_OUTPUT, help="Carpeta de exportación"
+        "--reiniciar-historial",
+        action="store_true",
+        help=(
+            "No conserva el historial de la prueba del run_config.json que ya haya en la carpeta "
+            "de destino (ni exige poder leerlo) y lo sobrescribe. Úsala solo a conciencia: la "
+            "marca «Prueba contaminada» deja de ver las ejecuciones anteriores de la prueba"
+        ),
     )
     parser.add_argument(
-        "--cache-dir", type=Path, help="Caché de instantáneas (por defecto, data/cache)"
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT,
+        metavar="CARPETA",
+        help="Carpeta de exportación (por defecto, examples/output)",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        metavar="CARPETA",
+        help="Caché de instantáneas (por defecto, data/cache)",
     )
     parser.add_argument(
         "--excel-es", action="store_true", help="CSV para Excel en español (; y coma decimal)"
@@ -717,14 +737,148 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     return args
 
 
-def reproduce_command(config_path: Path, args: argparse.Namespace) -> str:
-    """Orden que reproduce exactamente los mismos archivos (misma caché y mismo formato)."""
-    parts = ["python", "examples/demo_ko_pep.py", "--reproducir", str(config_path)]
-    if args.cache_dir is not None:
-        parts += ["--cache-dir", str(args.cache_dir)]
+def reproduce_command(config_path: Path, args: argparse.Namespace, cache_dir: Path) -> str:
+    """Orden que reproduce exactamente los mismos archivos (misma caché, carpeta y formato).
+
+    Usa el intérprete actual y rutas absolutas, de modo que funciona desde cualquier carpeta;
+    se cita para la consola del sistema (comillas dobles en Windows, ``shlex`` en POSIX)."""
+    parts = [sys.executable or "python", str(SCRIPT), "--reproducir", str(config_path.resolve())]
+    cache = cache_dir.resolve()
+    if args.cache_dir is not None or cache != Path(DEFAULT_CACHE).resolve():
+        parts += ["--cache-dir", str(cache)]
+    output = args.output_dir.resolve()
+    if output != DEFAULT_OUTPUT.resolve():
+        parts += ["--output-dir", str(output)]
     if args.excel_es:
         parts.append("--excel-es")
-    return " ".join(shlex.quote(part) for part in parts)
+    return quote_command(parts)
+
+
+# --------------------------------------------------------------------------- historial de la prueba
+
+#: Nombres posibles del run_config.json en una carpeta de exportación.
+STORED_CONFIG_NAMES = (CONFIG_FILE, f"{SYNTHETIC_PREFIX}{CONFIG_FILE}")
+DEMO_HISTORY_NOTE = (
+    "  En la demo, cada exportación conserva el historial de la prueba que ya había en su "
+    "carpeta de destino (si es del mismo par); solo --reiniciar-historial lo descarta. El "
+    "historial de OTRAS carpetas no se consulta."
+)
+_KEEP_OR_RESET = (
+    "Usa --output-dir con otra carpeta o, si quieres descartar ese historial a conciencia, "
+    "añade --reiniciar-historial."
+)
+
+PairKey = tuple[tuple[str, str], tuple[str, str]]
+
+
+class UnreadableRunConfig(Exception):
+    """El run_config.json que ya hay en la carpeta de destino no se puede leer."""
+
+
+def _pair_key(pair: PairSpec) -> PairKey:
+    return ((pair.a.provider, pair.a.symbol), (pair.b.provider, pair.b.symbol))
+
+
+def _unreadable_reason(exc: OSError) -> str:
+    if isinstance(exc, IsADirectoryError):
+        return "es una carpeta, no un archivo"
+    if isinstance(exc, PermissionError):
+        return "no hay permiso para leerlo"
+    return f"error del sistema {exc.errno}"
+
+
+def read_stored_history(path: Path) -> tuple[PairKey, list[str]]:
+    """Par (proveedor y símbolo de A y B) e historial de la prueba de un run_config.json.
+
+    No verifica el hash: ``test_history`` queda fuera de él, y aquí lo que importa es no
+    perder el historial aunque otros campos se hayan editado a mano. Lanza
+    ``UnreadableRunConfig`` (con el motivo en español) si no se puede extraer."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise UnreadableRunConfig(_unreadable_reason(exc)) from None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise UnreadableRunConfig("no es un JSON válido") from None
+    if not isinstance(raw, dict):
+        raise UnreadableRunConfig("no contiene una configuración (se esperaba un objeto JSON)")
+    version = raw.get("schema_version", SCHEMA_VERSION)
+    if not isinstance(version, int) or isinstance(version, bool) or version > SCHEMA_VERSION:
+        raise UnreadableRunConfig(
+            f"usa una versión de esquema que esta demo no entiende: {version!r}"
+        )
+    history = raw.get("test_history", [])
+    if not isinstance(history, list) or not all(isinstance(h, str) and h for h in history):
+        raise UnreadableRunConfig("su campo «test_history» no es una lista de hashes")
+    try:
+        key = tuple((raw["pair"][leg]["provider"], raw["pair"][leg]["symbol"]) for leg in "ab")
+    except (KeyError, TypeError):
+        raise UnreadableRunConfig("no indica el par («pair» con las series «a» y «b»)") from None
+    if not all(isinstance(value, str) for leg in key for value in leg):
+        raise UnreadableRunConfig("el proveedor o el símbolo de «pair» no es un texto")
+    return key, history  # type: ignore[return-value]
+
+
+def destination_history(
+    out_dir: Path, config: RunConfig, reset: bool = False
+) -> tuple[list[str], list[str]]:
+    """Historial de la prueba con el que se exporta en ``out_dir`` y avisos para el informe.
+
+    Parte de ``config.test_history`` y le añade el del run_config.json que ya haya en la
+    carpeta si es del mismo par (mismos proveedores y símbolos de A y B): así una ejecución
+    nueva no borra las ejecuciones anteriores de la prueba. Si ese archivo no se puede leer,
+    o es de otro par y tiene historial, lanza ConfigError para no sobrescribirlo, salvo con
+    ``reset`` (--reiniciar-historial), que lo descarta a conciencia."""
+    history = list(config.test_history)
+    found = [out_dir / name for name in STORED_CONFIG_NAMES if (out_dir / name).exists()]
+    if reset:
+        if not found:
+            return history, [
+                "--reiniciar-historial: la carpeta de destino no tenía un run_config.json; no "
+                "había historial que reiniciar."
+            ]
+        return history, [
+            f"Se reemplazó el run_config.json de {out_dir} sin conservar su historial de la "
+            "prueba (--reiniciar-historial): las ejecuciones de la prueba registradas solo allí "
+            "ya no constan, así que la marca «Prueba contaminada» no puede detectarlas."
+        ]
+    notices: list[str] = []
+    own = _pair_key(config.pair)
+    for path in found:
+        try:
+            key, stored = read_stored_history(path)
+        except UnreadableRunConfig as exc:
+            raise ConfigError(
+                f"Ya existe {path} y no se puede leer ({exc}), así que no se sabe si guarda el "
+                "historial de ejecuciones de la prueba. Para no borrarlo, la demo no lo "
+                f"sobrescribe. {_KEEP_OR_RESET}",
+                code="DEMO_HISTORIAL_ILEGIBLE",
+                details={"archivo": str(path)},
+            ) from None
+        if key != own:
+            other = f"{key[0][1]} / {key[1][1]}"
+            if stored:
+                raise ConfigError(
+                    f"{path} es de otro par ({other}) y guarda su historial de ejecuciones de la "
+                    f"prueba: sobrescribirlo lo borraría. {_KEEP_OR_RESET}",
+                    code="DEMO_CARPETA_DE_OTRO_PAR",
+                    details={"archivo": str(path), "par": other},
+                )
+            notices.append(
+                f"Se reemplaza la exportación de otro par ({other}) que había en la carpeta de "
+                "destino (no tenía historial de la prueba)."
+            )
+            continue
+        added = [h for h in stored if h not in history]
+        history += added
+        if added:
+            count = "1 configuración" if len(added) == 1 else f"{len(added)} configuraciones"
+            notices.append(
+                "La carpeta de destino ya tenía un run_config.json de este par con historial de "
+                f"la prueba ({count} con las que se ejecutó): se conserva en el nuevo "
+                "run_config.json, para que la marca «Prueba contaminada» lo siga teniendo en "
+                "cuenta."
+            )
+    return history, notices
 
 
 # --------------------------------------------------------------------------- main
@@ -755,7 +909,8 @@ def main(argv: list[str] | None = None) -> int:
             stream.reconfigure(errors="replace")  # consolas sin UTF-8 (Windows)
     args = parse_args(argv)
     try:
-        cache = SnapshotCache(args.cache_dir or get_settings().cache_dir)
+        cache_dir = Path(args.cache_dir or get_settings().cache_dir)
+        cache = SnapshotCache(cache_dir)
         with tempfile.TemporaryDirectory(prefix="mrlab_demo_") as tmp:
             notices: list[str] = []
             if args.reproducir:
@@ -766,8 +921,16 @@ def main(argv: list[str] | None = None) -> int:
                 data = DataService(ProviderRegistry({"csv": provider}), cache)
             # include_test solo puede ACTIVAR la prueba: al reproducir manda el run_config.json.
             result = run_pair(config, data, include_test=args.incluir_prueba)
-            print_report(result, notices)
             out_dir = args.output_dir / export_basename(result)
+            # No borrar el historial de la prueba que ya haya en la carpeta de destino: si hay
+            # que conservarlo, se vuelve a ejecutar con él para que decida la marca.
+            history, history_notices = destination_history(
+                out_dir, config, reset=args.reiniciar_historial
+            )
+            if history != list(config.test_history):
+                config = config.model_copy(update={"test_history": history})
+                result = run_pair(config, data, include_test=args.incluir_prueba)
+            print_report(result, notices)
             paths = export_run(result, out_dir, excel_es=args.excel_es)
     except LabError as exc:
         print(f"\nERROR ({exc.code}): {exc.message}", file=sys.stderr)
@@ -781,13 +944,21 @@ def main(argv: list[str] | None = None) -> int:
 
     title("12. Exportación")
     bullet(str(p) for p in paths)
-    config_path = next(p for p in paths if p.name.endswith("run_config.json"))
+    for notice in history_notices:
+        print(f"  {notice}")
+    config_path = next(p for p in paths if p.name.endswith(CONFIG_FILE))
     print(f"  Hash de la configuración: {result.config.config_hash}")
     print(f"  Prueba incluida en la configuración: {'sí' if result.config.include_test else 'no'}")
     print(
-        f"  Para reproducir (mismos archivos, byte a byte): {reproduce_command(config_path, args)}"
+        "  Para reproducir (mismos archivos, byte a byte): "
+        f"{reproduce_command(config_path, args, cache_dir)}"
     )
-    print("  (Añade --output-dir <otra carpeta> si quieres comparar los archivos con estos.)")
+    if os.name == "nt":
+        print("  (En PowerShell, escribe «& » delante de la orden.)")
+    print(
+        "  (Si quieres comparar los archivos con estos, añade al final --output-dir "
+        "<otra carpeta>.)"
+    )
     print(f"\nAVISO: {DISCLAIMER}")
     return 0
 

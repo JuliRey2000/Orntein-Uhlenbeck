@@ -51,6 +51,14 @@ Sin argumentos, la demo analiza este par sintético. Todo lo que exporta lleva l
 marca SINTÉTICO: el prefijo `SINTETICO_` en los nombres de archivo y la columna
 `tipo_datos = SINTETICO` en cada fila.
 
+La muestra de prueba solo se ejecuta con `--incluir-prueba`. La marca «Prueba
+contaminada» usa el historial guardado en el `run_config.json` exportado: una
+nueva ejecución en la misma carpeta lo conserva (`--reiniciar-historial` lo
+descarta a conciencia). Limitación de la fase 1: si exportas en otra carpeta
+(`--output-dir`) o partes de un `run_config.json` copiado antes de ejecutar la
+prueba, ese historial no viaja con él y la marca no puede detectarlo; el registro
+persistente de estudios llega en la fase 2.
+
 ## Datos reales
 
 `make fetch-example` (o `python examples/fetch_ko_pep.py`) descarga KO y PEP de

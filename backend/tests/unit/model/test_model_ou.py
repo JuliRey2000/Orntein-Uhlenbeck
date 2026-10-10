@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -10,6 +11,7 @@ import pytest
 from scipy.stats import norm
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tsa.adfvalues import mackinnoncrit, mackinnonp
+from statsmodels.tsa.stattools import adfuller, coint
 
 from mrlab.domain.errors import ConfigError, ModelError
 from mrlab.domain.models import SpreadType
@@ -19,14 +21,16 @@ from mrlab.model.ou import (
     NOT_OU_MESSAGE,
     OUFit,
     OUStatus,
+    adf_unit_root_test,
     conditional_mean,
     conditional_variance,
-    dickey_fuller_critical_value,
     fit_ou,
     forecast,
     rolling_zscore,
     simulate_ou_exact,
     simulate_paths_summary,
+    unit_root_critical_value,
+    unit_root_pvalue,
     zscore,
 )
 from mrlab.model.spread import compute_spread, fit_hedge_ratio
@@ -73,9 +77,9 @@ def test_recovers_parameters_seed_42():
     assert fit.mu_se == pytest.approx(0.089 * sigma_eq, rel=0.15)
     assert fit.nobs == 5000
     assert fit.warnings == [] and not fit.near_unit_root
-    # Decisión O7: la validez exige que Dickey–Fuller rechace la raíz unitaria (t ≈ −11).
-    assert fit.df_stat < -10 and fit.df_stat <= fit.df_crit
-    assert "rechaza la raíz unitaria" in fit.message
+    # Decisión O7: la validez exige que el ADF rechace la raíz unitaria (t ≈ −11).
+    assert fit.df_stat < -10 and fit.df_stat <= fit.df_crit and fit.df_pvalue < 1e-6
+    assert "rechaza la raíz unitaria" in fit.message and "Dickey–Fuller aumentada" in fit.message
 
 
 def test_mu_interval_coverage_and_lambda_bias_over_many_seeds():
@@ -110,7 +114,11 @@ def test_estimates_follow_exact_discretization_formulas():
     assert fit.sigma_eq == pytest.approx(fit.sigma / math.sqrt(2 * fit.lam), rel=1e-12)
     assert fit.half_life == pytest.approx(math.log(2) / fit.lam, rel=1e-12)
     assert fit.mu_se == pytest.approx(fit.sigma_eq * math.sqrt((1 + b) / ((1 - b) * n)), rel=1e-12)
-    assert fit.df_stat == pytest.approx((b - 1) / ols.bse[1], rel=1e-9)
+    # La prueba de raíz unitaria es el ADF de statsmodels (no el t del AR(1)): decisión O7.
+    stat, pvalue, lags, *_ = adfuller(
+        x, maxlag=12, autolag="AIC", regression="c", result_object=False
+    )
+    assert (fit.df_stat, fit.df_pvalue, fit.df_lags) == (stat, pvalue, lags)
 
 
 def test_dt_scales_lambda_and_half_life():
@@ -156,8 +164,8 @@ def test_random_walk_is_non_stationary_without_half_life():
     assert "no se puede distinguir el spread de un paseo aleatorio" in fit.message
     # La regresión y la prueba sí se informan: b, el estadístico y el valor crítico.
     assert fit.a is not None and fit.nobs == 999
-    assert fit.df_stat > fit.df_crit
-    assert fit.df_crit == pytest.approx(mackinnoncrit(N=1, regression="c", nobs=999)[1])
+    assert fit.df_stat > fit.df_crit and fit.df_pvalue > fit.df_alpha
+    assert fit.df_crit == unit_root_critical_value(0.05)
     for number in (fit.b, fit.df_stat, fit.df_crit):
         decimals = 4 if number == fit.b else 2
         assert f"{number:.{decimals}f}".replace(".", ",") in fit.message
@@ -183,7 +191,8 @@ def test_random_walks_are_non_stationary_in_90_percent_of_seeds():
             _assert_no_ou_numbers(fit)
         if fit.near_unit_root:  # «b no se distingue de 1» implica ajuste no válido
             assert not fit.valid and fit.status == OUStatus.NON_STATIONARY
-        assert fit.valid == (0 < fit.b < 1 and fit.df_stat <= fit.df_crit)
+        assert fit.valid == (0 < fit.b < 1 and fit.df_pvalue <= 0.05)
+        assert (fit.df_stat <= fit.df_crit) == (fit.df_pvalue <= 0.05)
     assert non_stationary >= 90
 
 
@@ -200,14 +209,85 @@ def test_unit_root_test_uses_residual_critical_values_for_estimated_spreads():
         valid_n1 += as_observed.valid
         valid_n2 += as_residual.valid
         assert as_residual.df_estimated_residual and not as_observed.df_estimated_residual
-        assert as_residual.df_stat == as_observed.df_stat
         assert as_residual.df_crit < as_observed.df_crit  # N = 2 es más exigente
     assert valid_n2 / 200 <= 0.10  # tamaño nominal del 5 %
     assert valid_n1 / 200 >= 0.15  # el valor crítico de una serie observada no sirve aquí
 
 
+def test_residual_unit_root_test_is_exactly_the_inner_step_of_coint():
+    """Decisión O7: con ``estimated_residual=True`` el estadístico, los rezagos y el p-value son
+    los de ``coint`` (ADF sin constante sobre el residuo, MacKinnon N = 2)."""
+    for seed in range(12):
+        rng = np.random.default_rng(seed)
+        x = np.cumsum(rng.normal(0, 0.01, 900))
+        y = (
+            0.5
+            + 1.2 * x
+            + (rng.normal(0, 0.01, 900) if seed % 2 else np.cumsum(rng.normal(0, 0.01, 900)))
+        )
+        fit = fit_ou(_ols_residual(y, x), estimated_residual=True, maxlag=12)
+        stat, pvalue, _ = coint(y, x, trend="c", maxlag=12, autolag="aic")
+        lags = adfuller(
+            _ols_residual(y, x), maxlag=12, autolag="aic", regression="n", result_object=False
+        )[2]
+        assert fit.df_stat == pytest.approx(stat, rel=1e-8)
+        assert fit.df_pvalue == pytest.approx(pvalue, rel=1e-8, abs=1e-15)
+        assert fit.df_lags == lags
+        assert fit.valid == (0 < fit.b < 1 and pvalue <= 0.05)
+
+
+def test_observed_unit_root_test_matches_adfuller_and_the_shown_critical_value():
+    for seed in range(20):
+        x = _ar1(0.97, 600, seed=seed) + np.random.default_rng(100 + seed).normal(0, 2, 600)
+        fit = fit_ou(x, maxlag=8)
+        stat, pvalue, lags, *_ = adfuller(
+            x, maxlag=8, autolag="AIC", regression="c", result_object=False
+        )
+        assert (fit.df_stat, fit.df_lags) == (stat, lags)
+        assert fit.df_pvalue == pytest.approx(pvalue, rel=1e-12)
+        assert fit.valid == (0 < fit.b < 1 and pvalue <= 0.05)
+        # «estadístico ≤ valor crítico» nunca contradice «p-value ≤ α».
+        assert (fit.df_stat <= fit.df_crit) == (pvalue <= 0.05)
+
+
+def test_decision_follows_the_pvalue_inside_the_finite_sample_band():
+    """Casos cuyo estadístico cae entre el valor crítico de muestra finita (``mackinnoncrit``)
+    y el que corresponde al p-value: decide el p-value (el mismo de ``adfuller`` y ``coint``),
+    así la validez del OU nunca contradice a Engle–Granger sin ajustar."""
+    observed = _ar1(0.97, 300, seed=509)
+    fit = fit_ou(observed)
+    finite = mackinnoncrit(N=1, regression="c", nobs=299)[1]
+    assert finite < fit.df_stat <= fit.df_crit and fit.df_pvalue <= 0.05
+    assert fit.valid
+
+    rng = np.random.default_rng(60)
+    x = np.cumsum(rng.normal(0, 0.01, 600))
+    y = 0.5 * x + 0.01 * _ar1(0.97, 600, seed=67)
+    residual = fit_ou(_ols_residual(y, x), estimated_residual=True)
+    stat, pvalue, crit = coint(y, x, trend="c", maxlag=12, autolag="aic")
+    assert crit[1] < residual.df_stat <= residual.df_crit and pvalue <= 0.05
+    assert residual.df_pvalue == pytest.approx(pvalue) and residual.valid
+
+
+@pytest.mark.parametrize("noise", [0.005, 0.01])
+def test_random_walk_with_microstructure_noise_keeps_the_size(noise):
+    """Hallazgo de la verificación: con ruido de medición iid sobre un paseo aleatorio los
+    incrementos tienen autocorrelación negativa y Dickey–Fuller SIN rezagos rechazaba de más
+    (11 % con ruido de 0,5 % y 37 % con 1 % en estas semillas). El ADF con rezagos por AIC
+    mantiene el tamaño cerca del 5 %."""
+    n_seeds, valid = 300, 0
+    for seed in range(n_seeds):
+        rng = np.random.default_rng(seed)
+        x = np.cumsum(rng.normal(0, 0.01, 900)) + rng.normal(0, noise, 900)
+        fit = fit_ou(x)
+        valid += fit.valid
+        if not fit.valid and 0 < fit.b < 1:
+            assert fit.near_unit_root and fit.df_lags is not None
+    assert valid / n_seeds <= 0.10
+
+
 def test_seed_where_only_residual_critical_value_detects_the_random_walk():
-    rng = np.random.default_rng(1007)
+    rng = np.random.default_rng(1024)
     y, x = np.cumsum(rng.normal(0, 0.01, 1500)), np.cumsum(rng.normal(0, 0.01, 1500))
     spread = _ols_residual(y[:900], x[:900])
     observed, residual = fit_ou(spread), fit_ou(spread, estimated_residual=True)
@@ -218,31 +298,92 @@ def test_seed_where_only_residual_critical_value_detects_the_random_walk():
     assert "Engle–Granger" in residual.message and "residuo" in residual.message
 
 
-def test_dickey_fuller_critical_values():
+def test_unit_root_critical_values_match_the_mackinnon_pvalues():
     for estimated, n_vars in ((False, 1), (True, 2)):
-        table = mackinnoncrit(N=n_vars, regression="c", nobs=899)
-        for level, crit in zip((0.01, 0.05, 0.10), table, strict=True):
-            assert dickey_fuller_critical_value(level, 899, estimated_residual=estimated) == crit
-        # Otros niveles: valor asintótico coherente con los p-values de MacKinnon.
-        c25 = dickey_fuller_critical_value(0.025, 899, estimated_residual=estimated)
-        assert table[0] < c25 < table[1]
-        assert mackinnonp(c25, regression="c", N=n_vars) == pytest.approx(0.025, abs=1e-6)
+        for level in (0.01, 0.025, 0.05, 0.10):
+            crit = unit_root_critical_value(level, estimated_residual=estimated)
+            assert mackinnonp(crit, regression="c", N=n_vars) == pytest.approx(level, abs=1e-9)
+            assert unit_root_pvalue(crit, estimated_residual=estimated) == pytest.approx(level)
+        # Muy cerca de la tabla de muestra finita de MacKinnon con n grande.
+        table = mackinnoncrit(N=n_vars, regression="c", nobs=100_000)
+        for level, value in zip((0.01, 0.05, 0.10), table, strict=True):
+            assert unit_root_critical_value(level, estimated_residual=estimated) == pytest.approx(
+                value, abs=0.01
+            )
     for bad in (0.0, 1.0, -0.1, float("nan")):
         with pytest.raises(ConfigError):
-            dickey_fuller_critical_value(bad, 899)
+            unit_root_critical_value(bad)
         with pytest.raises(ConfigError):
             fit_ou(_walk(1), unit_root_alpha=bad)
+    for bad_lag in (-1, 1.5, True):
+        with pytest.raises(ConfigError):
+            fit_ou(_walk(1), maxlag=bad_lag)
 
 
 def test_unit_root_alpha_moves_the_decision():
     # AR(1) con b cercano a 1: rechaza al 10 % pero no al 1 %.
     x = _ar1(0.985, 1000, seed=5)
     loose, strict = fit_ou(x, unit_root_alpha=0.10), fit_ou(x, unit_root_alpha=0.01)
-    assert loose.df_stat == strict.df_stat
+    assert loose.df_stat == strict.df_stat and loose.df_pvalue == strict.df_pvalue
     assert strict.df_crit < loose.df_stat <= loose.df_crit
     assert loose.valid and loose.df_alpha == 0.10
     assert strict.status == OUStatus.NON_STATIONARY and strict.near_unit_root
     assert "al 1 %" in strict.message
+
+
+def test_unit_root_test_can_be_reported_without_conditioning_validity():
+    """Ventanas de estabilidad: λ, μ, σ y vida media con 0 < b < 1 aunque el ADF no rechace."""
+    walk = _walk(42)
+    strict = fit_ou(walk)
+    params = fit_ou(walk, require_unit_root_rejection=False)
+    assert not strict.valid and strict.near_unit_root
+    assert params.valid and params.status == OUStatus.VALID and not params.near_unit_root
+    assert params.lam == pytest.approx(-math.log(params.b)) and params.half_life is not None
+    assert (params.df_stat, params.df_pvalue, params.df_lags) == (
+        strict.df_stat,
+        strict.df_pvalue,
+        strict.df_lags,
+    )
+    assert "sin exigir" in params.message and "no rechaza" in params.message
+    # b fuera de (0, 1) sigue sin parámetros.
+    assert not fit_ou(_walk(0), require_unit_root_rejection=False).valid
+
+
+def test_unit_root_test_never_bridges_missing_values():
+    """El ADF usa el tramo continuo sin NaN más largo; si es demasiado corto no hay prueba."""
+    x = simulate_ou_exact(0.1, 0.0, 0.05, 0.0, 599, 1, seed=2)[0]
+    x[[100, 250]] = np.nan
+    fit = fit_ou(pd.Series(x))
+    ref = adf_unit_root_test(x[251:])
+    assert ref is not None and fit.df_stat == ref.stat and fit.df_lags == ref.lags
+
+    chopped = x.copy()
+    chopped[::20] = np.nan  # tramos de 19 observaciones: hay transiciones, pero no tramos de 30
+    assert adf_unit_root_test(chopped) is None
+    fit = fit_ou(chopped)
+    assert fit.status == OUStatus.INSUFFICIENT and fit.nobs > MIN_OBS_OU
+    _assert_no_ou_numbers(fit)
+    assert "prueba de raíz unitaria" in fit.message
+    assert fit_ou(chopped, require_unit_root_rejection=False).df_stat is None
+
+
+def test_rank_deficient_unit_root_regression_is_not_a_valid_ou():
+    """Un spread de ~1e-16 hace singular la regresión ADF: la prueba no es calculable y el
+    ajuste no es válido (sin aviso de statsmodels)."""
+    x = simulate_ou_exact(0.3, 0.0, 0.01, 0.0, 599, 1, seed=21)[0]
+    assert fit_ou(x).valid
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        tiny = fit_ou(x * 1e-14)
+    assert tiny.status == OUStatus.INSUFFICIENT and tiny.df_stat is None
+    _assert_no_ou_numbers(tiny)
+    assert "prueba de raíz unitaria" in tiny.message
+
+
+def test_short_series_reduce_the_maximum_lag():
+    x = simulate_ou_exact(0.3, 0.0, 0.05, 0.0, MIN_OBS_OU - 1, 1, seed=1)[0]  # 30 puntos
+    fit = fit_ou(x, maxlag=40)
+    assert fit.df_lags is not None and fit.df_lags <= MIN_OBS_OU // 2 - 2
 
 
 def test_scale_detects_rounding_noise_of_identical_legs():
@@ -256,8 +397,8 @@ def test_scale_detects_rounding_noise_of_identical_legs():
     spread = compute_spread(prices, prices, hedge)
     assert float(spread.std()) < 1e-12
 
-    unscaled = fit_ou(spread, estimated_residual=True)
-    assert unscaled.valid  # sin escala absoluta no se distingue del ruido (el defecto original)
+    # Sin escala absoluta el resultado depende del ruido de coma flotante (el defecto original
+    # era que podía salir «válido»); con la escala, nunca.
     scale = float(np.std(np.log(prices)))
     fit = fit_ou(spread, estimated_residual=True, scale=scale)
     assert fit.status == OUStatus.INSUFFICIENT

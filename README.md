@@ -55,30 +55,39 @@ el laboratorio lo sigue tratando como SINTÉTICO y te lo avisa.
 
 ## Estado actual
 
-El proyecto avanza por fases. **Estamos en la fase 1: el núcleo de cálculo en
-Python** (paquete `mrlab`, en `backend/src/mrlab`), con sus pruebas y una demo por
-línea de comandos.
+El proyecto avanza por fases. **La fase 1, el núcleo de cálculo en Python, está
+terminada** (paquete `mrlab`, en `backend/src/mrlab`), con sus pruebas y una demo
+por línea de comandos. Las fases 2 y 3 son las siguientes.
 
 | Fase | Contenido | Estado |
 |---|---|---|
-| 1 | Núcleo Python: proveedores de datos, validación, cointegración, spread, OU, backtest de un par, métricas, exportación CSV/JSON, demo | **Implementada y revisada** |
+| 1 | Núcleo Python: proveedores de datos, validación, cointegración, spread, OU, backtest de un par, métricas, exportación CSV/JSON, demo | **Terminada** (dos rondas de revisión) |
 | 2 | API FastAPI, caché, errores en español | Pendiente |
-| 3 | Interfaz web (9 pestañas), informe HTML, Docker | Pendiente |
+| 3 | Interfaz web (9 pestañas), informe HTML, Docker, `docs/GUIA_ALUMNO.md` | Pendiente |
 | 4 | Ranking de pares con FDR, walk-forward, recalibración de β | Pendiente |
 | 5 | Cartera multi-par | Pendiente |
 
 **Estado de la fase 1.** El núcleo y la demo están completos y cubiertos por
-pruebas automáticas que no necesitan internet. Una revisión adversarial encontró
-defectos reales (por ejemplo, un paseo aleatorio podía pasar como OU válido, un
-índice sin proxy se simulaba como si fuera operable y la exportación afirmaba
-«prueba contaminada: no» sin verificarlo); ya están corregidos y cada corrección
-tiene su prueba de regresión. Las decisiones que tomaron esas correcciones están
-en [`docs/DECISIONS.md`](docs/DECISIONS.md) (entre otras, O7, O5a, S10a, A2 y
-D10–D17).
+pruebas automáticas que no necesitan internet. Dos rondas de revisión adversarial
+encontraron defectos reales y ya están corregidos, cada uno con su prueba de
+regresión. Algunos ejemplos:
 
-**Todavía no existen** la API, la interfaz web ni la configuración de Docker:
-llegan en las fases 2 y 3. Por ahora, `docker compose up` y `make dev` no están
-disponibles: el laboratorio se usa desde Python y desde la demo.
+- un paseo aleatorio podía pasar como OU válido. Ahora la validez exige que la
+  prueba de Dickey–Fuller aumentada rechace la raíz unitaria, y sobre el spread de
+  formación esa prueba es exactamente el paso interno de Engle–Granger;
+- un índice sin proxy se simulaba como si fuera operable, y la otra pierna podía
+  usarse como su «proxy» (se operaba un activo contra sí mismo);
+- la exportación afirmaba «prueba contaminada: no» sin verificarlo, y una nueva
+  ejecución de la demo borraba el historial de la prueba.
+
+Las decisiones que tomaron esas correcciones están en
+[`docs/DECISIONS.md`](docs/DECISIONS.md) (entre otras, O7, E8, O5a, S10a, S10b,
+A2, A2a, A7 y D10–D17).
+
+**Pendiente (fases 2 y 3):** la API, la interfaz web, la configuración de Docker,
+el informe HTML autocontenido y la guía del alumno (`docs/GUIA_ALUMNO.md`). Por
+ahora, `docker compose up` y `make dev` no están disponibles: el laboratorio se
+usa desde Python y desde la demo.
 
 ## Requisitos
 
@@ -154,13 +163,17 @@ python -m pytest
 
 - Las pruebas son deterministas (semillas fijas) y **no necesitan internet**: las
   del proveedor de Yahoo usan respuestas simuladas.
-- La suite completa tarda algo más de dos minutos (≈ 2 min 20 s en el equipo
-  donde se verificó). Casi un minuto corresponde a las pruebas de la demo, que la
-  ejecutan de punta a punta varias veces (también la reproducción byte a byte).
-- Por ahora solo una prueba está marcada como lenta (`slow`): la robustez del
-  escenario SINT-CBC con 30 semillas (≈ 10 segundos). `make test-fast` (o
-  `python -m pytest -m "not slow"` dentro de `backend`) la excluye; el ahorro es
-  pequeño.
+- La suite completa (775 pruebas) tarda unos cinco minutos y medio (5 min 24 s en
+  el equipo donde se verificó, con un solo núcleo ocupado). Algo más de dos minutos
+  corresponden a las pruebas de la demo, que la ejecutan de punta a punta varias
+  veces (también la reproducción byte a byte), y buena parte del resto a las
+  pruebas de Monte Carlo de la cointegración y del OU: cada ajuste OU incluye una
+  prueba de Dickey–Fuller aumentada con selección de rezagos.
+- Dos pruebas están marcadas como lentas (`slow`): el tamaño de la prueba de raíz
+  unitaria en las ventanas de estabilidad con 400 pares de paseos aleatorios
+  (≈ 45 s) y la robustez del escenario SINT-CBC con 30 semillas (≈ 15 s).
+  `make test-fast` (o `python -m pytest -m "not slow"` dentro de `backend`) las
+  excluye y tarda alrededor de un minuto menos.
 
 ## Demo
 
@@ -184,10 +197,16 @@ ignora (cámbiala con `--output-dir`; la caché de instantáneas, con `--cache-d
 
 Al final, la demo imprime la orden **«Para reproducir»**: vuelve a ejecutar el
 `run_config.json` exportado usando solo la caché local y produce los mismos
-archivos byte a byte (incluye `--cache-dir` y `--excel-es` si los usaste):
+archivos byte a byte. La orden usa el intérprete de Python con el que ejecutaste
+la demo y rutas absolutas (el script, el `run_config.json` y, si no son los
+predeterminados, `--cache-dir` y `--output-dir`), más `--excel-es` si lo usaste,
+así que funciona desde cualquier carpeta. En Windows se cita con comillas dobles
+(en PowerShell, antepón `& `). Tal cual, reescribe la misma carpeta; para comparar,
+añade al final `--output-dir <otra carpeta>`. Por ejemplo:
 
 ```bash
-python examples/demo_ko_pep.py --reproducir examples/output/<par>/run_config.json
+/ruta/a/.venv/bin/python /ruta/al/repo/examples/demo_ko_pep.py \
+    --reproducir /ruta/al/repo/examples/output/<par>/run_config.json
 ```
 
 ### La muestra de prueba
@@ -197,9 +216,24 @@ La muestra de prueba (el último 20 %) **no** se ejecuta salvo que lo pidas con
 Si el `run_config.json` ya incluía la prueba, `--reproducir` la vuelve a ejecutar
 sin necesidad de la opción. Si cambias los umbrales a mano y vuelves a ejecutar la
 prueba, el informe y la exportación la marcan como **contaminada** («Prueba
-contaminada: SÍ»). En la fase 1, el historial que permite detectarlo viaja dentro
-del propio `run_config.json`: si lo borras o lo editas a mano, la marca no puede
-detectarlo (el registro persistente de estudios llega en la fase 2).
+contaminada: SÍ»).
+
+En la fase 1, el historial que permite detectarlo viaja dentro del propio
+`run_config.json`. La demo lo protege así:
+
+- Antes de exportar, conserva el historial del `run_config.json` que ya haya en la
+  carpeta de destino si es del mismo par (también con `--reproducir`). Volver a
+  ejecutar la demo normalmente, sin la prueba, ya no lo borra.
+- Si ese archivo no se puede leer, o es de otro par y tiene historial, la demo se
+  detiene sin sobrescribirlo (`DEMO_HISTORIAL_ILEGIBLE`,
+  `DEMO_CARPETA_DE_OTRO_PAR`): usa otra `--output-dir` o, si de verdad quieres
+  descartar ese historial, `--reiniciar-historial`.
+
+**Limitación de la fase 1:** la marca no puede detectar una ejecución anterior de
+la prueba si borras o editas el historial a mano, si exportas en otra carpeta
+(`--output-dir`) o si partes de un `run_config.json` copiado antes de ejecutar la
+prueba y exportas fuera de la carpeta original. El registro persistente de
+estudios, que lo resuelve, llega en la fase 2.
 
 Si el par no superó los filtros (estado distinto de ✅ o alguna razón de
 descarte), el backtest se muestra con el aviso **«resultado solo ilustrativo»** y
@@ -248,6 +282,40 @@ El instrumento ejecutable hereda la moneda y el tipo de precio generales, pero s
 clase de activo se declara aparte (`--asset-class-exec-a`/`-b`) o con su
 `.meta.json`. La señal sale del índice y el PnL del instrumento ejecutable: la
 demo avisa del riesgo de base.
+
+### Opciones de los scripts de `examples/`
+
+Los tres scripts muestran su ayuda y sus errores en español (`-h` o `--help`; un
+error de argumentos termina con código 2 y sin trazas de Python).
+
+**`demo_ko_pep.py`** (`python examples/demo_ko_pep.py --help` da la lista completa):
+
+| Opción | Para qué sirve |
+|---|---|
+| `--csv-a`, `--csv-b` | CSV de las series A y B (sin ellas, el par sintético de `examples/data/`) |
+| `--currency`, `--asset-class`, `--price-type` | Metadatos de todas las series, si no hay `.meta.json`; `--currency-a`, `--asset-class-b`, etc. para una sola serie |
+| `--symbol-a`, `--symbol-b` | Símbolo de cada serie (por defecto, el nombre del archivo) |
+| `--exec-a`, `--exec-b` | CSV del instrumento ejecutable (proxy) de un índice o futuro; su clase con `--asset-class-exec-a`/`-b` (o su `.meta.json`) |
+| `--start`, `--end` | Recorta las fechas (AAAA-MM-DD) |
+| `--incluir-prueba` | Ejecuta también la muestra de prueba (una sola vez, con la configuración congelada) |
+| `--reproducir RUN_CONFIG` | Reproduce un `run_config.json` exportado usando solo la caché (no admite `--csv-*`, `--exec-*`, `--start` ni `--end`) |
+| `--reiniciar-historial` | Descarta a conciencia el historial de la prueba que haya en la carpeta de destino |
+| `--output-dir CARPETA` | Carpeta de exportación (por defecto, `examples/output`) |
+| `--cache-dir CARPETA` | Caché de instantáneas (por defecto, `data/cache`) |
+| `--excel-es` | CSV para Excel en español (`;`, coma decimal y BOM) |
+
+**`fetch_ko_pep.py`** (`make fetch-example`, requiere internet):
+
+| Opción | Para qué sirve |
+|---|---|
+| `--symbols SÍMBOLO …` | Símbolos de Yahoo Finance que se descargan (por defecto, `KO PEP`) |
+| `--start AAAA-MM-DD`, `--end AAAA-MM-DD` | Rango de fechas (por defecto, desde 2010-01-01 hasta hoy); `--end` no puede ser anterior a `--start` |
+| `--output-dir CARPETA` | Dónde se guardan los CSV y sus `.meta.json` (por defecto, `examples/data/real/`) |
+
+**`generar_csv_sinteticos.py`** regenera el par sintético de `examples/data/`
+(byte a byte). Admite un argumento opcional, la carpeta de destino:
+`python examples/generar_csv_sinteticos.py [carpeta]`. Una carpeta que empieza por
+«-» se rechaza para no confundirla con una opción (escríbela como `./-nombre`).
 
 ### Datos reales de KO y PEP
 
@@ -326,9 +394,13 @@ variables con prefijo `MRLAB_` (ver `backend/src/mrlab/config.py`).
   exactos, así que son más estrechos de lo que deberían. El bootstrap por bloques
   queda como extensión.
 - **OU de parámetros constantes:** no modela cambios de régimen. El ajuste OU solo
-  es válido si `0 < b < 1` **y** la prueba de Dickey–Fuller rechaza la raíz
-  unitaria (un `b` algo menor que 1 aparece incluso en un paseo aleatorio; ver
-  `docs/MATEMATICAS.md`, sección 8.5).
+  es válido si `0 < b < 1` **y** la prueba de Dickey–Fuller aumentada (rezagos por
+  AIC) rechaza la raíz unitaria: un `b` algo menor que 1 aparece incluso en un
+  paseo aleatorio (ver `docs/MATEMATICAS.md`, sección 8.5). Sobre el spread de un
+  par, esa prueba coincide con Engle–Granger sin ajustar. En las ventanas de
+  estabilidad, `λ` y la vida media se estiman aunque la prueba no rechace (con 252
+  observaciones tiene poca potencia) y el resultado de la prueba se informa
+  aparte.
 - **Pares cripto + bolsa:** se usan solo los días de negociación de la bolsa (nunca
   se rellenan fines de semana). Lo mismo si un par de cripto se opera con un
   instrumento de bolsa: el calendario es mixto y se anualiza con 252. En Yahoo, el cierre diario de cripto es a
@@ -374,6 +446,7 @@ variables con prefijo `MRLAB_` (ver `backend/src/mrlab/config.py`).
 ├── docs/                          # especificación, arquitectura, decisiones, matemáticas
 └── examples/
     ├── demo_ko_pep.py             # demo reproducible
+    ├── _cli.py                    # argparse en español, común a los tres scripts
     ├── fetch_ko_pep.py            # descarga KO y PEP de Yahoo (make fetch-example)
     ├── generar_csv_sinteticos.py  # regenera examples/data/ (byte a byte)
     └── data/                      # CSV SINTÉTICOS (real/ se crea con make fetch-example)

@@ -19,7 +19,6 @@ from integration_helpers import (
     synthetic_preset,
     with_symbol,
 )
-from statsmodels.tsa.adfvalues import mackinnoncrit
 
 from mrlab.analysis.pair_pipeline import (
     ILLUSTRATIVE_BANNER,
@@ -36,7 +35,7 @@ from mrlab.analysis.runner import run_pair
 from mrlab.backtest.split import compute_split
 from mrlab.domain.errors import ConfigError
 from mrlab.domain.models import AssetClass, CalendarType, Segment, SpreadType
-from mrlab.model.ou import OUStatus, fit_ou
+from mrlab.model.ou import OUStatus, adf_unit_root_test, fit_ou, unit_root_critical_value
 from mrlab.stats.cointegration import Direction
 
 PROMOTIONAL = ("garantizada", "par rentable", "estrategia ganadora", "valor justo")
@@ -349,13 +348,13 @@ def _random_walk_pair(seed: int, n: int = 1500):
 
 def test_random_walk_residual_is_not_a_valid_ou_with_residual_critical_values():
     """Con el valor crítico de una serie observada (N = 1, −2,86) este par de paseos
-    independientes salía «válido» con vida media de 35,7 días y sin ningún aviso. El spread es
-    el residuo de una MCO estimada: se exige el valor crítico de Engle–Granger (N = 2)."""
-    a, b = _random_walk_pair(1007)
+    independientes saldría «válido». El spread es el residuo de una MCO estimada: se exige el
+    valor crítico de Engle–Granger (N = 2)."""
+    a, b = _random_walk_pair(1024)
     an = analyze_pair(a, b)
     ou = an.ou
-    assert mackinnoncrit(N=2, regression="c", nobs=ou.nobs)[1] == ou.df_crit
-    assert ou.df_crit < ou.df_stat < mackinnoncrit(N=1, regression="c", nobs=ou.nobs)[1]
+    assert ou.df_crit == unit_root_critical_value(0.05, estimated_residual=True)
+    assert ou.df_crit < ou.df_stat < unit_root_critical_value(0.05)
     assert 0 < ou.b < 1 and ou.df_estimated_residual and ou.df_alpha == an.config.alpha_level
 
     assert ou.status == OUStatus.NON_STATIONARY and ou.near_unit_root and not ou.valid
@@ -366,17 +365,55 @@ def test_random_walk_residual_is_not_a_valid_ou_with_residual_critical_values():
     assert "no se puede distinguir el spread de un paseo aleatorio" in reason.message
     assert f"{ou.df_stat:.2f}".replace(".", ",") in reason.message
     assert f"{ou.df_crit:.2f}".replace(".", ",") in reason.message
+    assert "Dickey–Fuller aumentada" in reason.message and "sin rezagos" not in reason.message
     assert "RAIZ_UNITARIA_CERCANA" not in codes(an.discard_reasons)
 
 
-def test_ou_stability_windows_use_the_same_unit_root_rule():
+def _noisy_or_cointegrated_pair(seed: int):
+    """Pares de prueba de O7: cointegrados (impares) y paseos independientes con ruido de
+    microestructura de 1 % (pares), el caso en que Dickey–Fuller sin rezagos fallaba."""
+    rng = np.random.default_rng(seed)
+    if seed % 2:
+        log_a, log_b = cointegrated_log_prices(n=1500, seed=seed, lam=0.03)
+    else:
+        log_a = np.log(100) + np.cumsum(rng.normal(0, 0.01, 1500)) + rng.normal(0, 0.01, 1500)
+        log_b = np.log(100) + np.cumsum(rng.normal(0, 0.01, 1500)) + rng.normal(0, 0.01, 1500)
+    return make_series(np.exp(log_a), symbol="A"), make_series(np.exp(log_b), symbol="B")
+
+
+def test_training_ou_validity_coincides_with_unadjusted_engle_granger():
+    """Decisión O7 (refinada): sobre el spread de formación la prueba de raíz unitaria es
+    EXACTAMENTE el paso interno de ``coint`` en la dirección elegida, así que el OU es válido si
+    y solo si 0 < b < 1 y el p-value de Engle–Granger SIN AJUSTAR es ≤ α."""
+    for seed in range(16):
+        an = analyze_pair(*_noisy_or_cointegrated_pair(seed))
+        eg, ou = an.eg[an.chosen_direction], an.ou
+        assert ou.df_estimated_residual and ou.df_lags == eg.lags
+        assert ou.df_stat == pytest.approx(eg.statistic, rel=1e-9)
+        assert ou.df_pvalue == pytest.approx(eg.pvalue, rel=1e-9, abs=1e-15)
+        if 0 < ou.b < 1:
+            assert ou.valid == (eg.pvalue <= an.config.alpha_level), seed
+        # Un par ✅ (p ajustado ≤ α, así que también el p sin ajustar) nunca tiene un OU
+        # inválido por la prueba de raíz unitaria.
+        if an.status == PairStatus.EVIDENCE:
+            assert not ou.near_unit_root
+
+
+def test_ou_stability_windows_estimate_parameters_and_report_the_unit_root_test_apart():
     a, b = synthetic_preset("SINT-COI")
     an = analyze_pair(a, b)
     train = an.spread.loc[: str(an.split.train_end)]
-    for w in an.ou_stability.windows:
+    stab = an.ou_stability
+    assert stab.unit_root_alpha == an.config.alpha_level
+    for w in stab.windows:
         window = train.loc[str(w.start) : str(w.end)]
-        ref = fit_ou(window, estimated_residual=True, unit_root_alpha=0.05)
-        assert w.valid == ref.valid and w.half_life == ref.half_life
+        params = fit_ou(window, maxlag=an.config.maxlag, require_unit_root_rejection=False)
+        assert w.estimable == params.valid and w.half_life == params.half_life
+        # La prueba de la ventana usa N = 1: α y β se estimaron con toda la formación.
+        test = adf_unit_root_test(window, alpha=0.05, maxlag=an.config.maxlag)
+        assert w.unit_root_rejected == test.rejected and w.df_stat == test.stat
+    assert stab.n_unit_root_rejected == sum(bool(w.unit_root_rejected) for w in stab.windows)
+    assert "poca potencia" in stab.message
 
 
 # --------------------------------------------------------------------------- colineales
@@ -601,3 +638,142 @@ def test_crypto_pair_with_exchange_proxy_uses_mixed_calendar():
         stub_config(("ETH-USD", "BTC-USD"), exec_b="BTCETF"), StubData([eth, btc, etf])
     )
     assert result.backtests[Segment.VALIDATION].metrics.periods_per_year == 252
+
+
+# --------------------------------------------------------------------------- ejecutables
+
+
+def _index_and_etf(seed: int = 3):
+    """^GSPC (índice, proxy sugerido SPY) frente a SPY: un par que invita a usar SPY dos veces."""
+    log_a, log_b = cointegrated_log_prices(n=1500, seed=seed, lam=0.1)
+    index = as_non_executable(make_series(np.exp(log_a) * 10, symbol="^GSPC"), "SPY")
+    spy = make_series(np.exp(log_b), symbol="SPY", asset_class=AssetClass.ETF)
+    return index, spy, log_a
+
+
+def test_proxy_required_never_suggests_the_other_leg():
+    index, spy, _ = _index_and_etf()
+    an = analyze_pair(index, spy)
+    reason = next(c for c in an.discard_reasons if c.code == "PROXY_REQUERIDO")
+    assert "«SPY» ya se usa en la otra pierna" in reason.message
+    assert "El proxy sugerido es" not in reason.message
+    assert "otro instrumento ejecutable" in reason.message
+    # Con otra pierna, la sugerencia habitual se mantiene.
+    other = with_symbol(spy, "QQQ")
+    reason = next(
+        c for c in analyze_pair(index, other).discard_reasons if c.code == "PROXY_REQUERIDO"
+    )
+    assert "El proxy sugerido es «SPY»" in reason.message
+
+
+@pytest.mark.parametrize("exec_symbol", ["SPY", " spy "])
+def test_same_executable_instrument_in_both_legs_blocks_the_strategy(exec_symbol):
+    """Hallazgo de la verificación: ^GSPC/SPY con SPY como ejecutable de ^GSPC salía ✅ y el
+    backtest compraba y vendía SPY contra sí mismo (PnL = solo costes), sin ningún aviso."""
+    index, spy, _ = _index_and_etf()
+    an = analyze_pair(index, spy, exec_a=with_symbol(spy, exec_symbol))
+    reason = next(c for c in an.discard_reasons if c.code == "EJECUTABLES_IDENTICOS")
+    assert "EJECUTABLES_IDENTICOS" in STRATEGY_BLOCKING_CODES and reason.status is None
+    assert "mismo instrumento" in reason.message and "«^GSPC»" in reason.message
+    assert "solo reflejaría costes" in reason.message
+    assert not an.strategy_allowed and an.illustrative_only
+    assert "PROXY_REQUERIDO" not in codes(an.discard_reasons)
+
+
+def test_run_pair_does_not_simulate_the_same_instrument_against_itself():
+    index, spy, _ = _index_and_etf()
+    result = run_pair(stub_config(("^GSPC", "SPY"), exec_a="SPY"), StubData([index, spy]))
+    assert result.backtests == {}
+    assert "EJECUTABLES_IDENTICOS" in codes(result.analysis.discard_reasons)
+
+
+def test_proportional_executable_prices_are_identical_instruments():
+    index, spy, log_a = _index_and_etf()
+    # La misma serie con otro nombre y otro proveedor (p. ej. un CSV copiado): se detecta por
+    # los precios proporcionales.
+    clone = with_symbol(spy.with_data(spy.data * 2.0), "SPY2", provider="csv")
+    an = analyze_pair(index, spy, exec_a=clone)
+    reason = next(c for c in an.discard_reasons if c.code == "EJECUTABLES_IDENTICOS")
+    assert "proporcionales" in reason.message and "«SPY2»" in reason.message
+    assert not an.strategy_allowed
+
+    # Control: un ejecutable distinto que replica el índice sí permite simular.
+    ivv = make_series(np.exp(log_a), symbol="IVV", asset_class=AssetClass.ETF)
+    control = analyze_pair(index, spy, exec_a=ivv)
+    assert "EJECUTABLES_IDENTICOS" not in codes(control.discard_reasons)
+    assert control.status == PairStatus.EVIDENCE and control.strategy_allowed
+
+
+def test_index_class_requires_a_proxy_whatever_its_metadata_say():
+    log_a, log_b = cointegrated_log_prices(n=1500, seed=3, lam=0.1)
+    b = make_series(np.exp(log_b), symbol="B")
+    index = make_series(np.exp(log_a), symbol="^GSPC", asset_class=AssetClass.INDEX)
+    assert not index.meta.asset.executable  # el validador de AssetInfo (D1)
+    assert "PROXY_REQUERIDO" in codes(analyze_pair(index, b).discard_reasons)
+
+    # Un AssetInfo copiado sin validar puede quedar como índice «ejecutable»: el análisis
+    # decide también por la clase del activo.
+    forged = index.with_meta(
+        asset=index.meta.asset.model_copy(update={"executable": True, "suggested_proxy": None})
+    )
+    assert forged.meta.asset.executable
+    an = analyze_pair(forged, b)
+    assert "PROXY_REQUERIDO" in codes(an.discard_reasons) and not an.strategy_allowed
+
+    future = make_series(np.exp(log_a), symbol="ES=F", asset_class=AssetClass.FUTURE)
+    future = future.with_meta(asset=future.meta.asset.model_copy(update={"executable": True}))
+    an = analyze_pair(index, b, exec_a=future)
+    reason = next(c for c in an.discard_reasons if c.code == "PROXY_NO_EJECUTABLE")
+    assert "un futuro continuo" in reason.message and not an.strategy_allowed
+
+
+# --------------------------------------------------------------------------- validación con proxy
+
+
+def test_validation_summary_counts_the_dates_actually_used_with_a_late_proxy():
+    index, b, log_a = _index_and_etf()
+    dates = index.data.index
+    proxy = make_series(
+        np.exp(log_a[600:]), symbol="IVV", asset_class=AssetClass.ETF, dates=dates[600:]
+    )
+    an = analyze_pair(index, b, exec_a=proxy)
+    report = an.validation
+    assert len(an.aligned.prices) == 900 and an.split.n_train == 540
+    assert report.n_aligned == 900 and report.n_train_estimate == 540
+    assert "900 observaciones comunes, 540 en formación" in report.status_message
+    assert "1.500" not in report.status_message and not report.blocked
+
+    # Si la intersección deja la formación por debajo del mínimo, el informe queda bloqueado.
+    late = make_series(
+        np.exp(log_a[800:]), symbol="IVV", asset_class=AssetClass.ETF, dates=dates[800:]
+    )
+    blocked = analyze_pair(index, b, exec_a=late)
+    assert blocked.status == PairStatus.INSUFFICIENT_DATA
+    assert blocked.validation.blocked and blocked.validation.insufficient_data
+    assert blocked.validation.status_message.startswith("Análisis bloqueado")
+    assert "420" in blocked.validation.status_message
+    assert "DATOS_INSUFICIENTES" in [i.code for i in blocked.validation.issues]
+
+
+def test_validation_summary_is_not_apt_with_a_non_positive_proxy_price():
+    index, b, log_a = _index_and_etf()
+    prices = np.exp(log_a)
+    prices[1400] = -1.0
+    proxy = make_series(prices, symbol="IVV", asset_class=AssetClass.ETF)
+    an = analyze_pair(index, b, exec_a=proxy)
+    status = an.validation.status_message
+    assert not status.startswith("Datos aptos")
+    assert status.startswith("Datos utilizables con incidencias")
+    assert "instrumento ejecutable «IVV»" in status and "bloquean la simulación" in status
+    assert "PRECIO_EJECUTABLE_NO_POSITIVO" in codes(an.discard_reasons)
+    assert not an.strategy_allowed
+
+
+def test_validation_summary_is_blocked_when_the_proxy_currency_differs():
+    index, b, log_a = _index_and_etf()
+    proxy = make_series(np.exp(log_a), symbol="CSPX", asset_class=AssetClass.ETF, currency="GBP")
+    an = analyze_pair(index, b, exec_a=proxy)
+    assert an.status == PairStatus.INSUFFICIENT_DATA
+    assert an.validation.blocked
+    assert an.validation.status_message.startswith("Análisis bloqueado")
+    assert "GBP" in an.validation.status_message

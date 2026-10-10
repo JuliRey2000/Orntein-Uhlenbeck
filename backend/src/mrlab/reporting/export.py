@@ -160,9 +160,11 @@ TEST_CONTAMINATED_TEXT = {
     None: "no aplica: la prueba no se ejecutó.",
 }
 TEST_HISTORY_NOTE = (
-    "  Alcance: el historial de ejecuciones de la prueba viaja dentro de run_config.json; si se "
-    "borra o se edita a mano, esta marca no puede detectarlo. El registro persistente de estudios "
-    "llega en la fase 2."
+    "  Alcance: el historial de ejecuciones de la prueba viaja dentro de run_config.json. Si se "
+    "borra o se edita a mano, o si una ejecución nueva parte de una configuración sin ese "
+    "historial (p. ej. un run_config.json copiado antes de ejecutar la prueba, o una exportación "
+    "en otra carpeta), esta marca no puede detectarlo. El registro persistente de estudios llega "
+    "en la fase 2."
 )
 #: Valor de ``contaminada`` en ``pruebas_estadisticas.csv``.
 _CONTAMINATED_CELL = {True: "sí", False: "no", None: "no aplica"}
@@ -196,8 +198,11 @@ FIELD_NAMES_ES = {
     "df_stat": "estadistico_dickey_fuller",
     "df_crit": "valor_critico_dickey_fuller",
     "df_alpha": "nivel_dickey_fuller",
+    "df_pvalue": "p_valor_dickey_fuller",
+    "df_lags": "rezagos_dickey_fuller",
     "df_estimated_residual": "valores_criticos_residuo_estimado",
     "near_unit_root": "cerca_de_raiz_unitaria",
+    "unit_root_rejected": "rechaza_raiz_unitaria",
     "mean": "media",
     "std": "desv",
     "lower": "inferior",
@@ -530,8 +535,11 @@ def _stats_rows(result: RunResult) -> list[tuple[str, str, str, Any]]:
             [
                 ("ventana", ous.window),
                 ("paso", ous.step),
-                ("ventanas_no_validas", ous.n_invalid),
+                ("ventanas_sin_parametros", ous.n_invalid),
                 ("cv_lambda", ous.cv_lambda),
+                ("nivel_dickey_fuller", ous.unit_root_alpha),
+                ("ventanas_con_prueba_dickey_fuller", ous.n_unit_root_tested),
+                ("ventanas_que_rechazan_raiz_unitaria", ous.n_unit_root_rejected),
                 ("mensaje", ous.message),
             ],
         )

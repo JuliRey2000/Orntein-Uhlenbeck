@@ -67,9 +67,10 @@ def test_evidence_pair_runs_train_and_validation_backtests(synthetic):
 
 
 def test_pair_without_evidence_is_only_illustrative():
-    # Relación que se rompe en formación: sin evidencia, pero con OU válido (decisión O5).
-    # (Antes se usaba el preset SINT-IND; con la decisión O7 su OU ya no es válido.)
-    a, b = series_pair(*broken_relationship(break_start=300, break_end=700))
+    # Relación que se rompe en formación: ⚠️ resultado inestable (no ✅), pero con OU válido
+    # (decisión O5). Con la O7 refinada la validez del OU coincide con Engle–Granger SIN AJUSTAR
+    # (p = 0,012 aquí); con break_end=700 ese p es 0,067 y el OU ya no es válido.
+    a, b = series_pair(*broken_relationship(break_start=300, break_end=650))
     result = run_pair(stub_config(), StubData([a, b]))
     analysis = result.analysis
     assert analysis.status != PairStatus.EVIDENCE
