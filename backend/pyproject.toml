@@ -6,7 +6,6 @@ build-backend = "setuptools.build_meta"
 name = "mrlab"
 version = "0.1.0"
 description = "Laboratorio de Reversión a la Media: herramienta educativa de pairs trading (cointegración + Ornstein–Uhlenbeck)."
-readme = "../README.md"
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",

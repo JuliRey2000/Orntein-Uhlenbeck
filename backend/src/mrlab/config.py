@@ -11,7 +11,9 @@ REPO_ROOT = BACKEND_ROOT.parent
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="MRLAB_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=(REPO_ROOT / ".env", ".env"), env_prefix="MRLAB_", extra="ignore"
+    )
 
     data_dir: Path = REPO_ROOT / "data"
     cache_dir: Path = REPO_ROOT / "data" / "cache"

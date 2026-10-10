@@ -105,6 +105,7 @@ class SeriesMeta(BaseModel):
     coverage_end: date | None = None
     n_obs: int = 0
     source_note: str = ""
+    seed: int | None = None  # semilla del generador (solo datos sintéticos)
 
     @property
     def is_synthetic(self) -> bool:
