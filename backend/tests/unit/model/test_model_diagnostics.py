@@ -150,3 +150,24 @@ def test_rolling_ou_stability_with_too_few_windows():
 
     with pytest.raises(DataError):
         rolling_ou_stability(pd.Series(np.zeros(300)), window=252, step=63)
+
+
+def test_rolling_ou_stability_applies_the_unit_root_rule_of_the_full_fit():
+    """Decisión O7: cada ventana usa la misma regla de validez que el ajuste completo (con los
+    valores críticos del residuo estimado cuando el pipeline lo pide)."""
+    spread = _ou_spread(1000, lam=0.05)
+    lenient = rolling_ou_stability(spread, window=252, step=63)
+    strict = rolling_ou_stability(
+        spread, window=252, step=63, estimated_residual=True, unit_root_alpha=0.01
+    )
+    for w, s in zip(strict.windows, range(0, 1000 - 252 + 1, 63), strict=True):
+        ref = fit_ou(spread.iloc[s : s + 252], estimated_residual=True, unit_root_alpha=0.01)
+        assert w.valid == ref.valid and w.half_life == ref.half_life
+    assert strict.n_invalid > lenient.n_invalid
+    assert "no se distingue de 1" in strict.message
+
+    # ``scale`` también llega a cada ventana: ruido de redondeo → ninguna ventana válida.
+    tiny = _series(_ou_spread(600, lam=0.3).to_numpy() * 1e-14)
+    assert rolling_ou_stability(tiny, window=252, step=63).n_invalid == 0
+    scaled = rolling_ou_stability(tiny, window=252, step=63, scale=1.0)
+    assert scaled.windows and scaled.n_invalid == len(scaled.windows)

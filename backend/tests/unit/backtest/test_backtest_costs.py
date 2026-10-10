@@ -93,3 +93,61 @@ def test_financing_only_on_exposure_above_capital():
     expected = 0.05 * (15_000.0 - 10_000.0) * 1 / 365
     assert d.loc[3, "cost_financing"] == pytest.approx(expected)
     assert np.all(d["cost_borrow"] == 0.0)
+
+
+# --------------------------------------------------------------------------- validación (CostParams)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("day_count", 0),  # antes: ZeroDivisionError en el motor
+        ("day_count", -365),  # antes: préstamo y financiación como ingresos
+        ("day_count", 3650),
+        ("borrow_rate_annual", 3.0),  # 300 % anual: ¿se quiso escribir 0,03?
+        ("borrow_rate_annual", -0.01),
+        ("financing_rate_annual", 5.0),
+        ("financing_rate_annual", float("nan")),
+        ("commission_bps", -1.0),
+        ("commission_bps", 5_000.0),
+        ("slippage_bps_equity", float("inf")),
+        ("slippage_bps_crypto", 2_000.0),
+    ],
+)
+def test_cost_params_reject_unreasonable_values_in_spanish(field, value):
+    from mrlab.domain.errors import ConfigError
+
+    with pytest.raises(ConfigError) as info:
+        CostParams(**{field: value})
+    err = info.value
+    assert err.code == "COSTES_INVALIDOS"
+    assert f"costs.{field}" in err.message and "recibido" in err.message
+    assert err.details["campo"] == f"costs.{field}"
+
+
+def test_cost_params_hint_when_a_rate_looks_like_a_percentage():
+    from mrlab.domain.errors import ConfigError
+
+    with pytest.raises(ConfigError) as info:
+        CostParams(borrow_rate_annual=3.0)
+    assert "0,03" in info.value.message
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"day_count": 360},
+        {"day_count": 365},
+        {"borrow_rate_annual": 1.0, "financing_rate_annual": 0.0},
+        {"commission_bps": 0.0, "slippage_bps_equity": 1_000.0, "slippage_bps_crypto": 150.0},
+    ],
+)
+def test_cost_params_accept_reasonable_values(updates):
+    costs = CostParams(**updates)
+    assert all(getattr(costs, k) == v for k, v in updates.items())
+
+
+def test_day_count_is_used_for_accruals():
+    actual_360 = CostParams(day_count=360)
+    borrow, _ = carry_costs(5_000.0, 10_000.0, 10_000.0, 1, actual_360)
+    assert borrow == pytest.approx(0.03 * 5_000.0 / 360)

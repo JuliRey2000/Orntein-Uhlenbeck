@@ -13,6 +13,11 @@ CONTRATO (a implementar):
 - ``normalized_prices(prices)``: base 100 en la primera fecha común (las
   columnas se alinean por intersección).
 - Precios ≤ 0 → DataError (los logaritmos no están definidos).
+- Fechas duplicadas: la misma política que la validación de datos (2.3): orden
+  estable por fecha y se conserva la ÚLTIMA aparición de cada fecha (el
+  informe de validación es quien avisa de los duplicados). Entradas sin índice
+  de fechas → DataError; ventana móvil < 2 → ConfigError. Nunca un ValueError
+  crudo de pandas.
 
 Notas de implementación:
 - Las fechas con precio faltante (NaN) no son observaciones: se descartan antes
@@ -30,7 +35,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from mrlab.domain.errors import DataError
+from mrlab.domain.errors import ConfigError, DataError
 
 CONCEPTS = {
     "correlacion": "Correlación: los activos se mueven juntos día a día (rendimientos).",
@@ -66,9 +71,28 @@ def _check_positive(prices: pd.Series, name: object) -> None:
 
 
 def _clean_prices(prices: pd.Series, name: object = None) -> pd.Series:
-    """Precios sin NaN, en orden cronológico, como float y con positividad verificada."""
-    clean = prices.dropna().sort_index().astype(float)
-    _check_positive(clean, prices.name if name is None else name)
+    """Precios sin NaN ni fechas repetidas, en orden cronológico, como float y positivos.
+
+    Misma política que ``mrlab.data.validation.clean_series``: orden ESTABLE (entre
+    fechas repetidas se conserva el orden original), se queda la última aparición de
+    cada fecha y después se descartan los NaN (nunca se rellenan).
+    """
+    label = prices.name if name is None else name
+    if not isinstance(prices.index, pd.DatetimeIndex):
+        raise DataError(
+            f"La serie «{label}» debe estar indexada por fecha para calcular rendimientos.",
+            details={"serie": str(label)},
+        )
+    ordered = prices.sort_index(kind="stable")
+    unique = ordered[~ordered.index.duplicated(keep="last")]
+    try:
+        clean = unique.dropna().astype(float)
+    except (TypeError, ValueError) as exc:
+        raise DataError(
+            f"La serie «{label}» contiene valores que no son números: revisa los datos de origen.",
+            details={"serie": str(label)},
+        ) from exc
+    _check_positive(clean, label)
     return clean
 
 
@@ -111,8 +135,10 @@ def correlation_matrix(prices: Mapping[str, pd.Series]) -> CorrelationResult:
 def rolling_correlation(a: pd.Series, b: pd.Series, window: int = 63) -> pd.Series:
     """Pearson móvil de los últimos ``window`` log-rendimientos comunes (solo pasado; NaN al inicio)."""
     if window < 2:
-        raise ValueError(
-            f"La ventana de correlación móvil debe ser de al menos 2 observaciones (se recibió {window})."
+        raise ConfigError(
+            f"La ventana de correlación móvil debe ser de al menos 2 observaciones (se recibió {window}).",
+            code="VENTANA_INVALIDA",
+            details={"window": window},
         )
     ra, rb = _common_log_returns(_clean_prices(a), _clean_prices(b))
     rolling = ra.rolling(window, min_periods=window).corr(rb)
@@ -128,9 +154,8 @@ def normalized_prices(
         columns = {name: prices[name] for name in prices.columns}
     else:
         columns = dict(prices)
-    for name, series in columns.items():
-        _clean_prices(series, name)
-    frame = pd.concat(columns, axis=1, join="inner").dropna(how="any").sort_index().astype(float)
+    clean = {name: _clean_prices(series, name) for name, series in columns.items()}
+    frame = pd.concat(clean, axis=1, join="inner").sort_index()
     if frame.empty:
         raise DataError("Las series no tienen fechas en común: no se pueden comparar en base 100.")
     return frame / frame.iloc[0] * base

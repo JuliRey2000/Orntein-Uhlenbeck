@@ -155,3 +155,56 @@ def random_walk_and_stationary(n: int = 1000, seed: int = 0) -> tuple[np.ndarray
     for t in range(1, n):
         x[t] = 0.5 * x[t - 1] + eps[t]
     return log_a, np.log(50.0) + x
+
+
+# --------------------------------------------------------------------------- datos en memoria
+
+
+class StubData:
+    """Sustituto mínimo de ``DataService`` para ``run_pair``: sirve series ya construidas."""
+
+    def __init__(self, series: list[PriceSeries]):
+        self.series = {s.symbol: s for s in series}
+
+    def load(self, provider: str, symbol: str, start: date, end: date) -> PriceSeries:
+        return self.series[symbol].with_meta(snapshot_id=f"stub-{symbol}")
+
+    def load_snapshot(self, snapshot_id: str, start, end) -> PriceSeries:
+        raise AssertionError("StubData no guarda instantáneas")
+
+
+def stub_config(
+    symbols: tuple[str, str] = ("AAA", "BBB"),
+    *,
+    exec_a: str | None = None,
+    exec_b: str | None = None,
+    provider: str = "test",
+    **updates,
+) -> RunConfig:
+    """RunConfig para ``StubData`` (mismas fechas amplias que ``pair_config``)."""
+
+    def ref(symbol: str | None) -> SeriesRef | None:
+        if symbol is None:
+            return None
+        return SeriesRef(provider=provider, symbol=symbol, start="1990-01-01", end="2030-12-31")
+
+    pair = PairSpec(a=ref(symbols[0]), b=ref(symbols[1]), exec_a=ref(exec_a), exec_b=ref(exec_b))
+    return RunConfig(pair=pair, **updates)
+
+
+def as_non_executable(series: PriceSeries, suggested_proxy: str | None = "SPY") -> PriceSeries:
+    """La misma serie marcada como índice no ejecutable (como lo hace ``build_asset_info``)."""
+    asset = series.meta.asset.model_copy(
+        update={
+            "asset_class": AssetClass.INDEX,
+            "executable": False,
+            "suggested_proxy": suggested_proxy,
+        }
+    )
+    return series.with_meta(asset=asset)
+
+
+def with_symbol(series: PriceSeries, symbol: str, **asset_updates) -> PriceSeries:
+    """Copia de la serie con otro símbolo (y otros campos del activo, si se indican)."""
+    asset = series.meta.asset.model_copy(update={"symbol": symbol, **asset_updates})
+    return series.with_meta(asset=asset)

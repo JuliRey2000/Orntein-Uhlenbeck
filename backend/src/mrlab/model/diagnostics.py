@@ -10,7 +10,10 @@ CONTRATO:
 - ``rolling_ou_stability(spread, window, step)``: ``fit_ou`` sobre cada
   ventana del spread de FORMACIÓN (α, β fijos: es el spread que se opera).
   ``cv_lambda`` = desviación/media de λ sobre las ventanas válidas (None si
-  hay < 2 válidas). ``message`` en español.
+  hay < 2 válidas). ``message`` en español. ``unit_root_alpha``,
+  ``estimated_residual`` y ``scale`` se pasan tal cual a ``fit_ou`` (decisión
+  O7): el pipeline usa ``estimated_residual=True`` porque el spread es el
+  residuo de la regresión de cointegración de formación.
 
 Notas de implementación:
 - Los residuos se indexan con la fecha de X_{t+1} (el valor que se pronosticó)
@@ -34,7 +37,7 @@ from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.tsa.stattools import acf
 
 from mrlab.domain.errors import ConfigError, DataError, ModelError
-from mrlab.model.ou import TIME_UNIT_DEFAULT, OUFit, fit_ou
+from mrlab.model.ou import TIME_UNIT_DEFAULT, UNIT_ROOT_ALPHA_DEFAULT, OUFit, fit_ou
 from mrlab.stats.windows import rolling_windows
 
 LB_ALPHA = 0.05
@@ -171,8 +174,14 @@ def rolling_ou_stability(
     dt: float = 1.0,
     *,
     time_unit: str = TIME_UNIT_DEFAULT,
+    unit_root_alpha: float = UNIT_ROOT_ALPHA_DEFAULT,
+    estimated_residual: bool = False,
+    scale: float | None = None,
 ) -> OUStability:
-    """``fit_ou`` por ventanas del spread de formación con α y β fijos (decisión E8)."""
+    """``fit_ou`` por ventanas del spread de formación con α y β fijos (decisión E8).
+
+    Cada ventana usa la misma regla de validez que el ajuste completo (decisión O7).
+    """
     if not isinstance(spread.index, pd.DatetimeIndex):
         raise DataError("El spread debe estar indexado por fecha para evaluar su estabilidad.")
     if window < 2 or step < 1:
@@ -184,7 +193,14 @@ def rolling_ou_stability(
 
     windows: list[OUWindow] = []
     for start, end in rolling_windows(len(spread), window, step):
-        fit = fit_ou(spread.iloc[start:end], dt=dt, time_unit=time_unit)
+        fit = fit_ou(
+            spread.iloc[start:end],
+            dt=dt,
+            time_unit=time_unit,
+            unit_root_alpha=unit_root_alpha,
+            estimated_residual=estimated_residual,
+            scale=scale,
+        )
         windows.append(
             OUWindow(
                 start=spread.index[start].date(),
@@ -220,8 +236,8 @@ def rolling_ou_stability(
     ]
     if n_invalid:
         parts.append(
-            f"En {n_invalid} de ellas el OU no fue válido (b fuera de (0, 1) o datos "
-            "insuficientes)."
+            f"En {n_invalid} de ellas el OU no fue válido (b fuera de (0, 1), b que no se "
+            "distingue de 1 según Dickey–Fuller o datos insuficientes)."
         )
 
     cv_lambda: float | None = None

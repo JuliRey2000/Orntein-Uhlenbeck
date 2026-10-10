@@ -136,3 +136,43 @@ def test_requires_aligned_dated_series() -> None:
             dependent="A",
             independent="B",
         )
+
+
+def test_window_with_a_constant_series_is_not_evaluable_and_counts_as_failed() -> None:
+    """Un activo sin cotizar (precio plano) durante más de una ventana no interrumpe el
+    diagnóstico: esa ventana queda «no evaluable», cuenta como fallida y se nombran sus fechas."""
+    a, b = cointegrated_log_prices(n=N, seed=1)
+    a, b = a.copy(), b.copy()
+    a[300:600], b[300:600] = a[299], b[299]
+    res = stability(a, b)
+
+    flat = [w for w in res.windows if not w.evaluable]
+    assert len(flat) == 1 and flat[0].start == IDX[315].date()
+    w = flat[0]
+    assert not w.passed and w.pvalue is None and w.statistic is None and w.beta is None
+    assert "constante" in w.reason
+    n_fail = sum(not x.passed for x in res.windows)
+    assert res.frac_fail == pytest.approx(n_fail / len(res.windows))
+    reason = res.reasons[0]
+    assert f"En {n_fail} de {len(res.windows)} ventanas" in reason
+    assert "1 no se pudo evaluar y se cuenta como fallida" in reason
+    assert f"del {w.start.isoformat()} al {w.end.isoformat()}" in reason
+    assert "mismo signo" in res.reasons[1]  # β solo de las ventanas evaluables
+
+
+def test_collinear_window_is_not_evaluable() -> None:
+    _, b = cointegrated_log_prices(n=300, seed=0)
+    res = stability(1.0 + 2.0 * b, b)
+    assert len(res.windows) == 1
+    w = res.windows[0]
+    assert not w.evaluable and not w.passed and w.pvalue is None
+    assert w.beta == pytest.approx(2.0)  # β sí está definido
+    assert "colineales" in w.reason
+    assert res.frac_fail == 1.0 and res.unstable
+
+
+def test_no_evaluable_window_has_no_beta_comparison() -> None:
+    res = stability(np.full(300, 1.0), np.linspace(0.0, 1.0, 300))
+    assert len(res.windows) == 1 and not res.windows[0].evaluable
+    assert not res.beta_sign_change and res.unstable
+    assert "Ninguna ventana" in res.reasons[1]

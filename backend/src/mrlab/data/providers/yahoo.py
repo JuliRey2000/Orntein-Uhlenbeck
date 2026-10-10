@@ -3,7 +3,11 @@
 CONTRATO:
 - Precios con ``auto_adjust=True`` (ajustados por splits y dividendos). Por eso
   el PnL NO suma dividendos aparte (evita doble conteo). PriceType.ADJUSTED_CLOSE.
-- ``yfinance`` se importa de forma perezosa. Para pruebas sin red, el
+- ``yfinance`` se importa de forma perezosa; al importarlo se sube el nivel de
+  su logger («yfinance») a ERROR, salvo que el usuario active su modo de
+  depuración (``yf.config.debug.logging``): sus avisos en inglés (p. ej. «Cookie
+  fetch … failed») duplicarían los mensajes del laboratorio, que ya traducen
+  cada fallo. Para pruebas sin red, el
   constructor acepta ``ticker_factory`` (símbolo → objeto con ``.history(...)`` y
   ``.history_metadata``) y ``search_factory`` (consulta → objeto con ``.quotes``).
 - Metadatos (moneda, tipo de instrumento, nombre, bolsa, zona horaria) desde
@@ -19,7 +23,9 @@ CONTRATO:
   = fecha UTC). Columnas en minúscula: close (obligatoria), open, high, low,
   volume, en float64; el resto (dividendos, splits) se descarta.
 - Reintentos con espera exponencial: ``max_retries`` REINTENTOS tras el primer
-  intento (por defecto 4 → hasta 5 llamadas, esperas 1, 2, 4 y 8 s), espera
+  intento (por defecto 4 → hasta 5 llamadas, esperas 1, 2, 4 y 8 s; el
+  registro de proveedores toma los valores por defecto de ``Settings``:
+  ``yahoo_max_retries`` y ``yahoo_backoff_base_seconds``), espera
   ``backoff_base * 2**k`` más un jitter determinista de hasta ``jitter`` × la
   espera (derivado del símbolo y del intento); ``sleep`` inyectable. Solo se
   reintentan errores transitorios (límite de peticiones, red, respuesta
@@ -35,6 +41,7 @@ CONTRATO:
 
 from __future__ import annotations
 
+import logging
 import re
 import time
 import zlib
@@ -48,7 +55,7 @@ import pandas as pd
 from mrlab.data.calendar import to_date_index
 from mrlab.data.providers.base import check_interval
 from mrlab.data.proxies import build_asset_info, looks_non_executable
-from mrlab.domain.errors import DataError, ProviderError
+from mrlab.domain.errors import ConfigError, DataError, ProviderError
 from mrlab.domain.models import (
     AssetClass,
     AssetInfo,
@@ -78,6 +85,7 @@ INSTRUMENT_TYPES: dict[str, AssetClass] = {
 }
 
 PRICE_COLUMNS = ("close", "open", "high", "low", "volume")
+YFINANCE_LOGGER = "yfinance"
 
 # Códigos de error estables.
 NO_DATA = "SIMBOLO_SIN_DATOS"
@@ -143,7 +151,44 @@ def _yfinance() -> Any:
     debug = getattr(getattr(yf, "config", None), "debug", None)
     if debug is not None and getattr(debug, "hide_exceptions", False):
         debug.hide_exceptions = False
+    quiet_yfinance_logger(debug_mode=bool(getattr(debug, "logging", False)))
     return yf
+
+
+def quiet_yfinance_logger(debug_mode: bool = False) -> None:
+    """Sube a ERROR el logger «yfinance» (salvo en su modo de depuración).
+
+    yfinance registra como WARNING, en inglés, fallos que luego reintenta o que
+    el laboratorio ya explica en español (p. ej. «Cookie fetch from fc.yahoo.com
+    failed»). Solo se sube el nivel: si alguien lo fijó más alto, se respeta.
+    """
+    logger = logging.getLogger(YFINANCE_LOGGER)
+    if not debug_mode and logger.level < logging.ERROR:  # NOTSET (0) también
+        logger.setLevel(logging.ERROR)
+
+
+def _check_retry_options(max_retries: Any, backoff_base: Any, jitter: Any) -> None:
+    problems = []
+    if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
+        problems.append(
+            f"el número de reintentos debe ser un entero ≥ 0 (se recibió «{max_retries}»)"
+        )
+    for label, value in (("la espera base", backoff_base), ("el jitter", jitter)):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not value >= 0
+            or value == float("inf")
+        ):
+            problems.append(f"{label} debe ser un número ≥ 0 (se recibió «{value}»)")
+    if problems:
+        raise ConfigError(
+            "Opciones del proveedor Yahoo no válidas: " + "; ".join(problems) + ". Revisa "
+            "providers.toml o las variables MRLAB_YAHOO_MAX_RETRIES y "
+            "MRLAB_YAHOO_BACKOFF_BASE_SECONDS.",
+            code="CONFIG_PROVEEDORES_INVALIDA",
+            details={"max_retries": max_retries, "backoff_base": backoff_base, "jitter": jitter},
+        )
 
 
 def _default_ticker(symbol: str) -> Any:
@@ -175,6 +220,7 @@ class YahooProvider:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         jitter: float = 0.1,
     ):
+        _check_retry_options(max_retries, backoff_base, jitter)
         self.max_retries = max_retries
         self.backoff_base = backoff_base
         self.jitter = jitter
@@ -182,6 +228,14 @@ class YahooProvider:
         self._ticker_factory = ticker_factory or _default_ticker
         self._search_factory = search_factory or _default_search
         self._clock = clock
+
+    @classmethod
+    def defaults_from_settings(cls, settings: Any) -> dict[str, Any]:
+        """Opciones por defecto tomadas de ``Settings`` (las usa ``ProviderRegistry``)."""
+        return {
+            "max_retries": settings.yahoo_max_retries,
+            "backoff_base": settings.yahoo_backoff_base_seconds,
+        }
 
     # ------------------------------------------------------------------ API
 

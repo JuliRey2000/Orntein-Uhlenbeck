@@ -187,3 +187,154 @@ def test_load_missing_file(tmp_path):
     with pytest.raises(ConfigError) as info:
         load_run_config(tmp_path / "no_existe.json")
     assert info.value.code == "RUN_CONFIG_NO_ENCONTRADO"
+
+
+# --------------------------------------------------------------------------- prueba y su historial
+
+
+def _meta(symbol: str, retrieved_at: datetime | None):
+    from mrlab.domain.models import AssetClass, AssetInfo, PriceType, SeriesMeta
+
+    asset = AssetInfo(
+        symbol=symbol, name=symbol, asset_class=AssetClass.EQUITY, currency="USD", provider="csv"
+    )
+    return SeriesMeta(
+        asset=asset,
+        price_type=PriceType.ADJUSTED_CLOSE,
+        snapshot_id=f"csv_{symbol}_1d_abc",
+        retrieved_at=retrieved_at,
+    )
+
+
+def test_include_test_is_part_of_the_hash():
+    base = make_config()
+    assert base.include_test is False
+    assert config_hash(base.model_copy(update={"include_test": True})) != config_hash(base)
+
+
+def test_config_hash_ignores_volatile_series_metadata_and_test_history():
+    # Hallazgo: el hash dependía de ``series[].retrieved_at`` (hora de registro del CSV).
+    early = make_config(series=[_meta("KO", datetime(2026, 10, 10, 18, 53, 28, tzinfo=UTC))])
+    late = make_config(series=[_meta("KO", datetime(2026, 10, 11, 9, 0, 0, tzinfo=UTC))])
+    assert config_hash(early) == config_hash(late) == config_hash(make_config())
+    with_history = make_config(test_history=["a" * 64, "b" * 64])
+    assert config_hash(with_history) == config_hash(make_config())
+
+
+def test_include_test_and_history_survive_save_and_load(tmp_path):
+    cfg = make_config(include_test=True, test_history=["c" * 64])
+    loaded = load_run_config(save_run_config(cfg, tmp_path / "run_config.json"))
+    assert loaded.include_test is True and loaded.test_history == ["c" * 64]
+    assert loaded.config_hash == config_hash(cfg)
+
+
+def test_new_files_use_the_current_schema_version(tmp_path):
+    data = json.loads(save_run_config(make_config(), tmp_path / "rc.json").read_text("utf-8"))
+    assert data["schema_version"] == rc.SCHEMA_VERSION == 2
+    assert data["include_test"] is False and data["test_history"] == []
+
+
+# --------------------------------------------------------------------------- archivos de la versión 1
+
+
+def _legacy_v1_file(tmp_path, **updates):
+    """run_config.json como lo escribía la versión 1: sin include_test ni test_history, y con
+    un hash que incluía ``series`` (con su ``retrieved_at``)."""
+    import hashlib
+
+    cfg = make_config(series=[_meta("KO", datetime(2026, 10, 10, 18, 53, 28, tzinfo=UTC))])
+    raw = cfg.model_dump(mode="json", exclude={"include_test", "test_history"})
+    raw["schema_version"] = 1
+    raw.update(updates)
+    payload = {k: v for k, v in raw.items() if k not in {"config_hash", "code_version"}}
+    raw["config_hash"] = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+    path = tmp_path / "run_config.json"
+    path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+    return path, raw
+
+
+def test_version_1_files_are_verified_and_upgraded(tmp_path):
+    path, _ = _legacy_v1_file(tmp_path)
+    loaded = load_run_config(path)
+    assert loaded.schema_version == rc.SCHEMA_VERSION
+    assert loaded.include_test is False and loaded.test_history == []
+    assert loaded.config_hash == config_hash(loaded)
+    resaved = load_run_config(save_run_config(loaded, tmp_path / "otra" / "run_config.json"))
+    assert resaved == loaded
+
+
+def test_edited_version_1_file_is_still_rejected(tmp_path):
+    path, raw = _legacy_v1_file(tmp_path)
+    raw["strategy"]["entry_z"] = 1.5
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ConfigError) as info:
+        load_run_config(path)
+    assert info.value.code == "RUN_CONFIG_HASH_DISTINTO"
+
+
+# --------------------------------------------------------------------------- mensajes en español
+
+
+def _write(tmp_path, mutate) -> object:
+    raw = make_config().model_dump(mode="json", exclude={"config_hash"})
+    mutate(raw)
+    path = tmp_path / "run_config.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize(
+    ("mutate", "field", "fragment", "received"),
+    [
+        (lambda r: r["strategy"].update(entry_z="dos"), "strategy.entry_z", "un número", "dos"),
+        (
+            lambda r: r["strategy"].update(cooldown_bars=-1),
+            "strategy.cooldown_bars",
+            "mayor o igual que 0",
+            "-1",
+        ),
+        (
+            lambda r: r["strategy"].update(zscore_mode="raro"),
+            "strategy.zscore_mode",
+            "uno de estos valores",
+            "raro",
+        ),
+        (
+            lambda r: r["strategy"].update(allow_short="quizá"),
+            "strategy.allow_short",
+            "true o false",
+            "quizá",
+        ),
+        (lambda r: r["costs"].update(day_count=365.5), "costs.day_count", "entero", "365.5"),
+        (lambda r: r["pair"]["a"].pop("symbol"), "pair.a.symbol", "falta", None),
+        (lambda r: r.update(seeds={"X": "siete"}), "seeds.X", "entero", "siete"),
+    ],
+)
+def test_invalid_fields_are_reported_in_spanish_with_path_and_value(
+    tmp_path, mutate, field, fragment, received
+):
+    with pytest.raises(ConfigError) as info:
+        load_run_config(_write(tmp_path, mutate))
+    err = info.value
+    assert err.code == "RUN_CONFIG_INVALIDO"
+    assert f"«{field}»" in err.message and fragment in err.message
+    if received is not None:
+        assert f"recibido: {received}" in err.message
+    english = ("Input should", "Field required", "valid number", "unable to parse")
+    assert not any(text in err.message for text in english)
+    (problem, *_) = err.details["errores"]
+    assert problem["campo"] == field
+
+
+def test_inconsistent_parameters_in_a_file_keep_their_code_and_name_the_file(tmp_path):
+    path = _write(tmp_path, lambda r: r["costs"].update(day_count=0))
+    with pytest.raises(ConfigError) as info:
+        load_run_config(path)
+    assert info.value.code == "COSTES_INVALIDOS"
+    assert "run_config.json" in info.value.message and "costs.day_count" in info.value.message
+
+    path = _write(tmp_path, lambda r: r["strategy"].update(entry_z=5.0))
+    with pytest.raises(ConfigError) as info:
+        load_run_config(path)
+    assert info.value.code == "UMBRALES_INCONSISTENTES"
+    assert "run_config.json" in info.value.message

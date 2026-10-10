@@ -108,12 +108,12 @@ def test_scenario_defaults_only_fill_unset_fields():
     implicit = effective_params(
         SyntheticPairParams(scenario=SyntheticScenario.COINTEGRATED_LOW_CORRELATION)
     )
-    assert (implicit.b_vol, implicit.ou_sigma, implicit.ou_lambda) == (0.004, 0.015, 0.1)
+    assert (implicit.b_vol, implicit.ou_sigma, implicit.ou_lambda) == (0.01, 0.03, 0.5)
     explicit = effective_params(
-        SyntheticPairParams(scenario=SyntheticScenario.COINTEGRATED_LOW_CORRELATION, b_vol=0.01)
+        SyntheticPairParams(scenario=SyntheticScenario.COINTEGRATED_LOW_CORRELATION, b_vol=0.004)
     )
-    assert explicit.b_vol == 0.01 and explicit.ou_sigma == 0.015
-    assert effective_params(SyntheticPairParams()).b_vol == 0.01
+    assert explicit.b_vol == 0.004 and explicit.ou_sigma == 0.03
+    assert effective_params(SyntheticPairParams()).ou_sigma == 0.01
 
 
 @pytest.mark.parametrize(
@@ -211,3 +211,62 @@ def test_search_over_presets_and_registered():
     assert {a.symbol for a in provider.search("baja correlación")} == {"SINT-CBC-A", "SINT-CBC-B"}
     sym_a, _ = provider.register(SyntheticPairParams(seed=99))
     assert [a.symbol for a in provider.search(sym_a[:10].lower())] == [sym_a, sym_a[:-1] + "B"]
+
+
+def test_seed_is_recorded_in_series_metadata():
+    """Hallazgo de la revisión: la semilla solo aparecía como texto libre."""
+    a, b = generate_pair(SyntheticPairParams(seed=11, n_obs=50))
+    assert a.meta.seed == 11 and b.meta.seed == 11
+    preset = SyntheticProvider().get_history("SINT-CBC-A", date(2000, 1, 1), date(2100, 1, 1))
+    assert preset.meta.seed == 7
+
+
+# --------------------------------------------------------------------------- preset SINT-CBC
+# Hallazgo de la revisión: el preset «cointegrado con baja correlación» daba
+# ⚠️ Supuestos dudosos (serie A «ambigua»), contra lo que explica MATEMATICAS §2.2.
+
+
+def _cbc_analysis(seed: int):
+    from mrlab.analysis.pair_pipeline import analyze_pair
+
+    params = SyntheticPairParams(scenario=SyntheticScenario.COINTEGRATED_LOW_CORRELATION, seed=seed)
+    return analyze_pair(*generate_pair(params, symbol_prefix="SINT-CBC"))
+
+
+def test_preset_cbc_is_cointegrated_with_low_correlation():
+    from mrlab.analysis.pair_pipeline import PairStatus
+    from mrlab.stats.integration import integration_tests
+
+    provider = SyntheticProvider()
+    a = provider.get_history("SINT-CBC-A", date(2000, 1, 1), date(2100, 1, 1))
+    b = provider.get_history("SINT-CBC-B", date(2000, 1, 1), date(2100, 1, 1))
+    n_train = int(np.floor(len(a.data) * 0.6))  # muestra de formación por defecto (60 %)
+    la = np.log(a.close.to_numpy()[:n_train])
+    lb = np.log(b.close.to_numpy()[:n_train])
+
+    assert integration_tests(la, "SINT-CBC-A").classification == "compatible_I1"
+    assert integration_tests(lb, "SINT-CBC-B").classification == "compatible_I1"
+    assert min(eg_pvalue(la, lb), eg_pvalue(lb, la)) < 0.01
+    assert return_corr(la, lb) < 0.5
+
+    from mrlab.analysis.pair_pipeline import analyze_pair
+
+    an = analyze_pair(a, b)
+    assert an.status == PairStatus.EVIDENCE, [c.message for c in an.causes]
+    assert an.correlation_train is not None and an.correlation_train < 0.5
+    assert an.ou is not None and an.ou.valid and 1.0 <= an.ou.half_life <= 126.0
+
+
+@pytest.mark.slow
+def test_cbc_scenario_defaults_work_for_most_seeds():
+    """Con los valores por defecto antiguos solo 10 de 30 semillas daban ✅; ahora 22.
+
+    Las que fallan lo hacen sobre todo porque el paseo aleatorio B sale «ambiguo» en
+    ADF + KPSS (le pasa a ~10 % de los paseos puros con la regla E2 al 5 %).
+    """
+    from mrlab.analysis.pair_pipeline import PairStatus
+
+    results = [_cbc_analysis(seed) for seed in range(1, 31)]
+    ok = sum(an.status == PairStatus.EVIDENCE for an in results)
+    assert ok >= 20, f"solo {ok}/30 semillas con ✅"
+    assert all(an.correlation_train < 0.5 for an in results)

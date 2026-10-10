@@ -10,7 +10,15 @@ import pandas as pd
 import pytest
 from pydantic import ValidationError
 
-from mrlab.data.providers.csv_provider import CSVMetadata, CSVProvider, parse_csv
+from mrlab.config import BACKEND_ROOT
+from mrlab.data.providers.csv_provider import (
+    CSVMetadata,
+    CSVProvider,
+    build_metadata,
+    origin_from_filename,
+    parse_csv,
+    parse_metadata,
+)
 from mrlab.domain.errors import DataError, ProviderError
 from mrlab.domain.models import AssetClass, DataOrigin, PriceType
 
@@ -284,3 +292,225 @@ def test_index_dtype_matches_other_providers():
         s.data.index.dtype
         == pd.DatetimeIndex(pd.bdate_range("2020-01-01", periods=1)).as_unit("us").dtype
     )
+
+
+# --------------------------------------------------------------------------- origen SINTÉTICO
+# Hallazgo de la revisión: un CSV sintético sin su sidecar se exportaba como HISTÓRICO.
+
+EXAMPLES_DATA = BACKEND_ROOT.parent / "examples" / "data"
+
+
+@pytest.mark.parametrize("value", ["SINTETICO", "sintético", " Sintetico ", "SINTÉTICO"])
+def test_data_type_column_synthetic_forces_synthetic_origin(value):
+    text = f"tipo_datos,date,close\n{value},2020-01-02,1\n{value},2020-01-03,2\n"
+    declared = META.model_copy(update={"price_type": PriceType.ADJUSTED_CLOSE})
+    s = parse_csv(text, declared)
+    assert s.is_synthetic and s.meta.asset.origin == DataOrigin.SYNTHETIC
+    assert s.meta.price_type == PriceType.SYNTHETIC
+    assert s.meta.asset.name.startswith("SINTÉTICO — ")
+    assert "SINTÉTICOS" in s.meta.source_note
+    assert any("tipo_datos" in note for note in s.meta.asset.notes)
+    assert list(s.data.columns) == ["close"]  # la columna no es un precio
+
+
+def test_data_type_column_historical_or_blank_keeps_declared_metadata():
+    s = parse_csv("date,close,Tipo de datos\n2020-01-02,1,HISTÓRICO\n2020-01-03,2,\n", META)
+    assert not s.is_synthetic and s.meta.price_type == PriceType.CLOSE
+    assert s.meta.asset.notes == ()
+
+
+def test_data_type_column_with_one_synthetic_row_and_blanks_is_synthetic():
+    s = parse_csv("date,close,tipo_datos\n2020-01-02,1,\n2020-01-03,2,SINTETICO\n", META)
+    assert s.is_synthetic
+
+
+def test_historical_column_never_downgrades_declared_synthetic_data():
+    meta = META.model_copy(update={"origin": DataOrigin.SYNTHETIC})
+    meta = CSVMetadata.model_validate(meta.model_dump())
+    s = parse_csv("date,close,tipo_datos\n2020-01-02,1,HISTORICO\n", meta)
+    assert s.is_synthetic and s.meta.price_type == PriceType.SYNTHETIC
+    assert any("HISTORICO" in note for note in s.meta.asset.notes)
+
+
+@pytest.mark.parametrize(
+    "rows, code, words",
+    [
+        ("2020-01-02,1,HISTORICO\n2020-01-03,2,SINTETICO\n", "CSV_TIPO_DATOS_MEZCLADO", "mezcla"),
+        ("2020-01-02,1,REAL\n2020-01-03,2,HISTORICO\n", "CSV_TIPO_DATOS_DESCONOCIDO", "REAL"),
+    ],
+)
+def test_data_type_column_mixed_or_unknown_values_are_errors(rows, code, words):
+    with pytest.raises(DataError) as exc_info:
+        parse_csv("date,close,tipo_datos\n" + rows, META)
+    assert exc_info.value.code == code
+    assert words in exc_info.value.message
+    assert "línea" in exc_info.value.message
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("SINTETICO_SINT-COI-A.csv", DataOrigin.SYNTHETIC),
+        ("sintético_ko.csv", DataOrigin.SYNTHETIC),
+        ("/tmp/x/SINTETICO_KO.csv", DataOrigin.SYNTHETIC),
+        ("C:\\Users\\ana\\SINTETICO_KO.csv", DataOrigin.SYNTHETIC),
+        ("KO.csv", None),
+        ("datos/SINTETICO_/KO.csv", None),  # solo cuenta el nombre, no la carpeta
+        ("SINTETICOS.csv", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_origin_from_filename(name, expected):
+    assert origin_from_filename(name) == expected
+
+
+def test_example_synthetic_csv_without_sidecar_is_never_historical(tmp_path):
+    """Reproduce el hallazgo: copiar solo el CSV sintético y declararlo como histórico."""
+    source = EXAMPLES_DATA / "SINTETICO_SINT-COI-A.csv"
+    declared = build_metadata(
+        symbol="SINT-COI-A",
+        name="SINT-COI-A",
+        currency="USD",
+        asset_class="accion",
+        price_type="cierre_ajustado",
+    )
+    assert declared.origin == DataOrigin.HISTORICAL
+    provider = CSVProvider(tmp_path)
+    s = provider.register(source.read_bytes(), declared, filename=source.name)
+
+    assert s.is_synthetic and s.meta.price_type == PriceType.SYNTHETIC
+    assert any("SINTETICO_SINT-COI-A.csv" in note for note in s.meta.asset.notes)
+    assert (tmp_path / "SINTETICO_SINT-COI-A.csv").exists()
+    stored = parse_metadata((tmp_path / "SINTETICO_SINT-COI-A.meta.json").read_bytes())
+    assert stored.origin == DataOrigin.SYNTHETIC  # el sidecar guarda los metadatos efectivos
+    again = provider.get_history("SINT-COI-A", date(1900, 1, 1), date(2100, 12, 31))
+    assert again.is_synthetic and again.meta.retrieved_at is None
+    assert provider.get_metadata("SINT-COI-A").is_synthetic
+
+
+def test_register_with_data_type_column_saves_effective_metadata(tmp_path):
+    provider = CSVProvider(tmp_path)
+    s = provider.register(
+        "tipo_datos,date,close\nSINTETICO,2020-01-02,1\n", META, filename="ko.csv"
+    )
+    assert s.is_synthetic
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "SINTETICO_KO.csv",
+        "SINTETICO_KO.meta.json",
+    ]
+
+
+def test_file_stored_with_synthetic_prefix_is_never_historical(tmp_path):
+    # Archivos colocados a mano: nombre SINTETICO_ con un sidecar que dice HISTORICO.
+    (tmp_path / "SINTETICO_KO.csv").write_text(CONTENT, encoding="utf-8")
+    (tmp_path / "SINTETICO_KO.meta.json").write_text(META.model_dump_json(), encoding="utf-8")
+    provider = CSVProvider(tmp_path)
+    assert provider.get_history("KO", date(2020, 1, 1), date(2020, 12, 31)).is_synthetic
+    assert provider.get_metadata("KO").is_synthetic
+    assert all(asset.is_synthetic for asset in provider.search("ko"))
+
+
+def test_get_metadata_rereads_the_data_type_column(tmp_path):
+    (tmp_path / "KO.csv").write_text("date,close,tipo_datos\n2020-01-02,1,SINTETICO\n")
+    (tmp_path / "KO.meta.json").write_text(META.model_dump_json(), encoding="utf-8")
+    assert CSVProvider(tmp_path).get_metadata("KO").is_synthetic
+
+
+# --------------------------------------------------------------------------- metadatos en español
+# Hallazgo de la revisión: tracebacks de pydantic en inglés ante metadatos inválidos.
+
+
+@pytest.mark.parametrize(
+    "data, words",
+    [
+        (
+            {"symbol": "KO", "name": "KO", "currency": "US", "asset_class": "accion"},
+            ["«currency» (moneda)", "«US»", "3 letras"],
+        ),
+        (
+            {"symbol": "KO", "name": "KO", "currency": "USD", "asset_class": "acciones"},
+            ["«asset_class» (clase de activo)", "«acciones»", "accion, etf, indice"],
+        ),
+        (
+            {
+                "symbol": "KO",
+                "name": "KO",
+                "currency": "USD",
+                "asset_class": "etf",
+                "price_type": "x",
+            },
+            ["«price_type» (tipo de precio)", "«x»", "cierre_ajustado, cierre, sintetico"],
+        ),
+        (
+            {
+                "symbol": "KO",
+                "name": "KO",
+                "currency": "USD",
+                "asset_class": "etf",
+                "origin": "REAL",
+            },
+            ["«origin»", "«REAL»", "HISTORICO, SINTETICO"],
+        ),
+        ({"name": "KO", "currency": "USD", "asset_class": "etf"}, ["falta el campo «symbol»"]),
+        (
+            {"symbol": "KO", "name": "KO", "currency": "USD", "asset_class": "etf", "seed": "dos"},
+            ["«seed» (semilla)", "«dos»", "entero"],
+        ),
+        ('{"symbol": "KO",\n  "name": ', ["no es un JSON válido", "línea 2"]),
+        (b"[1, 2]", ["objeto JSON"]),
+        (b"\xff\xfe\x00", ["UTF-8"]),
+    ],
+)
+def test_parse_metadata_errors_are_spanish_data_errors(data, words):
+    with pytest.raises(DataError) as exc_info:
+        parse_metadata(data, source="KO.meta.json")
+    err = exc_info.value
+    assert err.code == "CSV_METADATOS_INVALIDOS"
+    assert "«KO.meta.json»" in err.message
+    for word in words:
+        assert word in err.message
+    for english in ("Input should", "Field required", "validation error", "Invalid JSON"):
+        assert english not in err.message
+
+
+def test_build_metadata_errors_and_tolerant_enum_values():
+    with pytest.raises(DataError) as exc_info:
+        build_metadata(symbol="KO", name="KO", currency="dólares", asset_class="accion")
+    assert exc_info.value.code == "CSV_METADATOS_INVALIDOS"
+    assert "«dólares»" in exc_info.value.message and "ISO" in exc_info.value.message
+    meta = build_metadata(
+        symbol="KO", name="KO", currency="usd", asset_class="Acción", price_type="CIERRE"
+    )
+    assert meta.asset_class == AssetClass.EQUITY and meta.price_type == PriceType.CLOSE
+    assert meta.currency == "USD"
+    sidecar = parse_metadata(meta.model_dump_json().encode("utf-8-sig"))
+    assert sidecar == meta
+
+
+def test_damaged_sidecar_is_skipped_but_named_in_the_error(tmp_path):
+    provider = CSVProvider(tmp_path)
+    provider.register(CONTENT, META)
+    (tmp_path / "PEP.csv").write_text(CONTENT, encoding="utf-8")
+    (tmp_path / "PEP.meta.json").write_text('{"symbol": "PEP", "name"', encoding="utf-8")
+    assert provider.list_symbols() == ["KO"]  # un sidecar dañado no impide usar los demás
+    with pytest.raises(ProviderError) as exc_info:
+        provider.get_history("PEP", date(2020, 1, 1), date(2020, 12, 31))
+    err = exc_info.value
+    assert err.code == "SIMBOLO_SIN_DATOS"
+    assert "PEP.meta.json" in err.message and "JSON válido" in err.message
+    assert err.details["metadatos_danados"] == ["PEP.meta.json"]
+
+
+# --------------------------------------------------------------------------- semilla
+
+
+def test_seed_is_recorded_and_implies_synthetic_data(tmp_path):
+    meta = build_metadata(symbol="SINT-X", name="X", currency="USD", asset_class="accion", seed=7)
+    assert meta.is_synthetic and meta.price_type == PriceType.SYNTHETIC
+    s = parse_csv(CONTENT, meta)
+    assert s.meta.seed == 7 and s.is_synthetic
+    provider = CSVProvider(tmp_path)
+    provider.register(CONTENT, meta)
+    assert provider.get_history("SINT-X", date(2020, 1, 1), date(2020, 12, 31)).meta.seed == 7
+    assert parse_csv(CONTENT, META).meta.seed is None

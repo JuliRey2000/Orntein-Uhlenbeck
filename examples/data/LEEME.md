@@ -8,10 +8,15 @@
 
 | Archivo | Contenido |
 |---|---|
-| `SINTETICO_SINT-COI-A.csv` | Serie A del par cointegrado sintético (`date,close`) |
-| `SINTETICO_SINT-COI-A.meta.json` | Metadatos de la serie A: moneda, clase de activo, tipo de precio y origen `SINTETICO` |
-| `SINTETICO_SINT-COI-B.csv` | Serie B del par cointegrado sintético (`date,close`) |
+| `SINTETICO_SINT-COI-A.csv` | Serie A del par cointegrado sintético (`date,close,tipo_datos`) |
+| `SINTETICO_SINT-COI-A.meta.json` | Metadatos de la serie A: moneda, clase de activo, tipo de precio, origen `SINTETICO` y semilla (`seed`) |
+| `SINTETICO_SINT-COI-B.csv` | Serie B del par cointegrado sintético (`date,close,tipo_datos`) |
 | `SINTETICO_SINT-COI-B.meta.json` | Metadatos de la serie B |
+
+La marca SINTÉTICO viaja con los datos por tres vías independientes: la columna
+`tipo_datos = SINTETICO` en cada fila, el prefijo `SINTETICO_` del nombre del
+archivo y los metadatos. Si copias solo un CSV (sin su `.meta.json`) y lo declaras
+como histórico, el laboratorio lo sigue tratando como SINTÉTICO y lo avisa.
 
 ## Cómo se generaron
 
@@ -29,7 +34,8 @@ cointegrado: sirve para practicar el flujo completo y comprobar que el
 laboratorio lo detecta. Con datos reales nunca se sabe de antemano, y eso es
 justamente lo que el laboratorio ayuda a evaluar.
 
-Para regenerarlos (el resultado es idéntico byte a byte):
+Para regenerarlos (el resultado es idéntico byte a byte; una prueba automática lo
+comprueba):
 
 ```bash
 python examples/generar_csv_sinteticos.py

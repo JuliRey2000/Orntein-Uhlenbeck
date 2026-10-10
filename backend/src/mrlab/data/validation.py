@@ -9,8 +9,10 @@ CONTRATO:
     (FALTANTES, advertencia);
   * close ≤ 0 → se reporta (PRECIO_NO_POSITIVO, error) y NO se elimina: la
     decisión de bloquear la toma ``validate_pair`` según el tipo de spread;
-  * |rendimiento simple diario| > 50 % → advertencia (SALTO_SOSPECHOSO) con
-    fechas: posible error de ajuste;
+  * |ln(P_t/P_{t−1})| > ln(1,5) → advertencia (SALTO_SOSPECHOSO) con fechas:
+    posible error de ajuste. El umbral es simétrico en logaritmos: una subida de
+    más del 50 % o una caída de más del 33,3 % (así un split 2:1 sin ajustar,
+    ≈ −50 %, siempre se marca);
   * cripto (calendario 7 días): huecos de más de 1 día natural → advertencia
     (HUECO_CRIPTO) con las fechas que faltan. Para bolsa no se infieren festivos.
 - ``align_pair(a, b)`` → AlignedPair: intersección de fechas de las series
@@ -30,7 +32,10 @@ CONTRATO:
     (cuántas hay, cuántas hacen falta, cuántas totales se necesitan);
   * fechas presentes en una sola serie → informativo (FECHAS_NO_COMUNES);
   * calendario mixto → advertencia DESFASE_CIERRE_CRIPTO (texto en calendar.py);
-  * ``status_message``: resumen en una frase, en español.
+  * ``status_message``: resumen en una frase, en español. «Datos aptos…» solo
+    si no hay ninguna incidencia con severidad error; si no está bloqueado pero
+    hay errores (p. ej. precios ≤ 0 con spread en precios) → «Datos utilizables
+    con incidencias: …» nombrando cada error.
   ``report.issues`` contiene TODAS las incidencias (primero las de cada serie,
   con ``symbol``, y después las del par): siempre se listan todas las causas.
   Si está bloqueado por moneda, se devuelve AlignedPair=None.
@@ -52,7 +57,11 @@ from mrlab.data.calendar import CLOSE_TIME_MISMATCH_WARNING, calendar_type, peri
 from mrlab.domain.errors import ConfigError, DataError
 from mrlab.domain.models import AssetClass, CalendarType, PriceSeries, SpreadType, coverage_of
 
+#: Subida diaria máxima antes de marcar un salto; el umbral real es simétrico en
+#: logaritmos, |ln(P_t/P_{t−1})| > ln(1 + SUSPICIOUS_JUMP): +50 % o −33,3 %.
 SUSPICIOUS_JUMP = 0.50
+SUSPICIOUS_LOG_JUMP = math.log1p(SUSPICIOUS_JUMP)
+SUSPICIOUS_DROP = math.expm1(-SUSPICIOUS_LOG_JUMP)  # −1/3
 MIN_TRAIN_OBS = 500
 MAX_DATES_IN_MESSAGE = 8
 
@@ -240,9 +249,13 @@ def clean_series(series: PriceSeries) -> tuple[PriceSeries, SeriesValidation]:
         )
 
     prev = close.shift(1)
-    both_positive = (close > 0) & (prev > 0)
-    jumps = both_positive & ((close / prev - 1.0).abs() > SUSPICIOUS_JUMP)
-    suspicious = _to_dates(out.index[jumps.to_numpy()])
+    both_positive = ((close > 0) & (prev > 0)).to_numpy()
+    log_change = np.full(len(close), np.nan)
+    log_change[both_positive] = np.log(
+        close.to_numpy()[both_positive] / prev.to_numpy()[both_positive]
+    )
+    jumps = both_positive & (np.abs(np.nan_to_num(log_change)) > SUSPICIOUS_LOG_JUMP)
+    suspicious = _to_dates(out.index[jumps])
     if suspicious:
         issues.append(
             ValidationIssue(
@@ -250,11 +263,15 @@ def clean_series(series: PriceSeries) -> tuple[PriceSeries, SeriesValidation]:
                 severity=Severity.WARNING,
                 symbol=symbol,
                 dates=suspicious,
+                details={"umbral_log": SUSPICIOUS_LOG_JUMP},
                 message=(
-                    f"{symbol}: variación diaria mayor al {format_pct(SUSPICIOUS_JUMP)} en "
-                    f"{len(suspicious)} fecha(s) ({format_dates(suspicious)}). Puede ser un error "
-                    "de ajuste por split o dividendo, o un dato erróneo: revísalo antes de "
-                    "confiar en el análisis."
+                    f"{symbol}: salto de precio sospechoso en {len(suspicious)} fecha(s) "
+                    f"({format_dates(suspicious)}): una subida de más del "
+                    f"{format_pct(SUSPICIOUS_JUMP)} o una caída de más del "
+                    f"{format_decimal(-SUSPICIOUS_DROP * 100)} % en un día "
+                    "(|ln(Pₜ/Pₜ₋₁)| > ln 1,5). Puede ser un error de ajuste por split o "
+                    "dividendo (un split 2:1 sin ajustar aparece como una caída del 50 %), o un "
+                    "dato erróneo: revísalo antes de confiar en el análisis."
                 ),
             )
         )
@@ -339,6 +356,35 @@ def _min_total_obs(min_train_obs: int, train_fraction: float) -> int:
     while math.floor(n * train_fraction) < min_train_obs:
         n += 1
     return n
+
+
+#: Resumen breve de cada incidencia con severidad error que no bloquea el análisis.
+_ERROR_SUMMARIES: dict[str, str] = {
+    "PRECIO_NO_POSITIVO": "precios menores o iguales a cero",
+}
+
+
+def _usable_status(issues: list[ValidationIssue], n_aligned: int, n_train: int) -> str:
+    """Resumen de un par no bloqueado: «Datos aptos…» solo si no hay errores."""
+    counts = f"{format_int(n_aligned)} observaciones comunes, {format_int(n_train)} en formación"
+    errors = [i for i in issues if i.severity == Severity.ERROR]
+    n_warn = sum(i.severity == Severity.WARNING for i in issues)
+    if not errors:
+        base = f"Datos aptos para el análisis: {counts}"
+        return base + (f", con {n_warn} advertencia(s) que conviene revisar." if n_warn else ".")
+    described = []
+    for issue in errors:
+        if issue.code not in _ERROR_SUMMARIES:  # incidencia nueva: su primera frase
+            described.append(issue.message.split(". ")[0].rstrip("."))
+            continue
+        where = f" en «{issue.symbol}»" if issue.symbol else ""
+        dates = f" ({len(issue.dates)} fecha(s))" if issue.dates else ""
+        described.append(f"{_ERROR_SUMMARIES[issue.code]}{where}{dates}")
+    warn = f"; además hay {n_warn} advertencia(s)" if n_warn else ""
+    return (
+        f"Datos utilizables con incidencias: {'; '.join(described)}{warn}. {counts}. Revisa las "
+        "incidencias antes de confiar en el análisis."
+    )
 
 
 def validate_pair(
@@ -502,12 +548,7 @@ def validate_pair(
     if blocked:
         status = "Análisis bloqueado: " + "; ".join(block_reasons) + "."
     else:
-        n_warn = sum(i.severity != Severity.INFO for i in issues)
-        base = (
-            f"Datos aptos para el análisis: {format_int(n_aligned)} observaciones comunes, "
-            f"{format_int(n_train)} en formación"
-        )
-        status = base + (f", con {n_warn} advertencia(s) que conviene revisar." if n_warn else ".")
+        status = _usable_status(issues, n_aligned, n_train)
 
     report = ValidationReport(
         series=[val_a, val_b],

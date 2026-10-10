@@ -11,8 +11,9 @@ import pytest
 import requests
 from yfinance.exceptions import YFPricesMissingError, YFRateLimitError, YFTzMissingError
 
+from mrlab.config import Settings
 from mrlab.data.providers.yahoo import YahooProvider, classify_error
-from mrlab.domain.errors import ProviderError
+from mrlab.domain.errors import ConfigError, ProviderError
 from mrlab.domain.models import AssetClass, PriceType
 
 FIXED_NOW = datetime(2026, 10, 10, 11, 30, tzinfo=UTC)
@@ -414,3 +415,75 @@ def test_default_factory_makes_yfinance_raise_errors():
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=120, check=True
     )
     assert out.stdout.strip() == "False"
+
+
+def test_yfinance_english_warnings_do_not_reach_the_user():
+    """Hallazgo de la revisión: los avisos de yfinance en inglés llegaban antes del error.
+
+    En un subproceso sin configuración de logging (como un script del usuario): la
+    factoría usa yfinance de verdad, que registra sus avisos como lo hace ante un
+    fallo de red, y luego falla. Solo debe verse el mensaje del laboratorio.
+    """
+    code = (
+        "from datetime import date\n"
+        "from mrlab.data.providers import yahoo\n"
+        "from mrlab.domain.errors import ProviderError\n"
+        "def factory(symbol):\n"
+        "    yf = yahoo._yfinance()\n"
+        "    log = yf.utils.get_yf_logger()\n"
+        "    log.warning('Cookie fetch from fc.yahoo.com failed (ConnectionError), "
+        "continuing without it')\n"
+        "    log.warning('Cookie/crumb fetch failed (ConnectionError), continuing without crumb')\n"
+        "    raise ConnectionError('Failed to perform, curl: (7) Could not connect to server')\n"
+        "p = yahoo.YahooProvider(ticker_factory=factory, sleep=lambda s: None, max_retries=1)\n"
+        "try:\n"
+        "    p.get_history('KO', date(2020, 1, 1), date(2020, 12, 31))\n"
+        "except ProviderError as exc:\n"
+        "    print(exc.code)\n"
+        "    print(exc.message)\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120, check=True
+    )
+    assert out.stderr == ""
+    assert out.stdout.startswith("ERROR_RED\nNo se pudo conectar con Yahoo Finance")
+    assert "Cookie" not in out.stdout
+
+
+def test_yfinance_logger_is_raised_to_error_but_respects_debug_mode():
+    code = (
+        "import logging\n"
+        "from mrlab.data.providers.yahoo import _yfinance, quiet_yfinance_logger\n"
+        "log = logging.getLogger('yfinance')\n"
+        "_yfinance()\n"
+        "print(log.level == logging.ERROR)\n"
+        "log.setLevel(logging.CRITICAL)\n"
+        "quiet_yfinance_logger()\n"
+        "print(log.level == logging.CRITICAL)\n"  # solo se sube, nunca se baja
+        "log.setLevel(logging.DEBUG)\n"
+        "quiet_yfinance_logger(debug_mode=True)\n"
+        "print(log.level == logging.DEBUG)\n"  # modo de depuración de yfinance
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=120, check=True
+    )
+    assert out.stdout.split() == ["True", "True", "True"]
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"max_retries": -1}, {"max_retries": 1.5}, {"backoff_base": -1.0}, {"jitter": float("nan")}],
+)
+def test_invalid_retry_options_are_spanish_config_errors(kwargs):
+    with pytest.raises(ConfigError) as exc_info:
+        YahooProvider(ticker_factory=lambda s: None, **kwargs)
+    assert exc_info.value.code == "CONFIG_PROVEEDORES_INVALIDA"
+    assert "no válidas" in exc_info.value.message
+
+
+def test_defaults_from_settings():
+    settings = Settings(yahoo_max_retries=2, yahoo_backoff_base_seconds=0.5)
+    assert YahooProvider.defaults_from_settings(settings) == {
+        "max_retries": 2,
+        "backoff_base": 0.5,
+    }

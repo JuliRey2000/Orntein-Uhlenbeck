@@ -67,7 +67,10 @@ Convenciones:
   `0,01` log-puntos ≈ 1 % (decisión O4).
 - **Un día de negociación** es una observación (decisión O4). Para pares de dos
   criptomonedas, el calendario es de 7 días y la unidad se llama «día de
-  negociación (calendario de 7 días)».
+  negociación (calendario de 7 días)». El calendario se decide con **todos** los
+  instrumentos usados, también los ejecutables: un par de dos criptomonedas que se
+  opera con un proxy de bolsa solo tiene días hábiles, así que es mixto (252
+  periodos y «día de negociación»; decisión D17).
 - **pb** = punto básico = 0,01 % = 1/10.000.
 
 ---
@@ -175,18 +178,38 @@ nada sobre si las **diferencias acumuladas** se corrigen. Dos activos pueden
 moverse juntos el 90 % de los días y aun así separarse sin límite.
 
 **Caso 2: cointegración con correlación baja** (escenario `SINT-CBC`).
-`ln A = α + β·ln B + X`, con B paseo aleatorio de volatilidad diaria 0,4 % y `X`
-un OU con `λ = 0,1`, `σ = 0,015`, `β = 1`. El rendimiento de A es
+`ln A = α + β·ln B + X`, con B paseo aleatorio de volatilidad diaria 1 % y `X`
+un OU con `λ = 0,5`, `σ = 0,03`, `β = 1`. El rendimiento de A es
 `r_A = β·r_B + ΔX`, y el cambio diario del OU es grande comparado con `r_B`:
 
 ```text
-Var(ΔX)          = 2·σ_eq²·(1 − e^{−λ}),  con σ_eq² = σ²/(2λ) = 0,001125
-Desviación de ΔX ≈ 1,46 % diario
-corr(r_A, r_B)   = 0,004 / sqrt(0,004² + 0,0146²) ≈ 0,26
+σ_eq²            = σ²/(2λ) = 0,03²/1 = 0,0009        (σ_eq = 3 %)
+Var(ΔX)          = 2·σ_eq²·(1 − e^{−λ}) = 2·0,0009·(1 − e^{−0,5}) ≈ 0,000708
+Desviación de ΔX ≈ 2,66 % diario
+corr(r_A, r_B)   = 0,01 / sqrt(0,01² + 0,000708) ≈ 0,35
 ```
 
-Correlación de solo 0,26, y sin embargo el spread **siempre vuelve**: es un OU con
-vida media `ln 2 / 0,1 ≈ 6,9` días y `σ_eq ≈ 3,4 %`.
+Correlación de solo 0,35, y sin embargo el spread **siempre vuelve**: es un OU con
+vida media `ln 2 / 0,5 ≈ 1,39` días y `σ_eq = 3 %`.
+
+Con la semilla del preset (7) el laboratorio lo detecta así: A y B compatibles
+con I(1) (ADF en niveles p ≈ 0,41 y 0,38; KPSS en niveles p < 0,01), Engle–Granger
+con p ≈ 5·10⁻²⁷ (ajustado ≈ 8·10⁻²⁷), correlación de los rendimientos en
+formación 0,33, estado ✅ y un OU válido con `λ̂ ≈ 0,53` (vida media estimada
+1,31 días, `σ̂_eq ≈ 2,9 %`). Con otras semillas el resultado varía: en las
+semillas 1 a 30, 22 dan ✅ y todas tienen correlación menor que 0,5 (media 0,35,
+máximo 0,42). Casi todas las demás fallan porque el paseo aleatorio puro B sale
+«ambiguo» con ADF + KPSS (le pasa a ≈ 10 % de los paseos aleatorios con la regla
+E2 al 5 %), algo que ningún parámetro del OU corrige.
+
+¿Por qué un OU tan rápido? Con un OU lento y poco ruidoso en B (versión anterior:
+volatilidad de B 0,4 %, `λ = 0,1`, `σ = 0,015`), el OU dominaba también los
+niveles de A, que parecía estacionaria: el par salía «⚠️ Supuestos dudosos» en la
+mayoría de las semillas. Un OU rápido domina el cambio **diario** (correlación
+baja) sin dominar el nivel acumulado de A (que sigue siendo I(1)). La vida media
+resultante, cercana a 1 día, está en el límite inferior de lo operable con datos
+diarios: el ejemplo enseña que correlación y cointegración son cosas distintas,
+no un par para operar.
 
 ### 2.3 Aptitud para OU
 
@@ -196,7 +219,8 @@ cointegrado y no sirve para operar en un horizonte de semanas. Un spread con vid
 media menor que un día no se puede operar con datos diarios. La aptitud para OU se
 evalúa con:
 
-- ajuste OU válido: `0 < b < 1` (sección 8.5);
+- ajuste OU válido: `0 < b < 1` **y** la prueba de Dickey–Fuller sobre el AR(1)
+  rechaza la raíz unitaria (sección 8.5, decisión O7);
 - vida media dentro de un rango útil (avisos si supera 126 días o si es menor que 1);
 - residuos sin autocorrelación (Ljung–Box, sección 8.7);
 - estabilidad de `λ` entre ventanas (sección 8.7);
@@ -350,8 +374,11 @@ automática verifica que no coincide con el de un ADF ordinario sobre los residu
 
 **Caso especial.** Si las dos series son prácticamente idénticas salvo escala
 (R² ≈ 1), `coint` devuelve un estadístico −∞ y p = 0. Ese p = 0 **no** es evidencia
-fiable: el laboratorio lo marca con un aviso (por ejemplo, si se eligió dos veces
-el mismo activo).
+fiable: el spread es solo ruido de redondeo. El laboratorio no ajusta el OU y
+descarta el par con `SERIES_COLINEALES`, que bloquea la simulación (decisión O8).
+Si es literalmente el mismo activo (mismo proveedor y símbolo), el estado es ⛔
+con la causa `MISMO_ACTIVO` (decisión D8). En una ventana de estabilidad, un
+estadístico −∞ cuenta como ventana no evaluable (sección 6.2).
 
 ### 4.3 Asimetría: las dos direcciones
 
@@ -494,6 +521,13 @@ Resultado INESTABLE si:  fracción de ventanas fallidas > 40 %   o   β cambia d
 (9/20 = 45 % > 40 %), o si en alguna ventana `β` es positivo y en otra negativo
 (la relación se invirtió). Con el mínimo de 500 observaciones hay solo 4 ventanas.
 
+**Ventanas no evaluables (decisión E10).** Si en una ventana Engle–Granger no se
+puede calcular (por ejemplo, una serie que no cambia de precio durante toda la
+ventana) o da un estadístico −∞ (series colineales en esa ventana), la ventana
+cuenta como **fallida**, con su motivo y sus fechas. No se convierte en un error
+de todo el par: es un diagnóstico. El cambio de signo de `β` se evalúa solo con
+las ventanas que tienen `β`.
+
 **Poca potencia.** Con 252 observaciones, Engle–Granger detecta mal incluso
 relaciones reales. Es esperable que muchos pares reales salgan «inestables»: eso
 es información sobre lo frágil de la evidencia, no un error del laboratorio.
@@ -511,7 +545,15 @@ sigue esta precedencia (decisión E6), y **siempre** se listan todas las causas:
 ✅ significa «hay evidencia en la ventana evaluada», nunca «cointegración
 garantizada». El estado ⛔ cubre tanto la falta de datos (menos de 500
 observaciones en formación) como los bloqueos por datos no aptos (monedas
-distintas o desconocidas, precios ≤ 0 con spread logarítmico).
+distintas o desconocidas, precios ≤ 0 con spread logarítmico, el mismo activo en
+las dos piernas).
+
+El estado describe la **evidencia estadística**. Aparte, el panel «¿Por qué se
+descartó este par?» lista las razones de aptitud para operar (OU no válido, vida
+media fuera de [1, 126], series colineales, proxy ejecutable requerido, precios
+ejecutables ≤ 0, costes que superan el PnL bruto…). Cualquier razón de ese panel,
+o un estado distinto de ✅, hace que el backtest sea **solo ilustrativo**, con un
+aviso que cita los motivos (decisión O5a).
 
 **En el código:** `mrlab.stats.cointegration.rolling_eg_stability`,
 `mrlab.stats.windows.rolling_windows`, `mrlab.analysis.pair_pipeline`.
@@ -756,7 +798,7 @@ esperada sigue siendo positiva, pero el intervalo ya incluye valores negativos
 `λ = 0,05`). El tiempo máximo por defecto, 3 vidas medias (sección 11), deja
 margen sobre ese valor medio.
 
-### 8.5 Por qué b ≥ 1 o b ≤ 0 invalida el modelo
+### 8.5 Cuándo el ajuste OU es válido (decisión O7)
 
 En un OU, `b = e^{−λΔt}` con `λ > 0`, así que **siempre** `0 < b < 1`.
 
@@ -773,14 +815,69 @@ En ambos casos el laboratorio muestra «el spread no muestra reversión
 estacionaria compatible con un OU» y **no** calcula `λ`, `μ`, `σ`, vida media,
 bandas ni z-score. Sin z no hay estrategia (decisión O5).
 
-**Un `b̂` apenas menor que 1 tampoco es evidencia.** MCO subestima `b` cuando
-el verdadero es 1 (sesgo de Dickey–Fuller): con un paseo aleatorio de 1.000
-observaciones, `b̂ < 1` en más del 95 % de las muestras. Por eso el laboratorio calcula
-`τ = (b̂ − 1)/EE(b̂)` y, si no baja del valor crítico de Dickey–Fuller al 5 %
-(≈ −2,86), añade el aviso «muy cerca de 1: no se distingue de un paseo aleatorio».
-Es solo un aviso: la validez sigue siendo `0 < b̂ < 1`, y la evidencia formal de
-reversión la da Engle–Granger (que sí tiene en cuenta que `α` y `β` se
-estimaron).
+**`0 < b̂ < 1` no basta: el sesgo de Dickey–Fuller.** Cuando el verdadero `b` es
+1 (paseo aleatorio), MCO lo subestima: `b̂` queda por debajo de 1 casi siempre.
+Si la validez fuera solo `0 < b̂ < 1`, un paseo aleatorio saldría como «OU
+válido» con una vida media finita y engañosa (por ejemplo, `b̂ = 0,99` da una vida
+media de 69 días). Por eso el laboratorio exige además que la prueba de
+Dickey–Fuller sobre ese mismo AR(1) **rechace** la raíz unitaria:
+
+```text
+τ = (b̂ − 1) / EE(b̂)          (AR(1) con constante, sin rezagos)
+Válido  ⇔  0 < b̂ < 1   y   τ ≤ c_α        (c_α: valor crítico de MacKinnon con constante, nivel α)
+```
+
+`α` es el nivel de evidencia del análisis (`alpha_level`, 0,05 por defecto). Para
+1 %, 5 % y 10 % se usan los valores críticos de MacKinnon con corrección de
+muestra finita; para otros niveles, el valor asintótico.
+
+**¿Qué valor crítico?** Depende de cómo se obtuvo la serie, por la misma razón de
+la sección 4.2:
+
+| Serie a la que se ajusta el AR(1) | Valores críticos | `c` al 5 % (899 transiciones) |
+|---|---|---|
+| Serie observada (p. ej. una simulación) | Dickey–Fuller, N = 1 | −2,86 |
+| Spread del par: **residuo** de la regresión de formación (α y β estimados con los mismos datos) | Engle–Granger, N = 2 | −3,34 |
+
+MCO elige `α` y `β` para que el residuo sea lo más pequeño posible, así que el
+spread de un par parece más estacionario de lo que es. Con la tabla N = 1 la
+prueba lo aceptaría demasiadas veces. El laboratorio usa N = 2 para el spread del
+par (también en las ventanas de estabilidad del OU) y N = 1 cuando el AR(1) se
+ajusta a una serie observada.
+
+**Comprobación por simulación** (2.000 repeticiones, 900 observaciones, como una
+formación de 1.500 con la división 60/20/20):
+
+| Caso | `0 < b̂ < 1` (regla anterior) | Válido con N = 1 | Válido con N = 2 |
+|---|---|---|---|
+| Paseo aleatorio observado | 95,3 % | 4,6 % | 0,9 % |
+| Residuo de MCO entre dos paseos aleatorios independientes | 99,0 % | 13,8 % | 4,6 % |
+
+Con la regla anterior, casi todos los paseos aleatorios pasaban como OU válidos.
+Con la tabla correcta, la tasa de falsos «OU válidos» queda cerca del nivel
+nominal del 5 %. En el análisis completo de 200 pares de paseos aleatorios
+independientes de 1.500 observaciones, con la regla anterior los 200 daban un OU
+«válido»; con la regla actual, 17 (8,5 %): algo más del 5 % porque el laboratorio
+elige la dirección de Engle–Granger con menor p-value, y eso favorece el spread
+que más parece estacionario.
+
+**Si la prueba no rechaza** (`near_unit_root`: `0 < b̂ < 1` pero `b̂` no se
+distingue de 1): el estado del ajuste es «no estacionario», se muestran `b̂`, `τ`
+y el valor crítico, y no se calculan `λ`, `μ`, `σ`, vida media ni bandas. El par
+recibe la razón de descarte `OU_NO_ESTACIONARIO`, que bloquea la estrategia.
+
+**Relación con Engle–Granger.** Las dos pruebas usan las mismas tablas (N = 2),
+pero no son la misma prueba: Engle–Granger elige rezagos por AIC (un ADF) y el OU
+usa un AR(1) sin rezagos. Pueden discrepar, por ejemplo si el spread tiene más
+memoria que un AR(1). El laboratorio muestra las dos: Engle–Granger decide el
+estado del par (evidencia de cointegración) y la prueba del AR(1) decide si el
+modelo OU se puede usar.
+
+**Ruido de redondeo.** Si las dos piernas son idénticas o proporcionales, el
+spread es casi nulo y solo contiene ruido numérico. El laboratorio compara la
+desviación del spread con la escala de las series (la desviación de `ln A` en
+formación): si es menor que `10⁻¹⁰` veces esa escala, el ajuste es «datos
+insuficientes» (decisión O8).
 
 **Avisos de vida media:** más de 126 días (medio año de negociación) es
 demasiado lenta para operar con este horizonte. Menos de 1 día no es operable ni
@@ -850,7 +947,9 @@ Ljung–Box:  Q(m) = n·(n + 2)·Σ_{k=1..m} ρ̂_k² / (n − k)  ~  χ² con m
 
 **Estabilidad del OU (decisión E8).** Se ajusta el OU en las mismas ventanas de
 la sección 6 (252 observaciones, paso 63) sobre el spread de formación con `α` y
-`β` **fijos** (el spread que realmente se opera):
+`β` **fijos** (el spread que realmente se opera). Cada ventana usa la misma regla
+de validez que el ajuste completo (sección 8.5: `0 < b̂ < 1` y Dickey–Fuller con
+valores críticos N = 2):
 
 ```text
 CV(λ) = desviación estándar(λ_ventanas) / media(λ_ventanas)     (ddof = 1, solo ventanas válidas)
@@ -944,8 +1043,11 @@ Con `w = 63` por defecto. No usa información futura, pero tiene tres problemas:
 | Ventas en corto | Permitidas (configurable) |
 
 Requisito: `salida < entrada < stop`. La estrategia solo existe si el OU es
-válido (decisión O5). Si el par no está en ✅, el backtest se permite con un aviso
-permanente de «resultado solo ilustrativo».
+válido (decisiones O5 y O7) y no hay ninguna razón que bloquee la simulación
+(series colineales, índice o futuro sin instrumento ejecutable, precios
+ejecutables ≤ 0). Si el par no está en ✅ o tiene alguna razón de descarte, el
+backtest se permite con un aviso permanente de «resultado solo ilustrativo» que
+cita los motivos (decisión O5a).
 
 ### 11.2 Entradas
 
@@ -1083,7 +1185,10 @@ acciones. Exposición bruta: `83,68·60 + 29,29·170 ≈ 10.000` USD.
 - Cada segmento se simula por separado, empezando sin posición y con el capital
   inicial. Una posición abierta al final queda como no realizada.
 - Si se cambian los umbrales después de ver la prueba, el resultado queda marcado
-  como «prueba contaminada» de forma permanente (decisión S10).
+  como «prueba contaminada» de forma permanente (decisión S10). En la fase 1, el
+  historial de configuraciones con que se ejecutó la prueba viaja dentro de
+  `run_config.json` (`test_history`, decisión S10a); el registro persistente de
+  estudios llega en la fase 2.
 
 ### 13.2 Convención de ejecución t → t+1
 

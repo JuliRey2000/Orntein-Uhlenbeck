@@ -1,13 +1,13 @@
 """Ejecución completa desde un RunConfig: datos (caché) → análisis → backtests.
 
 CONTRATO:
-- ``run_pair(config, data, include_test=False)``:
+- ``run_pair(config, data, include_test=None)``:
   carga las series con ``data.load_snapshot`` si el RunConfig trae snapshot_id
   (reproducción exacta, sin red) o con ``data.load`` si no; congela el split
   (si config.frozen_split es None se calcula y se guarda en el RunConfig
   devuelto); analiza; si ``strategy_allowed`` ejecuta el backtest de
   FORMACIÓN (marcado como dentro de muestra, solo ilustrativo) y VALIDACIÓN; la
-  PRUEBA solo si ``include_test`` (se ejecuta una vez con la configuración
+  PRUEBA solo si se pide (ver abajo; se ejecuta con la configuración
   congelada). Rellena ``config.series`` con los SeriesMeta usados y
   ``config.code_version``. Añade a ``discard_reasons`` "costes superan el PnL
   bruto" si ocurre en validación.
@@ -20,19 +20,43 @@ Precisiones de la implementación:
   ``SeriesRef`` queda con el ``snapshot_id`` de la instantánea usada (las
   fechas pedidas se conservan), ``frozen_split`` con las fechas de corte,
   ``data_origin`` según los datos (SINTETICO si alguna serie lo es, aunque el
-  RunConfig dijera otra cosa), ``code_version`` y ``config_hash``. Guardarlo,
-  cargarlo y volver a ejecutarlo da exactamente el mismo resultado sin usar el
+  RunConfig dijera otra cosa), ``include_test``, ``seeds``, ``test_history``,
+  ``code_version`` y ``config_hash``. Guardarlo, cargarlo y volver a ejecutarlo
+  da exactamente el mismo resultado (también con la prueba) sin usar el
   proveedor.
+- Prueba: se ejecuta si ``config.include_test`` o si el argumento
+  ``include_test`` es True (el argumento solo puede ACTIVARLA: con None o False
+  manda la configuración, de modo que reproducir un run_config.json que
+  incluía la prueba la vuelve a incluir). El valor efectivo queda en el
+  RunConfig devuelto y forma parte del hash.
+- Prueba contaminada (decisión S10, versión de la fase 1): cuando la prueba se
+  simula, h = config_hash; si ``test_history`` contiene algún hash distinto de
+  h, ``RunResult.test_contaminated = True`` (la prueba ya se vio con otra
+  configuración; la marca es permanente mientras el historial la conserve);
+  si no, False. h se añade al historial si no estaba. Si la prueba no se
+  simula, ``test_contaminated = None`` («no aplica») y el historial se
+  conserva sin cambios. El historial viaja en run_config.json; el registro
+  persistente de estudios llega en la fase 2.
+- ``seeds``: las del RunConfig más las de ``SeriesMeta.seed`` de cada serie
+  generada (clave = símbolo).
 - Sin ``snapshot_id``, la referencia debe traer ``start`` y ``end``.
 - Un snapshot cuyo proveedor o símbolo no coincide con la referencia →
   ConfigError ``RUN_CONFIG_INCONSISTENTE``.
 - Los segmentos sin observaciones (p. ej. validación = 0 %) no se simulan.
+- Si el motor rechaza un segmento con un ``LabError`` (p. ej. precios
+  ejecutables ≤ 0), ese segmento no se simula, la causa se añade a
+  ``discard_reasons`` (``SIMULACION_NO_POSIBLE``) y a
+  ``RunResult.segment_errors``, y el resto del análisis se conserva. Otros
+  errores (defectos de programación) se propagan.
 - Con ``StrategyParams.zscore_mode="movil"`` el backtest usa el z móvil
   (``rolling_zscore`` sobre el spread completo, solo hacia atrás) y se avisa de
   que es solo una comparación pedagógica.
-- Si el par no es ✅, cada backtest lleva el banner «solo ilustrativo» (O5).
-- ``RunResult.test_contaminated`` lo fija la capa de estudios (decisión S10);
-  la exportación lo informa.
+- Si el resultado es solo ilustrativo (``analysis.illustrative_only``: par no
+  ✅ o con razones de descarte), cada backtest lleva primero el banner con sus
+  motivos (``analysis.illustrative_banner``; decisión O5). Las razones que el
+  runner añade al simular (``SIMULACION_NO_POSIBLE``, ``COSTES_SUPERAN_BRUTO``)
+  se registran con ``add_discard_reasons``: el resultado pasa a ser solo
+  ilustrativo y el banner de cada backtest las cita.
 """
 
 from __future__ import annotations
@@ -43,15 +67,15 @@ from datetime import date
 import pandas as pd
 
 from mrlab.analysis.pair_pipeline import (
-    ILLUSTRATIVE_BANNER,
     Cause,
     PairAnalysis,
+    add_discard_reasons,
     analyze_pair,
 )
 from mrlab.backtest.engine import BacktestInput, BacktestResult, LegSpec, run_backtest
 from mrlab.backtest.split import segment_slice
 from mrlab.data.service import DataService
-from mrlab.domain.errors import ConfigError
+from mrlab.domain.errors import ConfigError, LabError
 from mrlab.domain.models import DataOrigin, PriceSeries, Segment
 from mrlab.model.ou import rolling_zscore
 from mrlab.reporting.run_config import PairSpec, RunConfig, SeriesRef, config_hash, git_version
@@ -65,6 +89,12 @@ ROLLING_Z_WARNING = (
 #: Orden de las series en ``RunConfig.series`` y en ``RunResult.series``.
 SERIES_ROLES = ("a", "b", "exec_a", "exec_b")
 
+_SEGMENT_NAMES = {
+    Segment.TRAIN: "formación",
+    Segment.VALIDATION: "validación",
+    Segment.TEST: "prueba",
+}
+
 
 @dataclass
 class RunResult:
@@ -73,8 +103,11 @@ class RunResult:
     backtests: dict[Segment, BacktestResult] = field(default_factory=dict)
     is_synthetic: bool = False
     series: dict[str, PriceSeries] = field(default_factory=dict)  # por rol: a, b, exec_a, exec_b
-    test_included: bool = False
-    test_contaminated: bool = False
+    test_included: bool = False  # ¿se pidió la prueba? (RunConfig.include_test efectivo)
+    #: True/False si la prueba se simuló (según ``RunConfig.test_history``); None si no.
+    test_contaminated: bool | None = None
+    #: Segmentos que no se pudieron simular → mensaje del error (en español).
+    segment_errors: dict[Segment, str] = field(default_factory=dict)
 
     @property
     def data_origin(self) -> DataOrigin:
@@ -179,7 +212,42 @@ def _costs_cause(bt: BacktestResult) -> Cause | None:
     )
 
 
-def run_pair(config: RunConfig, data: DataService, include_test: bool = False) -> RunResult:
+def _segment_failure(segment: Segment, exc: LabError) -> Cause:
+    return Cause(
+        code="SIMULACION_NO_POSIBLE",
+        status=None,
+        message=(
+            f"No se pudo simular el segmento de {_SEGMENT_NAMES[segment]}: {exc.message} Ese "
+            "segmento queda sin backtest; el resto del análisis se conserva."
+        ),
+    )
+
+
+def _seeds(config: RunConfig, loaded: dict[str, PriceSeries]) -> dict[str, int]:
+    """Semillas del RunConfig más las de las series generadas (clave = símbolo)."""
+    seeds = dict(config.seeds)
+    for role in SERIES_ROLES:
+        series = loaded.get(role)
+        seed = getattr(series.meta, "seed", None) if series is not None else None
+        if seed is not None:
+            seeds[series.symbol] = int(seed)
+    return dict(sorted(seeds.items()))
+
+
+def _record_test_run(result: RunResult) -> None:
+    """Registra en el historial la ejecución de la prueba y decide si está contaminada."""
+    cfg = result.config
+    current = cfg.config_hash
+    assert current is not None
+    history = list(cfg.test_history)
+    result.test_contaminated = any(h != current for h in history)
+    if current not in history:
+        history.append(current)
+    # test_history no forma parte del hash: config_hash no cambia.
+    result.config = cfg.model_copy(update={"test_history": history})
+
+
+def run_pair(config: RunConfig, data: DataService, include_test: bool | None = None) -> RunResult:
     refs = {
         "a": config.pair.a,
         "b": config.pair.b,
@@ -189,6 +257,7 @@ def run_pair(config: RunConfig, data: DataService, include_test: bool = False) -
     loaded = {role: _load(ref, data, role) for role, ref in refs.items() if ref is not None}
     is_synthetic = any(s.is_synthetic for s in loaded.values())
     origin = DataOrigin.SYNTHETIC if is_synthetic else DataOrigin.HISTORICAL
+    run_test = bool(config.include_test or include_test)
 
     analysis = analyze_pair(
         loaded["a"],
@@ -209,6 +278,8 @@ def run_pair(config: RunConfig, data: DataService, include_test: bool = False) -
         update={
             "pair": pair,
             "frozen_split": analysis.split or config.frozen_split,
+            "seeds": _seeds(config, loaded),
+            "include_test": run_test,
             "data_origin": origin,
             "series": [loaded[r].meta for r in SERIES_ROLES if r in loaded],
             "code_version": git_version(),
@@ -222,7 +293,7 @@ def run_pair(config: RunConfig, data: DataService, include_test: bool = False) -
         analysis=analysis,
         is_synthetic=is_synthetic,
         series=loaded,
-        test_included=include_test,
+        test_included=run_test,
     )
     if not analysis.strategy_allowed:
         return result
@@ -232,20 +303,34 @@ def run_pair(config: RunConfig, data: DataService, include_test: bool = False) -
     rolling = strategy.zscore_mode == "movil"
     z = rolling_zscore(analysis.spread, strategy.rolling_window) if rolling else analysis.zscore
     legs = (loaded.get("exec_a", loaded["a"]), loaded.get("exec_b", loaded["b"]))
-    segments = [Segment.TRAIN, Segment.VALIDATION] + ([Segment.TEST] if include_test else [])
+    banner = analysis.illustrative_banner
+    extra = ([banner] if banner else []) + ([ROLLING_Z_WARNING] if rolling else [])
+    late: list[Cause] = []  # razones de descarte que solo se conocen al simular
+    segments = [Segment.TRAIN, Segment.VALIDATION] + ([Segment.TEST] if run_test else [])
     for segment in segments:
-        inp = _segment_input(analysis, z, segment, legs, origin)
-        if inp is None:
+        try:
+            inp = _segment_input(analysis, z, segment, legs, origin)
+            if inp is None:
+                continue
+            bt = run_backtest(inp, strategy, final.costs)
+        except LabError as exc:
+            late.append(_segment_failure(segment, exc))
+            result.segment_errors[segment] = exc.message
             continue
-        bt = run_backtest(inp, strategy, final.costs)
-        extra = ([ILLUSTRATIVE_BANNER] if analysis.illustrative_only else []) + (
-            [ROLLING_Z_WARNING] if rolling else []
-        )
         bt.warnings = [*extra, *bt.warnings]
         result.backtests[segment] = bt
 
     validation = result.backtests.get(Segment.VALIDATION)
     cause = _costs_cause(validation) if validation is not None else None
     if cause is not None:
-        analysis.discard_reasons.append(cause)
+        late.append(cause)
+    if late:
+        # Decisión O5: cualquier razón de descarte hace el resultado solo ilustrativo; el
+        # banner de cada backtest se actualiza para citar también estas razones.
+        add_discard_reasons(analysis, late)
+        updated = analysis.illustrative_banner
+        for bt in result.backtests.values():
+            bt.warnings = [updated, *(w for w in bt.warnings if w != banner)]
+    if Segment.TEST in result.backtests:
+        _record_test_run(result)
     return result

@@ -1,10 +1,14 @@
 """Registro de proveedores leído de ``providers.toml``.
 
 CONTRATO:
-- ``ProviderRegistry.from_toml(path, overrides=None)``: lee ``default`` y las
-  secciones ``[providers.<nombre>]`` con ``class = "modulo:Clase"`` y
-  ``enabled`` (por defecto true). Las demás claves de la sección se pasan como
-  argumentos con nombre al constructor (p. ej. ``api_key_env``). Instancia solo
+- ``ProviderRegistry.from_toml(path, overrides=None, settings=None)``: lee
+  ``default`` y las secciones ``[providers.<nombre>]`` con
+  ``class = "modulo:Clase"`` y ``enabled`` (por defecto true). Las demás claves
+  de la sección se pasan como argumentos con nombre al constructor (p. ej.
+  ``api_key_env``). Si la clase define ``defaults_from_settings(settings)``, esas
+  opciones se usan como valores POR DEFECTO (las claves del TOML mandan); así
+  ``YahooProvider`` toma ``yahoo_max_retries`` y ``yahoo_backoff_base_seconds``
+  de ``mrlab.config.get_settings()`` (o de ``settings`` si se pasa). Instancia solo
   los habilitados; ``overrides`` permite inyectar instancias ya construidas
   (p. ej. un YahooProvider con factorías falsas en pruebas) sin importar la
   clase: una instancia inyectada siempre queda registrada. Errores de
@@ -57,7 +61,10 @@ class ProviderRegistry:
 
     @classmethod
     def from_toml(
-        cls, path: Path | str, overrides: dict[str, DataProvider] | None = None
+        cls,
+        path: Path | str,
+        overrides: dict[str, DataProvider] | None = None,
+        settings: Any = None,
     ) -> ProviderRegistry:
         path = Path(path)
         overrides = dict(overrides or {})
@@ -104,6 +111,13 @@ class ProviderRegistry:
                 continue
             provider_cls = _load_class(name, section.get("class"), path)
             kwargs = {k: v for k, v in section.items() if k not in _RESERVED_KEYS}
+            defaults_hook = getattr(provider_cls, "defaults_from_settings", None)
+            if callable(defaults_hook):
+                if settings is None:
+                    from mrlab.config import get_settings
+
+                    settings = get_settings()
+                kwargs = {**defaults_hook(settings), **kwargs}  # el TOML manda
             try:
                 instance = provider_cls(**kwargs)
             except TypeError as exc:

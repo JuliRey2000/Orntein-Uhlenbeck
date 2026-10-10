@@ -207,3 +207,33 @@ def test_reuploaded_csv_is_not_served_from_a_stale_snapshot(tmp_path):
     assert v2.close.tolist() == [1.0, 2.5]
     assert v2.meta.snapshot_id != v1.meta.snapshot_id
     assert service.load_snapshot(v1.meta.snapshot_id).close.tolist() == [1.0, 2.0]
+
+
+def test_tampered_snapshot_fails_and_reloading_the_original_csv_repairs_it(tmp_path):
+    """Hallazgo de la revisión: la caché no verificaba el contenido de las instantáneas."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    csv = CSVProvider(tmp_path / "uploads")
+    service = DataService(ProviderRegistry({"csv": csv}), SnapshotCache(tmp_path / "cache"))
+    meta = CSVMetadata(symbol="MIO", name="Mi serie", currency="USD", asset_class=AssetClass.EQUITY)
+    start, end = date(2020, 1, 1), date(2020, 1, 31)
+    csv.register("date,close\n2020-01-02,1\n2020-01-03,2\n2020-01-06,3\n", meta)
+    original = service.load("csv", "MIO", start, end)
+    sid = original.meta.snapshot_id
+
+    path = next((tmp_path / "cache").glob(f"*/*/{sid}.parquet"))
+    table = pq.read_table(path)
+    df = table.to_pandas()
+    df.iloc[1:, df.columns.get_loc("close")] *= 1.25  # se altera la instantánea «inmutable»
+    altered = pa.Table.from_pandas(df, preserve_index=True)
+    pq.write_table(altered.replace_schema_metadata(table.schema.metadata), path)
+
+    with pytest.raises(DataError) as exc_info:
+        service.load_snapshot(sid)  # reproducir un run_config: nunca en silencio
+    assert exc_info.value.code == "SNAPSHOT_CORRUPTO"
+
+    repaired = service.load("csv", "MIO", start, end)  # vuelve a leer el CSV original
+    assert repaired.meta.snapshot_id == sid
+    assert repaired.close.tolist() == [1.0, 2.0, 3.0]
+    assert service.load_snapshot(sid).close.tolist() == [1.0, 2.0, 3.0]

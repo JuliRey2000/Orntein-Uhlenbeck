@@ -75,3 +75,35 @@ def test_input_validation_errors_are_in_spanish():
         run_backtest(make_input([]), StrategyParams(), NO_COSTS)
     with pytest.raises(ConfigError, match="β"):
         run_backtest(make_input([0.0] * 3, beta=math.inf), StrategyParams(), NO_COSTS)
+
+
+def test_capital_exhausted_at_the_last_close_is_reported():
+    # Hallazgo: con equity ≤ 0 justo en el último cierre no había evento ni aviso.
+    # Corto de spread (−50 A, +100 B) y A se dispara en el último cierre: capital −5.000.
+    params = StrategyParams(stop_loss_pct=1.0, stop_z=50.0)
+    z = [0.0, 2.5, 2.4, 2.6, 2.6]
+    py = [100.0, 100.0, 100.0, 110.0, 400.0]
+    res = run_backtest(make_input(z, py), params, NO_COSTS)
+    d = res.daily
+    assert d["equity"].iloc[-1] == pytest.approx(-5_000.0)
+    assert any("agotó" in w for w in res.warnings)
+    (event,) = [e for e in res.events if e.kind == "capital_agotado"]
+    assert event.date == d["date"].iloc[-1].date()
+    assert "último cierre" in event.message
+    (t,) = res.trades
+    assert t.open_at_end and t.exit_reason is None  # no queda cierre para ejecutar la salida
+
+
+def test_capital_exhausted_warning_comes_from_the_daily_equity():
+    # Cualquier cierre con capital ≤ 0 produce el aviso, aunque no haya evento registrado.
+    from mrlab.backtest.engine import _result_warnings
+
+    params = StrategyParams(stop_loss_pct=1.0, stop_z=50.0)
+    z = [0.0, 2.5, 2.4, 2.6, 2.6]
+    py = [100.0, 100.0, 100.0, 110.0, 400.0]
+    res = run_backtest(make_input(z, py), params, NO_COSTS)
+    inp = make_input([0.0] * 5)
+    warnings = _result_warnings(inp, params, res.trades, [], res.daily)
+    assert any("agotó" in w for w in warnings)
+    healthy = run_backtest(make_input([0.0] * 5), params, NO_COSTS)
+    assert not any("agotó" in w for w in healthy.warnings)

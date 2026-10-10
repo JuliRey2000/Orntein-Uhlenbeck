@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 from conftest import cointegrated_log_prices
@@ -117,3 +118,51 @@ def test_test_segment_runs_only_when_requested(csv_service):
     # Ejecutar la prueba no cambia formación ni validación.
     for segment in (Segment.TRAIN, Segment.VALIDATION):
         assert without.backtests[segment].trades == with_test.backtests[segment].trades
+
+
+# --------------------------------------------------------------------------- prueba incluida
+
+
+@pytest.mark.parametrize("replay_flag", [None, False, True])
+def test_replaying_a_config_that_ran_the_test_reproduces_it_exactly(
+    csv_service, tmp_path, replay_flag
+):
+    # Hallazgo: include_test no quedaba en run_config.json; al reproducir sin --incluir-prueba
+    # la prueba desaparecía y la exportación cambiaba con el mismo hash.
+    original = run_pair(pair_config("csv"), csv_service, include_test=True)
+    assert original.config.include_test is True
+    path = save_run_config(original.config, tmp_path / "run_config.json")
+    offline = service(tmp_path / "cache")
+    replay = run_pair(load_run_config(path), offline, include_test=replay_flag)
+    assert Segment.TEST in replay.backtests
+    assert replay.config == original.config
+    assert export_zip_bytes(replay) == export_zip_bytes(original)
+    assert replay.test_contaminated is False
+
+
+def test_include_test_changes_the_config_hash(csv_service):
+    without = run_pair(pair_config("csv"), csv_service)
+    with_test = run_pair(pair_config("csv"), csv_service, include_test=True)
+    assert without.config.include_test is False and with_test.config.include_test is True
+    assert without.config.config_hash != with_test.config.config_hash
+
+
+# --------------------------------------------------------------------------- identidad estable
+
+
+def _registered_at(directory, mtime: float):
+    log_a, log_b = cointegrated_log_prices(n=1200, seed=21, lam=0.1, sigma=0.012)
+    provider = csv_provider(directory / "uploads", log_a, log_b)
+    for path in (directory / "uploads").glob("*.csv"):
+        os.utime(path, (mtime, mtime))  # «registrado» en otro momento
+    return service(directory / "cache", csv=provider)
+
+
+def test_same_csv_registered_at_different_times_gives_the_same_config_hash(tmp_path):
+    # Hallazgo: el hash incluía series[].retrieved_at (la hora de lectura del CSV).
+    first = run_pair(pair_config("csv"), _registered_at(tmp_path / "uno", 1_600_000_000.0))
+    second = run_pair(pair_config("csv"), _registered_at(tmp_path / "dos", 1_700_000_000.0))
+    assert first.config.pair == second.config.pair  # mismas instantáneas (mismo contenido)
+    retrieved = {m.retrieved_at for m in first.config.series + second.config.series}
+    assert len(retrieved) == 2  # los metadatos sí registran la hora de cada lectura
+    assert first.config.config_hash == second.config.config_hash

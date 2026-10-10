@@ -19,14 +19,24 @@ CONTRATO:
   con los metadatos (SeriesMeta en JSON) dentro de los metadatos del esquema
   Parquet (clave ``mrlab_meta``), y actualiza ``root/index.json`` de forma
   atómica (archivo temporal + ``os.replace``). Devuelve la serie con
-  ``meta.snapshot_id`` asignado y coverage/n_obs actualizados. Si el id ya existe,
-  no reescribe datos (conserva el ``retrieved_at`` original). Los datos se
+  ``meta.snapshot_id`` asignado y coverage/n_obs actualizados. Si el id ya existe
+  y el archivo verifica (ver ``get``), no reescribe datos (conserva el
+  ``retrieved_at`` original); si el archivo existente está dañado o alterado, lo
+  REESCRIBE con los datos nuevos (que por construcción tienen ese id). Los datos se
   guardan en forma canónica: columnas conocidas en orden fijo y float64, índice
   de ``mrlab.data.calendar.to_date_index``; el orden de filas no se toca (los
   datos crudos pueden traer desorden o duplicados que reporta la validación).
 - ``get(snapshot_id)`` → PriceSeries idéntica a la guardada (mismo índice,
   columnas y dtypes float64). Inexistente → DataError(code="SNAPSHOT_NO_ENCONTRADO")
   explicando que re-descargar puede dar precios distintos.
+- Verificación al LEER (direccionamiento por contenido real): se recalcula el
+  id con el mismo cálculo que ``put`` (``make_snapshot_id`` → ``_id_from``) a
+  partir de los datos leídos y de la identidad TAL COMO SE GUARDÓ en el JSON del
+  Parquet (así un campo nuevo del modelo no invalida instantáneas antiguas); si
+  no coincide con el id pedido (o con el id guardado en los metadatos), o el
+  archivo no se puede leer → DataError(code="SNAPSHOT_CORRUPTO") explicando que
+  la instantánea fue alterada o dañada y cómo regenerarla. Nunca se usa en
+  silencio.
 - ``list(provider=None, symbol=None)`` → SeriesMeta ordenados por retrieved_at desc
   (los sintéticos, sin retrieved_at, por fecha de guardado). El símbolo se
   compara sin distinguir mayúsculas.
@@ -59,6 +69,14 @@ from mrlab.domain.models import PriceSeries, SeriesMeta, coverage_of
 
 PRICE_COLUMNS = ("close", "open", "high", "low", "volume")
 META_KEY = b"mrlab_meta"
+CORRUPT = "SNAPSHOT_CORRUPTO"
+_REGENERATE = (
+    "Para regenerarla, vuelve a cargar la serie desde su origen: si es un CSV (el archivo "
+    "original) o datos sintéticos, al cargarlos de nuevo la instantánea se reescribe con el mismo "
+    "identificador; si viene de un proveedor en línea (Yahoo), pide actualizar los datos: una "
+    "descarga nueva puede traer precios distintos (otro identificador), y entonces el análisis "
+    "original ya no se puede reproducir exactamente."
+)
 INDEX_FILE = "index.json"
 INDEX_VERSION = 1
 
@@ -117,25 +135,42 @@ def content_hash(df: pd.DataFrame) -> str:
     return h.hexdigest()
 
 
-def snapshot_hash(meta: SeriesMeta, df: pd.DataFrame) -> str:
-    """Hash de la instantánea: contenido + identidad (no incluye la fecha de descarga)."""
-    identity = {
-        "asset": meta.asset.model_dump(mode="json"),
-        "price_type": meta.price_type.value,
-        "interval": meta.interval,
-        "requested_start": meta.requested_start.isoformat() if meta.requested_start else None,
-        "requested_end": meta.requested_end.isoformat() if meta.requested_end else None,
-        "content": content_hash(df),
+def _identity_of(meta_json: dict[str, Any]) -> dict[str, Any]:
+    """Identidad de la serie a partir de ``SeriesMeta`` en forma JSON."""
+    return {
+        "asset": meta_json["asset"],
+        "price_type": meta_json["price_type"],
+        "interval": meta_json.get("interval", "1d"),
+        "requested_start": meta_json.get("requested_start"),
+        "requested_end": meta_json.get("requested_end"),
     }
-    payload = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _hash_identity(identity: dict[str, Any], df: pd.DataFrame) -> str:
+    payload = json.dumps(
+        {**identity, "content": content_hash(df)},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def make_snapshot_id(meta: SeriesMeta, df: pd.DataFrame) -> str:
+def _id_from(identity: dict[str, Any], df: pd.DataFrame) -> str:
+    asset = identity["asset"]
     return (
-        f"{safe_symbol(meta.provider)}_{safe_symbol(meta.symbol)}_{safe_symbol(meta.interval)}_"
-        f"{snapshot_hash(meta, df)[:12]}"
+        f"{safe_symbol(asset['provider'])}_{safe_symbol(asset['symbol'])}_"
+        f"{safe_symbol(identity['interval'])}_{_hash_identity(identity, df)[:12]}"
     )
+
+
+def snapshot_hash(meta: SeriesMeta, df: pd.DataFrame) -> str:
+    """Hash de la instantánea: contenido + identidad (no incluye la fecha de descarga)."""
+    return _hash_identity(_identity_of(meta.model_dump(mode="json")), df)
+
+
+def make_snapshot_id(meta: SeriesMeta, df: pd.DataFrame) -> str:
+    return _id_from(_identity_of(meta.model_dump(mode="json")), df)
 
 
 def _not_found(snapshot_id: str, root: Path) -> DataError:
@@ -178,11 +213,17 @@ class SnapshotCache:
         with _lock_for(self.root):
             index = self._load_index()
             if path.exists():
-                stored = self._read(path, sid)
-                if sid not in index:
-                    index[sid] = self._entry(stored.meta, path)
-                    self._write_index(index)
-                return stored
+                try:
+                    stored = self._read(path, sid)
+                except DataError as exc:
+                    if exc.code != CORRUPT:
+                        raise
+                    stored = None  # dañada o alterada: se reescribe con los datos nuevos
+                if stored is not None:
+                    if sid not in index:
+                        index[sid] = self._entry(stored.meta, path)
+                        self._write_index(index)
+                    return stored
             path.parent.mkdir(parents=True, exist_ok=True)
             table = pa.Table.from_pandas(data, preserve_index=True)
             table = table.replace_schema_metadata(
@@ -266,15 +307,34 @@ class SnapshotCache:
             raw_meta = (table.schema.metadata or {})[META_KEY]
             meta = SeriesMeta.model_validate_json(raw_meta)
             df = table.to_pandas()
+            df.index = to_date_index(df.index)
+            data = canonical_frame(df)
+            # Mismo cálculo que ``put`` sobre la identidad TAL COMO SE GUARDÓ (el JSON
+            # del Parquet): un campo nuevo del modelo, con su valor por defecto, no
+            # invalida las instantáneas escritas antes de existir.
+            actual = _id_from(_identity_of(json.loads(raw_meta)), data)
         except Exception as exc:  # archivo truncado, editado o de otra versión
             raise DataError(
                 f"La instantánea «{snapshot_id}» de la caché está dañada y no se puede leer "
-                f"({path}). Bórrala y vuelve a cargar la serie desde el proveedor.",
-                code="SNAPSHOT_CORRUPTO",
+                f"({path}). {_REGENERATE}",
+                code=CORRUPT,
                 details={"snapshot_id": snapshot_id, "path": str(path), "error": str(exc)[:300]},
             ) from exc
-        df.index = to_date_index(df.index)
-        return PriceSeries(meta=meta, data=df)
+        if actual != snapshot_id or meta.snapshot_id != snapshot_id:
+            raise DataError(
+                f"La instantánea «{snapshot_id}» de la caché fue alterada: su contenido ya no "
+                "corresponde al identificador con que se guardó (al recalcularlo se obtiene "
+                f"«{actual}»). No se usa, porque daría resultados distintos bajo el mismo "
+                f"identificador. Archivo: {path}. {_REGENERATE}",
+                code=CORRUPT,
+                details={
+                    "snapshot_id": snapshot_id,
+                    "id_recalculado": actual,
+                    "id_en_metadatos": meta.snapshot_id,
+                    "path": str(path),
+                },
+            )
+        return PriceSeries(meta=meta, data=data)
 
     def _load_index(self) -> dict[str, dict[str, Any]]:
         try:

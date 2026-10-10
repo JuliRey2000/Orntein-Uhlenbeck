@@ -49,7 +49,9 @@ descarte con causas concretas.
 
 Los datos sintéticos se etiquetan **SINTÉTICO** en todas partes (símbolos
 `SINT-*`, nombres «SINTÉTICO — …», columna `tipo_datos` y prefijo
-`SINTETICO_` en las exportaciones) y nunca se presentan como históricos.
+`SINTETICO_` en los CSV de ejemplo y en las exportaciones) y nunca se presentan
+como históricos: aunque copies solo un CSV sintético y lo declares como histórico,
+el laboratorio lo sigue tratando como SINTÉTICO y te lo avisa.
 
 ## Estado actual
 
@@ -59,11 +61,20 @@ línea de comandos.
 
 | Fase | Contenido | Estado |
 |---|---|---|
-| 1 | Núcleo Python: proveedores de datos, validación, cointegración, spread, OU, backtest de un par, métricas, exportación CSV/JSON, demo | **Fase actual** |
+| 1 | Núcleo Python: proveedores de datos, validación, cointegración, spread, OU, backtest de un par, métricas, exportación CSV/JSON, demo | **Implementada y revisada** |
 | 2 | API FastAPI, caché, errores en español | Pendiente |
 | 3 | Interfaz web (9 pestañas), informe HTML, Docker | Pendiente |
 | 4 | Ranking de pares con FDR, walk-forward, recalibración de β | Pendiente |
 | 5 | Cartera multi-par | Pendiente |
+
+**Estado de la fase 1.** El núcleo y la demo están completos y cubiertos por
+pruebas automáticas que no necesitan internet. Una revisión adversarial encontró
+defectos reales (por ejemplo, un paseo aleatorio podía pasar como OU válido, un
+índice sin proxy se simulaba como si fuera operable y la exportación afirmaba
+«prueba contaminada: no» sin verificarlo); ya están corregidos y cada corrección
+tiene su prueba de regresión. Las decisiones que tomaron esas correcciones están
+en [`docs/DECISIONS.md`](docs/DECISIONS.md) (entre otras, O7, O5a, S10a, A2 y
+D10–D17).
 
 **Todavía no existen** la API, la interfaz web ni la configuración de Docker:
 llegan en las fases 2 y 3. Por ahora, `docker compose up` y `make dev` no están
@@ -123,9 +134,10 @@ instalación (`pip install -e "backend[dev]"`).
 |---|---|---|
 | `make install` | Instala el paquete y las dependencias de desarrollo | `pip install -e "backend[dev]"` |
 | `make test` | Ejecuta todas las pruebas | `cd backend` y luego `python -m pytest` |
+| `make test-fast` | Ejecuta las pruebas sin las marcadas como lentas | `cd backend` y luego `python -m pytest -m "not slow"` |
 | `make demo` | Ejecuta la demo con el par sintético (sin internet) | `python examples/demo_ko_pep.py` |
-| `make fetch-example` | Descarga KO y PEP de Yahoo Finance a `examples/data/real/` | (ver [Demo](#demo)) |
-| `make lint` | Revisa el estilo del código con ruff | `ruff check backend` |
+| `make fetch-example` | Descarga KO y PEP de Yahoo Finance a `examples/data/real/` | `python examples/fetch_ko_pep.py` |
+| `make lint` | Revisa el estilo del código con ruff | `python -m ruff check backend examples` |
 
 ## Pruebas
 
@@ -142,8 +154,13 @@ python -m pytest
 
 - Las pruebas son deterministas (semillas fijas) y **no necesitan internet**: las
   del proveedor de Yahoo usan respuestas simuladas.
-- Algunas pruebas de Monte Carlo están marcadas como lentas. Para una pasada
-  rápida, exclúyelas con `python -m pytest -m "not slow"` (dentro de `backend`).
+- La suite completa tarda algo más de dos minutos (≈ 2 min 20 s en el equipo
+  donde se verificó). Casi un minuto corresponde a las pruebas de la demo, que la
+  ejecutan de punta a punta varias veces (también la reproducción byte a byte).
+- Por ahora solo una prueba está marcada como lenta (`slow`): la robustez del
+  escenario SINT-CBC con 30 semillas (≈ 10 segundos). `make test-fast` (o
+  `python -m pytest -m "not slow"` dentro de `backend`) la excluye; el ahorro es
+  pequeño.
 
 ## Demo
 
@@ -163,7 +180,30 @@ python examples/demo_ko_pep.py
 Sin argumentos, la demo usa el par **SINTÉTICO** de `examples/data/` (generado
 con semilla fija y etiquetado como tal). No necesita conexión a internet. La
 exportación de resultados se guarda en `examples/output/`, una carpeta que git
-ignora.
+ignora (cámbiala con `--output-dir`; la caché de instantáneas, con `--cache-dir`).
+
+Al final, la demo imprime la orden **«Para reproducir»**: vuelve a ejecutar el
+`run_config.json` exportado usando solo la caché local y produce los mismos
+archivos byte a byte (incluye `--cache-dir` y `--excel-es` si los usaste):
+
+```bash
+python examples/demo_ko_pep.py --reproducir examples/output/<par>/run_config.json
+```
+
+### La muestra de prueba
+
+La muestra de prueba (el último 20 %) **no** se ejecuta salvo que lo pidas con
+`--incluir-prueba`, y debe ejecutarse una sola vez con la configuración congelada.
+Si el `run_config.json` ya incluía la prueba, `--reproducir` la vuelve a ejecutar
+sin necesidad de la opción. Si cambias los umbrales a mano y vuelves a ejecutar la
+prueba, el informe y la exportación la marcan como **contaminada** («Prueba
+contaminada: SÍ»). En la fase 1, el historial que permite detectarlo viaja dentro
+del propio `run_config.json`: si lo borras o lo editas a mano, la marca no puede
+detectarlo (el registro persistente de estudios llega en la fase 2).
+
+Si el par no superó los filtros (estado distinto de ✅ o alguna razón de
+descarte), el backtest se muestra con el aviso **«resultado solo ilustrativo»** y
+sus motivos.
 
 ### Tus propios CSV
 
@@ -183,8 +223,31 @@ Formato del CSV:
   cada serie: sin ellos no se puede verificar que ambas estén en la misma moneda ni
   elegir la anualización (252 o 365). Consulta las opciones con
   `python examples/demo_ko_pep.py --help`.
+- Si junto al CSV existe `<nombre>.meta.json` (lo crea `make fetch-example`), sus
+  metadatos se usan tal cual. Si los metadatos no son válidos, la demo explica en
+  español qué campo falla y cómo corregirlo.
 - Las dos series deben estar en la **misma moneda** y compartir al menos **834
   fechas** (el 60 % de formación debe tener 500 observaciones o más).
+- Una columna opcional `tipo_datos` (HISTORICO o SINTETICO) o un nombre de archivo
+  que empieza por `SINTETICO_` marcan los datos como sintéticos.
+
+### Índices y futuros: instrumento ejecutable
+
+Un índice (p. ej. `^GSPC`) o un futuro continuo no se puede comprar ni vender
+directamente. Si una serie es un índice, la demo muestra el análisis estadístico
+completo, pero **no simula la estrategia** (`PROXY_REQUERIDO`) hasta que indiques
+el CSV del instrumento que se opera en su lugar (por ejemplo, un ETF):
+
+```bash
+python examples/demo_ko_pep.py --csv-a SPX.csv --csv-b NDX.csv \
+    --currency USD --asset-class indice --price-type cierre \
+    --exec-a SPY.csv --exec-b QQQ.csv --asset-class-exec-a etf --asset-class-exec-b etf
+```
+
+El instrumento ejecutable hereda la moneda y el tipo de precio generales, pero su
+clase de activo se declara aparte (`--asset-class-exec-a`/`-b`) o con su
+`.meta.json`. La señal sale del índice y el PnL del instrumento ejecutable: la
+demo avisa del riesgo de base.
 
 ### Datos reales de KO y PEP
 
@@ -217,9 +280,10 @@ estados.
   instantáneas y nunca vuelve a descargar en silencio.
 - **Índices y futuros no son ejecutables.** Si eliges un índice (p. ej. `^GSPC`) o
   un futuro (`GC=F`), el laboratorio sugiere un instrumento ejecutable (`SPY`,
-  `GLD`) y te pide confirmarlo; nunca lo sustituye en silencio. Ten en cuenta el
-  riesgo de base: `^GSPC` no incluye dividendos y `SPY` ajustado sí (≈ 1,5 % anual de
-  diferencia).
+  `GLD`) y te pide confirmarlo; nunca lo sustituye en silencio. Sin instrumento
+  ejecutable, el análisis se muestra pero la estrategia no se simula. Ten en
+  cuenta el riesgo de base: `^GSPC` no incluye dividendos y `SPY` ajustado sí
+  (≈ 1,5 % anual de diferencia).
 
 ### CSV propios
 
@@ -248,7 +312,10 @@ variables con prefijo `MRLAB_` (ver `backend/src/mrlab/config.py`).
 - **Misma moneda.** Si los dos activos cotizan en monedas distintas (o la moneda es
   desconocida), el análisis se bloquea. La conversión de moneda queda como
   extensión.
-- **Precios positivos** para el spread logarítmico (el que se usa por defecto).
+- **Precios positivos** para el spread logarítmico (el que se usa por defecto) y
+  siempre para los instrumentos que se operan: con un precio ejecutable ≤ 0 (como
+  el petróleo WTI en abril de 2020) el análisis se muestra, pero la estrategia no
+  se simula.
 - **Mínimo de 500 observaciones** comunes en la muestra de formación.
 - **α y β fijos:** se estiman en formación y no se recalibran (la recalibración
   móvil llega en la fase 4).
@@ -258,9 +325,13 @@ variables con prefijo `MRLAB_` (ver `backend/src/mrlab/config.py`).
 - **Bandas e intervalos sin incertidumbre de parámetros:** tratan λ, μ y σ como
   exactos, así que son más estrechos de lo que deberían. El bootstrap por bloques
   queda como extensión.
-- **OU de parámetros constantes:** no modela cambios de régimen.
+- **OU de parámetros constantes:** no modela cambios de régimen. El ajuste OU solo
+  es válido si `0 < b < 1` **y** la prueba de Dickey–Fuller rechaza la raíz
+  unitaria (un `b` algo menor que 1 aparece incluso en un paseo aleatorio; ver
+  `docs/MATEMATICAS.md`, sección 8.5).
 - **Pares cripto + bolsa:** se usan solo los días de negociación de la bolsa (nunca
-  se rellenan fines de semana). En Yahoo, el cierre diario de cripto es a
+  se rellenan fines de semana). Lo mismo si un par de cripto se opera con un
+  instrumento de bolsa: el calendario es mixto y se anualiza con 252. En Yahoo, el cierre diario de cripto es a
   medianoche UTC y el de la bolsa de EE. UU. a las 16:00 de Nueva York: los dos
   «cierres» no son simultáneos.
 - **Cortos en cripto:** vender en corto cripto spot requiere derivados (por
@@ -303,6 +374,8 @@ variables con prefijo `MRLAB_` (ver `backend/src/mrlab/config.py`).
 ├── docs/                          # especificación, arquitectura, decisiones, matemáticas
 └── examples/
     ├── demo_ko_pep.py             # demo reproducible
+    ├── fetch_ko_pep.py            # descarga KO y PEP de Yahoo (make fetch-example)
+    ├── generar_csv_sinteticos.py  # regenera examples/data/ (byte a byte)
     └── data/                      # CSV SINTÉTICOS (real/ se crea con make fetch-example)
 ```
 

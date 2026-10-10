@@ -35,7 +35,8 @@ CONTRATO — bucle por observación i = 0..n−1 del segmento:
       "señal no ejecutable" (se registra, no se ejecuta). Si no, orden de entrada.
     - en el último cierre del segmento no se crean órdenes.
     - el rearme se libera en el cierre en que z vuelve a la banda de ese lado.
-    - capital ≤ 0 con posición → salida forzada (evento "capital agotado").
+    - capital ≤ 0 con posición → salida forzada (evento "capital agotado"); en
+      el último cierre se registra el evento, sin orden.
  6. Fin del segmento: la posición abierta queda NO realizada y la operación se
     marca ``open_at_end=True`` (no se fuerza el cierre).
 
@@ -57,6 +58,11 @@ Precisiones de la implementación:
 - ``Trade.q_y``/``q_x`` son las cantidades de ENTRADA (una reducción posterior
   queda en los eventos y en ``daily``). ``Trade.bars_held`` = observaciones desde
   la ejecución de la entrada hasta la de la salida (o hasta el último cierre).
+- Avisos del resultado (``BacktestResult.warnings``): «capital agotado» si
+  ALGÚN cierre de ``daily`` tiene capital ≤ 0 (también el último, donde ya no
+  se crean órdenes), y ``CRYPTO_SHORT_WARNING`` si alguna operación deja corta
+  una pierna de clase cripto (el corto de cripto spot requiere derivados, fuera
+  de la v1; el préstamo cobrado es una aproximación).
 
 Contabilidad obligatoria (se prueba): Σ pnl_gross − Σ costes = Σ pnl_net;
 capital_final = capital_inicial + Σ pnl_net; realizado + no realizado = total.
@@ -111,6 +117,15 @@ EXECUTION_CONVENTION = (
 
 #: Margen relativo sobre max_leverage antes de ordenar una reducción.
 LEVERAGE_TOLERANCE = 0.01
+
+#: Aviso cuando la simulación vende en corto una pierna cripto ({symbols}: símbolos afectados).
+CRYPTO_SHORT_WARNING = (
+    "Se simuló la venta en corto de cripto spot ({symbols}). En la práctica, ponerse corto en "
+    "cripto spot requiere derivados (perpetuos con funding), que están fuera del alcance de la "
+    "v1; el coste de préstamo de cortos aplicado es solo una aproximación."
+)
+
+CAPITAL_EXHAUSTED_WARNING = "El capital del par se agotó durante el segmento."
 
 DAILY_COLUMNS = [
     "date",
@@ -505,7 +520,17 @@ class _Simulator:
         if self.state == PositionState.COOLDOWN and i >= self.cooldown_until:
             self.state = PositionState.FLAT
         if i == self.n - 1:
-            return  # en el último cierre no se crean órdenes
+            # En el último cierre no se crean órdenes, pero un capital agotado se registra.
+            if self.trade is not None and self.equity <= 0:
+                self._event(
+                    i,
+                    "capital_agotado",
+                    f"Operación {self.trade.trade_id}: el capital del par llegó a "
+                    f"{_fmt(self.equity)} en el último cierre del segmento con la posición "
+                    "abierta; ya no queda un cierre siguiente para ejecutar la salida forzada.",
+                    {"capital": self.equity},
+                )
+            return
         if self.trade is not None:
             self.last_blocked = None
             self._decide_with_position(i, z, gross_exposure, leverage, notes)
@@ -644,8 +669,24 @@ class _Simulator:
         self.events.append(Event(date=self._date(i), kind=kind, message=message, details=details))
 
 
+def _crypto_short_symbols(inp: BacktestInput, trades: list[Trade]) -> list[str]:
+    """Piernas cripto que alguna operación dejó en corto (cantidad de entrada < 0)."""
+    symbols: list[str] = []
+    for leg, short in (
+        (inp.leg_y, any(t.q_y < 0 for t in trades)),
+        (inp.leg_x, any(t.q_x < 0 for t in trades)),
+    ):
+        if short and leg.asset_class == AssetClass.CRYPTO and leg.symbol not in symbols:
+            symbols.append(leg.symbol)
+    return symbols
+
+
 def _result_warnings(
-    inp: BacktestInput, params: StrategyParams, trades: list[Trade], events: list[Event]
+    inp: BacktestInput,
+    params: StrategyParams,
+    trades: list[Trade],
+    events: list[Event],
+    daily: pd.DataFrame,
 ) -> list[str]:
     warnings: list[str] = []
     if inp.segment == Segment.TRAIN:
@@ -671,8 +712,12 @@ def _result_warnings(
     n_not_exec = sum(e.kind == "senal_no_ejecutable" for e in events)
     if n_not_exec:
         warnings.append(f"Se registraron {n_not_exec} señales no ejecutables (ver eventos).")
-    if any(e.kind == "capital_agotado" for e in events):
-        warnings.append("El capital del par se agotó durante el segmento.")
+    exhausted = bool((daily["equity"] <= 0).any()) if len(daily) else False
+    if exhausted or any(e.kind == "capital_agotado" for e in events):
+        warnings.append(CAPITAL_EXHAUSTED_WARNING)
+    crypto_shorts = _crypto_short_symbols(inp, trades)
+    if crypto_shorts:
+        warnings.append(CRYPTO_SHORT_WARNING.format(symbols=", ".join(crypto_shorts)))
     return warnings
 
 
@@ -697,5 +742,5 @@ def run_backtest(inp: BacktestInput, params: StrategyParams, costs: CostParams) 
         spread_type=inp.spread_type,
         calendar=inp.calendar,
         origin=inp.origin,
-        warnings=_result_warnings(inp, params, trades, events),
+        warnings=_result_warnings(inp, params, trades, events, daily),
     )

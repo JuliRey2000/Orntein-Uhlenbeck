@@ -19,6 +19,11 @@ CONTRATO (a implementar):
   frac_fail > max_fail_frac (0,40) o si β cambia de signo entre ventanas.
   ``reasons`` en español con los números. Sin ventanas → unstable=False y una
   razón explicándolo.
+  Una ventana NO EVALUABLE (p. ej. una serie constante dentro de la ventana, o
+  series colineales con estadístico −∞) no interrumpe el diagnóstico: queda con
+  ``evaluable=False``, ``passed=False`` y su ``reason``, cuenta como fallida y
+  la primera razón nombra sus fechas. El cambio de signo de β se mide solo con
+  las ventanas que tienen β.
 - ``eg_decision(results, ...)`` (función pura para el pipeline): ajusta los
   p-values por FDR, elige la dirección y decide si hay evidencia.
   * Familia por defecto: las 2 direcciones del par (m = 2).
@@ -71,6 +76,13 @@ COLLINEAR_WARNING = (
     "activo o series duplicadas; ese p-value no debe leerse como evidencia."
 )
 
+COLLINEAR_WINDOW_REASON = (
+    "las series son prácticamente colineales en esta ventana: Engle–Granger no es fiable"
+)
+
+#: Máximo de ventanas no evaluables que se nombran en la razón (el resto se cuenta).
+MAX_WINDOWS_IN_REASON = 3
+
 STABILITY_POWER_NOTE = (
     "Con pocas observaciones por ventana la prueba de Engle–Granger tiene poca potencia, así que "
     "incluso una relación real puede no detectarse en algunas ventanas."
@@ -99,11 +111,13 @@ class EGWindow(BaseModel):
     start: date
     end: date
     nobs: int
-    statistic: float
-    pvalue: float
-    alpha: float
-    beta: float
+    statistic: float | None = None  # None si la ventana no se pudo evaluar
+    pvalue: float | None = None
+    alpha: float | None = None
+    beta: float | None = None
     passed: bool
+    evaluable: bool = True
+    reason: str | None = None  # por qué no se pudo evaluar (en español)
 
 
 class EGStability(BaseModel):
@@ -378,19 +392,41 @@ def rolling_eg_stability(
 
     windows: list[EGWindow] = []
     for start, end in rolling_windows(len(y), window, step):
-        eg = engle_granger(
-            y.iloc[start:end],
-            x.iloc[start:end],
-            direction=direction,
-            dependent=dependent,
-            independent=independent,
-            maxlag=maxlag,
-        )
+        bounds = {
+            "start": y.index[start].date(),
+            "end": y.index[end - 1].date(),
+            "nobs": end - start,
+        }
+        try:
+            eg = engle_granger(
+                y.iloc[start:end],
+                x.iloc[start:end],
+                direction=direction,
+                dependent=dependent,
+                independent=independent,
+                maxlag=maxlag,
+            )
+        except DataError as exc:
+            # Diagnóstico (decisión E5): una ventana no evaluable cuenta como fallida, no
+            # interrumpe el análisis del par.
+            reason = exc.message[:1].lower() + exc.message[1:]
+            windows.append(EGWindow(**bounds, passed=False, evaluable=False, reason=reason))
+            continue
+        if not np.isfinite(eg.statistic):
+            windows.append(
+                EGWindow(
+                    **bounds,
+                    alpha=eg.alpha_ols,
+                    beta=eg.beta_ols,
+                    passed=False,
+                    evaluable=False,
+                    reason=COLLINEAR_WINDOW_REASON,
+                )
+            )
+            continue
         windows.append(
             EGWindow(
-                start=y.index[start].date(),
-                end=y.index[end - 1].date(),
-                nobs=end - start,
+                **bounds,
                 statistic=eg.statistic,
                 pvalue=eg.pvalue,
                 alpha=eg.alpha_ols,
@@ -419,7 +455,7 @@ def rolling_eg_stability(
     n_windows = len(windows)
     n_fail = sum(not w.passed for w in windows)
     frac_fail = n_fail / n_windows
-    betas = np.array([w.beta for w in windows])
+    betas = np.array([w.beta for w in windows if w.beta is not None], dtype=float)
     beta_sign_change = bool((betas > 0).any() and (betas < 0).any())
     too_many_failures = frac_fail > max_fail_frac
 
@@ -428,16 +464,34 @@ def rolling_eg_stability(
         f"p-value de Engle–Granger superó el nivel {_fmt(alpha_level, 2)}; el máximo tolerado es "
         f"{_fmt_pct(max_fail_frac)}."
     )
+    not_evaluable = [w for w in windows if not w.evaluable]
+    if not_evaluable:
+        listed = "; ".join(
+            f"del {w.start.isoformat()} al {w.end.isoformat()} ({(w.reason or '').rstrip('.')})"
+            for w in not_evaluable[:MAX_WINDOWS_IN_REASON]
+        )
+        rest = len(not_evaluable) - MAX_WINDOWS_IN_REASON
+        more = f"; y {rest} más" if rest > 0 else ""
+        k = len(not_evaluable)
+        verb = (
+            "no se pudo evaluar y se cuenta como fallida"
+            if k == 1
+            else "no se pudieron evaluar y se cuentan como fallidas"
+        )
+        failures += f" De ellas, {k} {verb}: {listed}{more}."
     if too_many_failures:
         failures += f" {STABILITY_POWER_NOTE}"
-    beta_range = f"mínimo {_fmt(betas.min(), 3)}, máximo {_fmt(betas.max(), 3)}"
-    if beta_sign_change:
-        betas_msg = (
-            f"β cambió de signo entre ventanas ({beta_range}): la relación entre los activos se "
-            "invirtió dentro de la muestra de formación."
-        )
+    if betas.size == 0:
+        betas_msg = "Ninguna ventana tiene un β estimado: no se puede comparar su signo."
     else:
-        betas_msg = f"β mantuvo el mismo signo en todas las ventanas ({beta_range})."
+        beta_range = f"mínimo {_fmt(betas.min(), 3)}, máximo {_fmt(betas.max(), 3)}"
+        if beta_sign_change:
+            betas_msg = (
+                f"β cambió de signo entre ventanas ({beta_range}): la relación entre los activos "
+                "se invirtió dentro de la muestra de formación."
+            )
+        else:
+            betas_msg = f"β mantuvo el mismo signo en todas las ventanas ({beta_range})."
 
     return EGStability(
         direction=direction,

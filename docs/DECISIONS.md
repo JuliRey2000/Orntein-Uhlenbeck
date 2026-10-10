@@ -14,7 +14,9 @@ el responsable del proyecto.
   La app sugiere un proxy y ofrece dos modos: (a) **analizar y ejecutar con el
   proxy** (preseleccionado) o (b) analizar el índice y ejecutar con el proxy,
   avisando del riesgo de base (p. ej. `^GSPC` no incluye dividendos y `SPY`
-  ajustado sí: ~1,5 % anual de deriva). Nunca se sustituye en silencio.
+  ajustado sí: ~1,5 % anual de deriva). Nunca se sustituye en silencio. Sin un
+  proxy elegido, el análisis estadístico se muestra completo, pero la simulación
+  queda bloqueada (`PROXY_REQUERIDO`; ver A2).
 - **Alternativas:** usar siempre el índice; sustituir automáticamente por el proxy.
 - **Justificación:** analizar y operar la misma serie evita que la señal y el PnL
   provengan de instrumentos distintos; el modo (b) se conserva porque la
@@ -53,6 +55,8 @@ el responsable del proyecto.
   que empieza por «SINTÉTICO —», `origin = SINTETICO`, prefijo `SINTETICO_` en
   los archivos y columna `tipo_datos` en cada fila exportada. Se tratan como
   acciones a efectos de calendario y costes.
+  Un CSV cargado por el usuario también se marca como SINTÉTICO si cualquier
+  indicio lo dice (D10).
 - **Alternativas:** marca solo en la interfaz.
 - **Justificación:** prohibición explícita de presentar datos sintéticos como
   históricos; la marca viaja con los datos y no depende de la interfaz.
@@ -72,28 +76,173 @@ el responsable del proyecto.
 - **Decisión:** cada descarga es una instantánea Parquet inmutable con id
   `proveedor_símbolo_intervalo_hash12`. Nunca se mezclan descargas. Reproducir un
   `run_config.json` usa exactamente esas instantáneas; si falta alguna se informa
-  el error y no se vuelve a descargar en silencio.
+  el error y no se vuelve a descargar en silencio. El contenido se verifica al
+  leer (D12).
 - **Alternativas:** caché incremental que añade días nuevos a un archivo.
 - **Justificación:** Yahoo reajusta todo el histórico con cada dividendo o split;
   añadir días a una descarga antigua mezclaría factores de ajuste distintos.
 - **Fecha:** 2026-10-10
 
 ### D8 — Bloqueos por datos no aptos usan el estado ⛔
-- **Decisión:** monedas distintas, moneda desconocida o precios ≤ 0 con spread
-  logarítmico producen el estado «⛔ Datos insuficientes», con la causa concreta
-  explicada.
-- **Alternativas:** crear un sexto estado «Datos no aptos».
+- **Decisión:** monedas distintas, moneda desconocida (también la del proxy
+  ejecutable: `MONEDA_DESCONOCIDA`, nunca «None» en el mensaje), precios ≤ 0 con
+  spread logarítmico y el mismo activo en las dos piernas (`MISMO_ACTIVO`: mismo
+  proveedor y mismo símbolo, sin distinguir mayúsculas ni espacios) producen el
+  estado «⛔ Datos insuficientes», con la causa concreta explicada. El mismo
+  símbolo de proveedores distintos no es ⛔, pero queda bloqueado por
+  colinealidad (O8).
+- **Alternativas:** crear un sexto estado «Datos no aptos»; para el mismo activo,
+  solo un aviso.
 - **Justificación:** la especificación exige exactamente cinco estados; ⛔ es el
-  único que bloquea, y la causa detalla el motivo.
+  único que bloquea, y la causa detalla el motivo. Elegir dos veces el mismo
+  activo es un error plausible de un alumno y ninguna prueba tiene sentido.
 - **Fecha:** 2026-10-10
 
 ### D9 — Datos de ejemplo: CSV sintéticos en el repositorio (confirmada)
 - **Decisión:** `examples/data/` solo contiene CSV **sintéticos**. `demo_ko_pep.py`
   acepta `--csv-a/--csv-b`; `make fetch-example` descarga KO/PEP de Yahoo a CSV en
-  la máquina del usuario. Sin argumentos, la demo usa el par sintético.
+  la máquina del usuario. Sin argumentos, la demo usa el par sintético. El
+  generador (`examples/generar_csv_sinteticos.py`) escribe la columna
+  `tipo_datos = SINTETICO` en cada fila y la semilla (`seed`) en el `.meta.json`;
+  una prueba comprueba que los archivos versionados coinciden byte a byte con lo
+  que genera.
 - **Alternativas:** versionar CSV reales de Yahoo.
 - **Justificación:** los términos de uso de Yahoo desaconsejan redistribuir sus
   datos, y la demo debe funcionar sin internet.
+- **Fecha:** 2026-10-10
+
+### D10 — CSV: cualquier indicio de datos sintéticos los marca como SINTÉTICOS
+- **Decisión:** una serie CSV es SINTÉTICA si lo dicen los metadatos (`origin` o
+  `price_type`), si declaran una semilla (`seed`), si alguna fila de la columna
+  opcional `tipo_datos` dice SINTETICO (sin distinguir mayúsculas ni tildes; las
+  celdas vacías no informan) o si el nombre del archivo empieza por `SINTETICO_`
+  (al registrarlo con su nombre original o al leer un archivo guardado con ese
+  prefijo). Al forzarlo se añade una nota explicativa (`AssetInfo.notes`) y el
+  `.meta.json` se guarda con los metadatos efectivos; la demo lo avisa. Una
+  columna HISTORICO nunca rebaja datos declarados sintéticos (se anota). Filas
+  HISTORICO y SINTETICO mezcladas (`CSV_TIPO_DATOS_MEZCLADO`) o valores
+  desconocidos (`CSV_TIPO_DATOS_DESCONOCIDO`) son un error. El nombre nunca prueba
+  que los datos sean históricos.
+- **Alternativas:** rechazar con error cuando los metadatos contradicen la columna
+  o el nombre; ignorar el nombre del archivo; tratar las celdas vacías como mezcla.
+- **Justificación:** la sección 17 y D5 prohíben presentar datos sintéticos como
+  históricos y piden que la marca viaje con los datos. Antes, copiar solo el CSV
+  de ejemplo y declararlo como cierre ajustado lo exportaba como HISTORICO.
+  Forzar en la dirección segura, con una nota, no interrumpe al alumno y nunca
+  etiqueta mal; la mezcla sí se rechaza porque una serie no puede ser real y
+  generada a la vez.
+- **Fecha:** 2026-10-10
+
+### D11 — Metadatos CSV con errores en español
+- **Decisión:** `parse_metadata(dict | str | bytes)` y `build_metadata(**campos)`
+  convierten cualquier fallo (JSON inválido, con línea y columna; bytes que no son
+  UTF-8; campo que falta; valor fuera de la lista; tipo incorrecto) en
+  `DataError CSV_METADATOS_INVALIDOS`. El mensaje nombra el campo, el valor
+  recibido y los valores válidos, y añade una ayuda con los campos obligatorios.
+  La moneda se valida solo como formato ISO de 3 letras. Clase de activo, tipo de
+  precio y origen se aceptan sin distinguir mayúsculas ni tildes («Acción»). Un
+  `.meta.json` dañado no impide usar los demás archivos, pero se nombra en el
+  error `SIMBOLO_SIN_DATOS`. La demo y el script de descarga usan estas funciones.
+- **Alternativas:** pasar el mensaje de pydantic tal cual; validar la moneda
+  contra la lista ISO 4217 completa.
+- **Justificación:** la sección 0 exige errores claros en español que digan qué
+  hacer (antes la demo terminaba con un traceback de pydantic en inglés). Para
+  comprobar que dos monedas son iguales basta el código, y una lista ISO habría que
+  mantenerla.
+- **Fecha:** 2026-10-10
+
+### D12 — Instantáneas verificadas al leer (complementa D7 y A9)
+- **Decisión:** `SnapshotCache` recalcula el id de cada instantánea al leerla,
+  con el mismo cálculo que al guardarla, sobre los datos leídos y la identidad tal
+  como quedó guardada en el JSON del Parquet (no sobre el modelo revalidado). Si no
+  coincide con el id pedido o con el de sus metadatos → `SNAPSHOT_CORRUPTO`, con
+  instrucciones para regenerarla; nunca se usa en silencio. Guardar de nuevo una
+  instantánea alterada o ilegible la reescribe: volver a cargar el CSV original o
+  regenerar los datos sintéticos la repara. `DataService.load` no vuelve a
+  descargar automáticamente: informa el error y hay que pedir la actualización.
+  `SeriesMeta.seed` no entra en la identidad, así que los ids existentes no
+  cambian, y un campo nuevo con valor por defecto tampoco invalida instantáneas
+  antiguas.
+- **Alternativas:** verificar solo al guardar; un archivo de sumas de control
+  aparte; recalcular sobre el modelo revalidado (rompería la caché al añadir
+  campos); volver a descargar en silencio.
+- **Justificación:** D7 exige que reproducir use exactamente esas instantáneas.
+  Con un id direccionado por contenido, verificarlo al leer es la única garantía
+  real (antes una instantánea alterada se usaba en silencio, incluso recargando el
+  CSV original).
+- **Fecha:** 2026-10-10
+
+### D13 — Parámetros del escenario SINT-CBC (cointegrado con baja correlación)
+- **Decisión:** volatilidad diaria de B 0,01, OU con `σ = 0,03` y `λ = 0,5`; la
+  deriva de B sigue en 0,0002 y la semilla del preset en 7. Teoría:
+  `σ_eq = σ/√(2λ) = 3 %`; `Var(ΔX) = 2·σ_eq²·(1 − e^{−λ}) ≈ 0,000708` (≈ 2,66 %
+  diario); `corr(r_A, r_B) = 0,01/√(0,01² + 0,000708) ≈ 0,35`; vida media
+  `ln 2/0,5 ≈ 1,39` días. Con la semilla 7: A y B compatibles con I(1),
+  Engle–Granger p ≈ 5·10⁻²⁷, correlación en formación 0,33, estado ✅,
+  `λ̂ ≈ 0,53` (vida media estimada 1,31 días). Robustez: 22 de 30 semillas ✅
+  (antes 10 de 30) y 75 de 90 en las semillas 1–90, todas con correlación < 0,5
+  (media 0,35, máximo 0,43). Casi todas las fallas vienen de que el paseo
+  aleatorio B sale «ambiguo» con ADF + KPSS (≈ 10 % de los paseos aleatorios con
+  la regla E2 al 5 %), lo que ningún parámetro del OU corrige.
+- **Alternativas:** los valores anteriores (volatilidad de B 0,004, `σ = 0,015`,
+  `λ = 0,1`: la serie A parecía estacionaria y el preset daba «⚠️ Supuestos
+  dudosos»; 10 de 30); `λ = 1` (26 de 30, pero vida media < 1 día, fuera del rango
+  operable); deriva 0,0006–0,001 (sin mejora en 90 semillas y la semilla 7 falla
+  desde 0,0008); `σ = 0,025` (correlación máxima 0,49, sin margen).
+- **Justificación:** el ejemplo pedagógico debe mostrar de verdad «cointegrado con
+  baja correlación» con ✅ y sin supuestos dudosos. Un OU rápido domina el cambio
+  diario (correlación baja) sin que la serie A parezca estacionaria en niveles.
+  Cifras verificadas con el código (MATEMATICAS §2.2).
+- **Fecha:** 2026-10-10
+
+### D14 — Umbral de salto sospechoso simétrico en logaritmos
+- **Decisión:** `SALTO_SOSPECHOSO` si `|ln(P_t/P_{t−1})| > ln 1,5`, es decir, una
+  subida de más del 50 % o una caída de más del 33,3 % en un día. El mensaje sigue
+  hablando de un posible error de ajuste por split o dividendo y menciona que un
+  split 2:1 sin ajustar aparece como una caída del 50 %.
+- **Alternativas:** `|R simple| > 50 %` (anterior: asimétrico; no marcaba el split
+  2:1 sin ajustar, el error de ajuste más común); marcar `R > 0,5` o `R ≤ −0,45`.
+- **Justificación:** un split k:1 sin ajustar y su contrasplit tienen el mismo
+  `|ln|` (`ln k`): el umbral en logaritmos los trata igual.
+- **Fecha:** 2026-10-10
+
+### D15 — Resumen de validación con errores no bloqueantes
+- **Decisión:** el resumen dice «Datos aptos para el análisis…» solo si ninguna
+  incidencia tiene severidad error. Si el par no está bloqueado pero hay errores
+  (p. ej. precios ≤ 0 con spread en precios), dice «Datos utilizables con
+  incidencias: <cada error con símbolo y número de fechas>; además hay N
+  advertencia(s)…» y pide revisarlas antes de confiar en el análisis. Las
+  incidencias de los instrumentos ejecutables se añaden al informe y el resumen
+  las menciona (A2).
+- **Alternativas:** mantener «Datos aptos» y contar los errores como advertencias;
+  bloquear siempre que haya errores.
+- **Justificación:** el resumen no puede contradecir una incidencia marcada como
+  error. Bloquear el spread en precios con precios ≤ 0 iría más allá de la sección
+  2.3; lo que no se puede simular lo bloquea el análisis (S12).
+- **Fecha:** 2026-10-10
+
+### D16 — Logger de yfinance (complementa A9)
+- **Decisión:** al importar `yfinance`, el logger «yfinance» sube a ERROR (solo
+  se sube: si alguien lo fijó más alto se respeta), salvo que esté activo el modo
+  de depuración de yfinance (`yf.config.debug.logging`).
+- **Alternativas:** redirigir el logger a un archivo; nivel CRITICAL; no tocarlo.
+- **Justificación:** con `hide_exceptions = False` los fallos ya llegan como
+  excepciones que el laboratorio traduce; los avisos en inglés (p. ej. «Cookie
+  fetch from fc.yahoo.com failed») solo duplicaban información antes del mensaje
+  en español. El modo de depuración sigue disponible para diagnosticar.
+- **Fecha:** 2026-10-10
+
+### D17 — Calendario efectivo: todos los instrumentos usados (complementa D6 y A2)
+- **Decisión:** el tipo de calendario se determina con las clases de TODAS las
+  series usadas: las analizadas y las ejecutables. Cripto analizado con un
+  ejecutable de bolsa da calendario mixto: 252 periodos, unidad «día de
+  negociación», incidencia `DESFASE_CIERRE_CRIPTO` y aviso «Calendario efectivo
+  mixto». `PairAnalysis.calendar` y el calendario del informe de validación
+  reflejan ese calendario efectivo.
+- **Alternativas:** usar solo las series analizadas.
+- **Justificación:** tras alinear con un proxy de bolsa, los datos solo tienen días
+  hábiles; anualizar con 365 inflaba el Sharpe ≈ 20 % y rotulaba mal la unidad del
+  OU.
 - **Fecha:** 2026-10-10
 
 ## Estadística
@@ -136,7 +285,8 @@ el responsable del proyecto.
 
 ### E5 — Estabilidad: p-values por ventana sin ajustar
 - **Decisión:** ventanas de 252 con paso 63 dentro de formación, dirección fija;
-  los p-values por ventana no se ajustan.
+  los p-values por ventana no se ajustan. Una ventana no evaluable cuenta como
+  fallida (E10).
 - **Alternativas:** aplicar BH también por ventana.
 - **Justificación:** son un diagnóstico de estabilidad, no un descubrimiento. Con
   252 observaciones EG tiene poca potencia: muchos pares reales saldrán
@@ -169,11 +319,55 @@ el responsable del proyecto.
 
 ### E9 — Correlaciones por par sobre fechas comunes
 - **Decisión:** los log-rendimientos de cada par se calculan sobre la intersección
-  de fechas de sus precios; el número de observaciones se muestra por celda.
+  de fechas de sus precios; el número de observaciones se muestra por celda. Las
+  fechas duplicadas siguen la política de la validación (E11).
 - **Alternativas:** calcular rendimientos sobre el calendario propio de cada serie
   y luego alinear.
 - **Justificación:** en un par cripto + bolsa, el rendimiento cripto de viernes a
   lunes debe incluir el fin de semana para ser comparable con el de la bolsa.
+- **Fecha:** 2026-10-10
+
+### E10 — Ventanas de estabilidad no evaluables (complementa E5)
+- **Decisión:** una ventana donde Engle–Granger no se puede calcular (p. ej. una
+  serie constante en la ventana) o es colineal (estadístico −∞) queda con
+  `evaluable = False`, `passed = False` y su motivo: cuenta como fallida y la
+  primera razón de inestabilidad nombra sus fechas (hasta 3, más «y N más»). El
+  cambio de signo de β usa solo las ventanas con β. La exportación incluye
+  `evaluable` y `motivo` por ventana.
+- **Alternativas:** excluir la ventana del denominador; propagar el error (antes:
+  todo el par pasaba a ⛔ `CALCULO_NO_POSIBLE` con un mensaje engañoso).
+- **Justificación:** la estabilidad es un diagnóstico; una ventana no evaluable no
+  invalida el Engle–Granger de toda la formación, y un p = 0 por colinealidad no
+  es evidencia.
+- **Fecha:** 2026-10-10
+
+### E11 — Fechas duplicadas en las correlaciones (complementa E9)
+- **Decisión:** `mrlab.stats.correlation` aplica la misma política que la
+  validación (orden estable, conservar la última aparición de cada fecha y luego
+  descartar NaN). Una entrada sin índice de fechas da `DataError` y una ventana
+  móvil menor que 2 da `ConfigError VENTANA_INVALIDA`; nunca un `ValueError`
+  crudo de pandas.
+- **Alternativas:** lanzar `DataError` ante duplicados.
+- **Justificación:** la caché conserva los duplicados crudos a propósito y la
+  pestaña de correlaciones debe funcionar con la misma política que el resto del
+  análisis.
+- **Fecha:** 2026-10-10
+
+### E12 — Coherencia de `AnalysisConfig`
+- **Decisión:** `AnalysisConfig` lanza `ConfigError CONFIGURACION_ANALISIS_INVALIDA`
+  en español (al construirse y al cargar un `run_config.json`) si:
+  `stability_window < 2·(maxlag + 1) + 30` (56 con `maxlag = 12`; `2·(maxlag + 1)`
+  es el mínimo técnico de `coint` y 30 el margen para que la prueba y el OU por
+  ventana tengan sentido); `stability_step < 1`; `maxlag < 0`;
+  `min_train_obs < max(30, 2·(maxlag + 2) + 1)`; `max_fail_frac` fuera de [0, 1];
+  `half_life_min < 0` o `≥ half_life_max`; `correlation_min` fuera de [−1, 1];
+  horizontes de pronóstico vacíos o < 1; `forecast_level` fuera de (0, 1);
+  `fdr_method` distinto de `bh`/`by`. `alpha_level` y `fdr_q` conservan sus
+  restricciones.
+- **Alternativas:** dejar que fallen los cálculos (antes daba ⛔ «Datos
+  insuficientes» o excepciones crudas).
+- **Justificación:** un error de configuración no debe presentarse como falta de
+  datos.
 - **Fecha:** 2026-10-10
 
 ## Modelo OU
@@ -214,13 +408,37 @@ el responsable del proyecto.
 - **Fecha:** 2026-10-10
 
 ### O5 — Estrategia bloqueada si el OU no es válido; ilustrativa si el par no es ✅ (confirmada)
-- **Decisión:** sin un OU válido (b fuera de (0, 1)) no hay σ_eq ni z: la
-  estrategia queda bloqueada. Si el OU es válido pero el par no es ✅, el backtest
-  se permite con un banner rojo permanente «El par no superó los filtros:
-  resultado solo ilustrativo».
+- **Decisión:** sin un OU válido no hay σ_eq ni z: la estrategia queda
+  bloqueada. Si el OU es válido pero el par no es ✅, el backtest se permite con un
+  banner rojo permanente «El par no superó los filtros: resultado solo
+  ilustrativo».
+- **Actualización (2026-10-10):** «OU válido» significa `0 < b < 1` **y** que la
+  prueba de Dickey–Fuller del AR(1) rechace la raíz unitaria (O7). El banner
+  también se muestra si el par es ✅ pero tiene alguna razón de descarte, y cita
+  los motivos (O5a).
 - **Alternativas:** bloquear siempre que el par no sea ✅.
 - **Justificación:** ver fallar la estrategia en un par sin evidencia es
   pedagógicamente valioso, siempre que no pueda confundirse con evidencia.
+- **Fecha:** 2026-10-10
+
+### O5a — Resultado «solo ilustrativo» con sus motivos (complementa O5 y A1)
+- **Decisión:** `illustrative_only` = estado distinto de ✅ **o** cualquier razón
+  del panel «¿Por qué se descartó?» (vida media fuera de [1, 126], filtro de
+  correlación, costes que superan el PnL bruto, un segmento que no se pudo
+  simular, etc.). El banner «El par no superó los filtros: resultado solo
+  ilustrativo.» se completa con los motivos (`PairAnalysis.illustrative_reasons`
+  e `illustrative_banner`) y encabeza los avisos de cada backtest; el LEEME lo
+  muestra una sola vez. Las razones que solo se conocen al simular
+  (`COSTES_SUPERAN_BRUTO` en validación, `SIMULACION_NO_POSIBLE`) las añade el
+  runner con `add_discard_reasons`, que mantiene esta regla y actualiza el banner
+  de cada backtest ya simulado.
+- **Alternativas:** depender solo del estado; documentar que la vida media no
+  afecta al banner; dejar fuera del banner las razones que añade el runner.
+- **Justificación:** un par ✅ con vida media < 1 día se presentaba sin banner
+  mientras el panel de descartes decía «no operable», y un par con costes que
+  superan el PnL bruto se exportaba con `solo_ilustrativo = no` aunque el panel lo
+  descartaba. Eso contradice la sección 0: el resultado del backtest no puede
+  contradecir el panel de descartes.
 - **Fecha:** 2026-10-10
 
 ### O6 — Simulación: cruce de μ y vida media empírica
@@ -230,6 +448,53 @@ el responsable del proyecto.
 - **Alternativas:** puente browniano para detectar cruces entre observaciones.
 - **Justificación:** simple y explicable; la diferencia entre mediana del tiempo
   de cruce y vida media es en sí una lección.
+- **Fecha:** 2026-10-10
+
+### O7 — Validez del OU: 0 < b < 1 y Dickey–Fuller rechaza la raíz unitaria
+- **Decisión:** un ajuste OU solo es VÁLIDO si `0 < b̂ < 1` **y** la prueba de
+  Dickey–Fuller sobre el AR(1) (estadístico `(b̂ − 1)/EE(b̂)`, sin rezagos, con
+  constante) rechaza la raíz unitaria al nivel α (0,05 por defecto; en el análisis
+  del par, α = `alpha_level`). Valores críticos de MacKinnon: N = 1 para una serie
+  observada (valor por defecto de `fit_ou`) y N = 2 cuando el spread es el
+  RESIDUO de la regresión de cointegración estimada con los mismos datos (el
+  análisis del par, también en la estabilidad del OU por ventanas). Para 1/5/10 %
+  se usan los valores con corrección de muestra finita; para otros niveles, el
+  asintótico (invirtiendo `mackinnonp`). Si no se rechaza: estado
+  `NON_STATIONARY`, `valid = False`, `near_unit_root = True` (significa «0 < b̂ < 1
+  pero b̂ no se distingue de 1»), sin λ, μ, σ, σ_eq, vida media, EE(μ̂) ni bandas.
+  Se conservan a, b, el estadístico y el valor crítico, y el mensaje en español los
+  muestra. La razón de descarte `RAIZ_UNITARIA_CERCANA` desaparece: ahora es
+  `OU_NO_ESTACIONARIO`, que bloquea la estrategia. Sustituye la parte de A9 que
+  decía que `near_unit_root` es solo un aviso y precisa O5.
+- **Alternativas:** mantener solo `0 < b < 1` con un aviso (regla anterior); usar
+  siempre N = 1; decidir con el p-value asintótico.
+- **Justificación:** con la regla anterior un paseo aleatorio salía «válido» casi
+  siempre por el sesgo de Dickey–Fuller (MCO subestima b cuando b = 1). Simulación
+  con 900 observaciones (una formación de 1.500) y 2.000 repeticiones: un paseo
+  aleatorio observado tiene `0 < b̂ < 1` en el 95,3 % de los casos y la prueba con
+  N = 1 lo acepta en el 4,6 %; el residuo de MCO entre dos paseos aleatorios
+  independientes tiene `0 < b̂ < 1` en el 99,0 %, la tabla N = 1 lo acepta en el
+  13,8 % y la tabla N = 2 en el 4,6 % (≈ nominal). En el análisis completo de 200
+  pares de paseos independientes de 1.500 observaciones (verificación de la
+  revisión), con la regla anterior los 200 daban un OU válido (156 con el aviso de
+  raíz unitaria y 44 sin ningún aviso); con O7, 17 (8,5 %, algo más del 5 % porque
+  se elige la dirección de menor p-value). Además, la prueba obligatoria de la sección 14 dependía de una semilla
+  elegida. La sección 0/17 prohíbe sugerir reversión sin evidencia. Detalle en
+  MATEMATICAS §8.5.
+- **Fecha:** 2026-10-10
+
+### O8 — Series colineales y escala absoluta del spread
+- **Decisión:** si la dirección elegida de Engle–Granger tiene estadístico −∞
+  (series idénticas salvo escala), no se ajusta el OU (`OUFit` con estado
+  «datos insuficientes» y la explicación de colinealidad) y el par se descarta con
+  `SERIES_COLINEALES`, que bloquea la simulación. Además, `fit_ou` acepta `scale`
+  (en el análisis, la desviación de f(y) en formación) y devuelve «datos
+  insuficientes» si `std(spread) < 10⁻¹⁰·scale` (ruido de redondeo).
+- **Alternativas:** solo la comprobación relativa existente (s² frente a la
+  varianza de X); bloquear en la validación de datos.
+- **Justificación:** el OU salía válido con σ_eq ≈ 10⁻¹⁶ y el backtest operaba
+  ruido de redondeo. Nota: dos ETF casi idénticos (R² ≥ 1 − 1,5·10⁻⁶ en formación)
+  también quedan bloqueados, con la explicación.
 - **Fecha:** 2026-10-10
 
 ## Estrategia y backtest
@@ -323,6 +588,56 @@ el responsable del proyecto.
 - **Alternativas:** solo un aviso en la sesión del navegador.
 - **Justificación:** la marca debe sobrevivir a recargas y viajar con los resultados.
 - **Fecha:** 2026-10-10
+- **Nota:** el registro persistente en `data/studies/` llega en la fase 2; la
+  versión mínima de la fase 1 es S10a.
+
+### S10a — Prueba contaminada en la fase 1 (complementa S10)
+- **Decisión:** `RunConfig.test_history` guarda los `config_hash` con los que se
+  ha simulado la prueba (fuera del hash). Al simularla con hash h: contaminada =
+  el historial contiene algún hash distinto de h. La marca es permanente: volver a
+  la configuración original no la quita mientras el historial la conserve. h se
+  añade si no estaba. Si la prueba no se simula: `test_contaminated = None` («no
+  aplica») y el historial se conserva. El LEEME, `pruebas_estadisticas.csv`
+  (sección `prueba`) y la demo dicen «SÍ», «no (según el historial registrado en
+  run_config.json…)» o «no aplica», con una nota de alcance; en la demo, el título
+  del bloque de prueba pasa a «Prueba (CONTAMINADA…)».
+- **Alternativas:** no afirmar nada («no verificado») hasta la fase 2; la regla
+  literal «h no está en el historial» (permitiría volver a la configuración
+  original sin marca).
+- **Justificación:** la exportación decía «Prueba contaminada: no.» sin
+  verificarlo, aunque la prueba se hubiera re-ejecutado con otros umbrales. El
+  historial viaja con la configuración y detecta el caso real reproducido con la
+  demo (editar los umbrales del `run_config.json` y volver a ejecutar). Se declara
+  su límite: si se borra el historial a mano, no se detecta.
+- **Fecha:** 2026-10-10
+
+### S11 — Avisos del motor: corto de cripto spot y capital agotado
+- **Decisión:** (1) si alguna operación deja corta una pierna de clase cripto, el
+  backtest avisa que el corto de cripto spot requiere derivados (perpetuos con
+  funding), fuera de la v1, y que el préstamo cobrado es una aproximación; se
+  nombran los símbolos y el aviso llega al LEEME. (2) El aviso «El capital del par
+  se agotó durante el segmento» se da si cualquier cierre del diario tiene capital
+  ≤ 0, y en el último cierre se registra también el evento `capital_agotado` (sin
+  orden).
+- **Alternativas:** (1) bloquear los cortos de cripto; (2) avisar solo cuando
+  exista el evento.
+- **Justificación:** secciones 2.2 y 7.4; antes se simulaban cortos de cripto sin
+  ningún aviso, y el capital podía terminar negativo sin aviso si se agotaba en el
+  último cierre.
+- **Fecha:** 2026-10-10
+
+### S12 — Precios ejecutables no positivos
+- **Decisión:** si algún precio EJECUTABLE (la propia serie con spread en precios,
+  o el proxy) es ≤ 0 en formación, validación o prueba, el par recibe la razón de
+  descarte `PRECIO_EJECUTABLE_NO_POSITIVO`, con el instrumento, el tramo y la
+  primera fecha: la simulación queda bloqueada y el análisis se muestra. Con
+  proxy, esas fechas ya no se excluyen del análisis.
+- **Alternativas:** capturar el error del motor por segmento (se mantiene como
+  defensa adicional, A10); excluir esas fechas.
+- **Justificación:** el dimensionamiento (cantidad = nocional / precio) y la
+  valoración necesitan precios positivos; antes `run_pair` abortaba y se perdía
+  todo el análisis (caso WTI de abril de 2020).
+- **Fecha:** 2026-10-10
 
 ## Costes y métricas
 
@@ -358,6 +673,18 @@ el responsable del proyecto.
   definido». Costes como % del PnL bruto: «no aplica» si el bruto ≤ 0.
 - **Alternativas:** Sharpe solo sobre días con posición.
 - **Justificación:** refleja el rendimiento del capital asignado al par.
+- **Fecha:** 2026-10-10
+
+### C5 — Rangos razonables de costes
+- **Decisión:** `CostParams` exige comisión y slippage en [0, 1.000] pb (hasta
+  10 % por pierna), tasas anuales de préstamo y financiación en [0, 1] (fracción
+  anual) y `day_count` en (0, 366]. Fuera de rango → `ConfigError COSTES_INVALIDOS`
+  en español, con el campo, el rango y el valor recibido; si una tasa parece un
+  porcentaje (1 < x ≤ 100), sugiere dividir por 100.
+- **Alternativas:** solo `day_count > 0`; `day_count ∈ {360, 365}`.
+- **Justificación:** un `run_config.json` editado a mano llegaba a una división por
+  cero (`day_count = 0`) o convertía préstamo y financiación en ingresos
+  (`day_count < 0`); escribir 3 en lugar de 0,03 es un error habitual.
 - **Fecha:** 2026-10-10
 
 ## Ranking y cartera (fases 4 y 5)
@@ -426,11 +753,31 @@ el responsable del proyecto.
 
 ### I5 — Identidad de la configuración
 - **Decisión:** `config_hash` = sha256 del JSON canónico del `RunConfig` sin
-  `config_hash` ni `code_version`. La versión del código (hash de git, `-dirty` si
-  hay cambios; variable `GIT_COMMIT` en Docker) se registra aparte.
+  `config_hash`, `code_version`, `series` ni `test_history` (I5a). La versión del
+  código (hash de git, `-dirty` si hay cambios; variable `GIT_COMMIT` en Docker)
+  se registra aparte.
 - **Alternativas:** incluir la versión del código en el hash.
 - **Justificación:** la misma configuración debe identificarse igual aunque cambie
   el código; la versión se audita por separado.
+- **Fecha:** 2026-10-10
+
+### I5a — Qué identifica la configuración (modifica I5)
+- **Decisión:** `config_hash` excluye `config_hash`, `code_version`, `series` y
+  `test_history` (`HASH_EXCLUDED`). `series` se excluye entero porque solo
+  describe los datos (fecha de lectura, cobertura, notas) y las referencias
+  fijadas por `snapshot_id` en `pair` ya identifican el contenido; `test_history`
+  es un registro de ejecuciones, no un parámetro. `include_test` y `seeds` sí
+  forman parte del hash (A3a, A3b). Versión de esquema 2: los archivos de la
+  versión 1 se verifican con la definición de entonces (el JSON tal como se
+  guardó, sin `config_hash` ni `code_version`) y se devuelven actualizados a la
+  versión 2 con su hash nuevo; si no coinciden, se rechazan como cualquier
+  archivo editado.
+- **Alternativas:** excluir solo `retrieved_at`; no subir la versión (los
+  archivos antiguos se rechazarían diciendo que «se modificaron»); aceptar los v1
+  sin verificar.
+- **Justificación:** los mismos CSV registrados en momentos distintos daban otro
+  hash, y eso habría disparado en falso la marca de prueba contaminada (S10a).
+  Subir la versión evita un mensaje engañoso con los archivos ya exportados.
 - **Fecha:** 2026-10-10
 
 ### I6 — Windows, idioma, puertos
@@ -443,42 +790,78 @@ el responsable del proyecto.
   directos son transparentes.
 - **Fecha:** 2026-10-10
 
+### I7 — Settings como valores por defecto de los proveedores
+- **Decisión:** `ProviderRegistry.from_toml` pasa a cada clase de proveedor que
+  define `defaults_from_settings(settings)` esas opciones como valores por
+  defecto; las claves de `providers.toml` mandan. `YahooProvider` toma
+  `yahoo_max_retries` y `yahoo_backoff_base_seconds` de `mrlab.config.get_settings()`
+  (variables `MRLAB_YAHOO_MAX_RETRIES` y `MRLAB_YAHOO_BACKOFF_BASE_SECONDS`) y
+  valida esas opciones (entero ≥ 0; números ≥ 0 finitos) con `ConfigError` en
+  español.
+- **Alternativas:** leer Settings dentro de `YahooProvider`; un caso especial por
+  nombre de proveedor en el registro.
+- **Justificación:** mantiene el proveedor inyectable en pruebas y extensible a
+  otros proveedores (p. ej. una clave de API); el TOML sigue siendo la
+  configuración explícita. Antes `max_retries = -1` terminaba en un
+  `AssertionError`.
+- **Fecha:** 2026-10-10
+
 ## Integración de la fase 1
 
 ### A1 — Causas del estado y razones de descarte
 - **Decisión:** `causes` contiene TODAS las causas activas del estado principal,
   ordenadas por la precedencia E6; si no hay ninguna, el estado es ✅ y lleva una
   única causa con el p-value ajustado de Engle–Granger. La validez del OU no es
-  un estado: un OU no válido (b fuera de (0, 1)) bloquea la estrategia y aparece
-  en «¿Por qué se descartó?» sin cambiar el estado. Lo mismo para la vida media
-  fuera de [1, 126], b indistinguible de 1 (`near_unit_root`), el filtro de
-  correlación y «costes superan el PnL bruto» en validación. Un error de datos
-  durante los cálculos (p. ej. una serie constante en formación) da ⛔ con la
-  causa `CALCULO_NO_POSIBLE`.
-- **Alternativas:** convertir el OU no válido en un sexto estado; mostrar solo la
-  causa que decide el estado.
+  un estado: un OU no válido (O7: b fuera de (0, 1) o b que no se distingue de 1
+  según Dickey–Fuller, `OU_NO_ESTACIONARIO`) aparece en «¿Por qué se descartó?»
+  sin cambiar el estado. Lo mismo para la vida media fuera de [1, 126], el filtro
+  de correlación, «costes superan el PnL bruto» en validación y un segmento que no
+  se pudo simular (A10). Bloquean la simulación, sin cambiar el estado, las
+  razones de `STRATEGY_BLOCKING_CODES`: OU no válido (`OU_NO_ESTACIONARIO`,
+  `OU_B_NO_POSITIVO`, `OU_DATOS_INSUFICIENTES`), `SERIES_COLINEALES`,
+  `PROXY_REQUERIDO`, `PROXY_NO_EJECUTABLE` y `PRECIO_EJECUTABLE_NO_POSITIVO`.
+  `strategy_allowed` = no ⛔, OU válido y ninguna de esas razones. Cualquier razón
+  de descarte hace el resultado solo ilustrativo (O5a). Un error de datos durante
+  los cálculos (p. ej. una serie constante en formación) da ⛔ con la causa
+  `CALCULO_NO_POSIBLE`; una ventana de estabilidad no evaluable no (E10).
+- **Alternativas:** convertir el OU no válido (o las razones que bloquean la
+  simulación) en estados; mostrar solo la causa que decide el estado.
 - **Justificación:** la especificación fija exactamente cinco estados y pide
   listar todas las causas; separar estado (evidencia estadística) y descartes
   (aptitud para operar) es más claro para el alumno.
 - **Fecha:** 2026-10-10
 
-### A2 — Proxy ejecutable: alineación por intersección
+### A2 — Proxy ejecutable: requerido, alineado por intersección y validado (actualizada)
 - **Decisión:** con `exec_a`/`exec_b`, el análisis y el backtest usan solo las
   fechas en que cotizan también los instrumentos ejecutables (nunca se rellena) y
   se avisa cuántas fechas se excluyeron y del riesgo de base. El proxy debe estar
-  en la misma moneda que la serie analizada (si no, ⛔). Sin proxy, un índice o
-  futuro se opera sobre su propia serie con un aviso que sugiere el proxy.
-- **Alternativas:** reindexar el proxy y rellenar huecos; bloquear índices sin proxy.
-- **Justificación:** coherente con D1 y D6 (nunca sustituir en silencio, nunca
-  rellenar); el aviso mantiene el valor pedagógico del modo (b) de D1.
+  en la misma moneda que la serie analizada (si no, ⛔; si su moneda es
+  desconocida, ⛔ `MONEDA_DESCONOCIDA`). Además (2026-10-10):
+  (a) una pierna no ejecutable (índice o futuro) sin proxy recibe la razón de
+  descarte `PROXY_REQUERIDO`, que sugiere el proxy sin sustituirlo y bloquea la
+  simulación; el análisis estadístico se muestra completo. Si el instrumento
+  elegido como ejecutable tampoco es ejecutable: `PROXY_NO_EJECUTABLE`.
+  (b) Las incidencias de la limpieza del proxy (duplicados, faltantes, saltos,
+  huecos, precios ≤ 0) se añaden al informe de validación con su símbolo y la
+  etiqueta «Instrumento ejecutable», y el resumen las menciona.
+  (c) Las fechas con precio del proxy ≤ 0 ya no se excluyen: bloquean la
+  simulación (S12).
+  (d) El calendario se decide con todos los instrumentos (D17).
+- **Alternativas:** operar el índice sobre su propia serie con un aviso (versión
+  anterior de esta decisión); reindexar el proxy y rellenar huecos; excluir las
+  fechas con precio ≤ 0.
+- **Justificación:** D1 confirmada exige ejecutar con un proxy elegido
+  explícitamente: un índice no se puede comprar ni vender, así que simularlo como
+  si se pudiera presentaba un PnL imposible. Las incidencias del proxy alimentan el
+  PnL y deben verse. Coherente con D6 (nunca rellenar).
 - **Fecha:** 2026-10-10
 
 ### A3 — `run_config.json` autosuficiente
 - **Decisión:** `run_pair` devuelve el RunConfig completado: cada referencia
   queda fijada a la instantánea usada (`snapshot_id`, conservando las fechas
   pedidas), `frozen_split`, `series`, `data_origin` según los datos (SINTETICO si
-  alguna serie lo es, aunque la configuración dijera otra cosa), `code_version` y
-  `config_hash`. Sin `snapshot_id` la referencia debe traer `start` y `end`. Una
+  alguna serie lo es, aunque la configuración dijera otra cosa), `include_test`
+  (A3a), `seeds` (A3b), `test_history` (S10a), `code_version` y `config_hash`. Sin `snapshot_id` la referencia debe traer `start` y `end`. Una
   instantánea cuyo proveedor o símbolo no coincide con la referencia se rechaza.
   Un `run_config.json` escrito a mano sin `config_hash` se acepta y se le calcula;
   uno con hash que no coincide se rechaza.
@@ -486,6 +869,44 @@ el responsable del proyecto.
   datos en cada ejecución.
 - **Justificación:** guardar, cargar y volver a ejecutar debe dar los mismos
   bytes sin tocar el proveedor (D7, sección 15).
+- **Fecha:** 2026-10-10
+
+### A3a — `include_test` en el RunConfig
+- **Decisión:** `RunConfig.include_test` forma parte del hash. En
+  `run_pair(config, data, include_test=None)` el argumento solo puede ACTIVAR la
+  prueba; con None o False manda la configuración. El valor efectivo queda en el
+  RunConfig devuelto.
+- **Alternativas:** que un False explícito desactive la prueba aunque la
+  configuración la incluya; guardar `include_test` fuera del hash.
+- **Justificación:** reproducir un `run_config.json` que incluía la prueba debe dar
+  los mismos bytes aunque se omita `--incluir-prueba` (la orden «Para reproducir»
+  de la demo no la lleva). Ejecutar o no la prueba cambia el resultado, así que
+  debe cambiar la identidad.
+- **Fecha:** 2026-10-10
+
+### A3b — Semillas en `run_config.json`
+- **Decisión:** `run_pair` rellena `RunConfig.seeds` con las semillas de la
+  configuración más `{símbolo: SeriesMeta.seed}` de cada serie generada (el valor
+  de la serie prevalece en la misma clave; claves ordenadas); forma parte del
+  hash. El proveedor sintético y el CSV (campo `seed` del `.meta.json`) rellenan
+  `SeriesMeta.seed`.
+- **Alternativas:** reemplazar en lugar de fusionar; dejar la semilla solo en la
+  nota de la fuente.
+- **Justificación:** la sección 15 pide registrar las semillas (antes `seeds`
+  estaba siempre vacío). Fusionar conserva semillas de otros usos (p. ej.
+  bootstrap o simulación en fases futuras).
+- **Fecha:** 2026-10-10
+
+### A3c — Errores de formato de `run_config.json` en español
+- **Decisión:** `load_run_config` traduce los tipos de error de pydantic más
+  comunes a texto propio: «<ruta.del.campo>» <problema> (recibido: <valor>),
+  hasta 5 y «y N problema(s) más». `details["errores"]` lleva lo mismo
+  estructurado. Los errores de coherencia de los validadores
+  (`UMBRALES_INCONSISTENTES`, `COSTES_INVALIDOS`, `CONFIGURACION_ANALISIS_INVALIDA`)
+  conservan su código y nombran el archivo.
+- **Alternativas:** mostrar solo la ruta del campo, sin el problema.
+- **Justificación:** el usuario no debe ver textos de pydantic en inglés; la ruta
+  y el valor bastan para corregir el archivo.
 - **Fecha:** 2026-10-10
 
 ### A4 — Formato de la exportación
@@ -496,6 +917,11 @@ el responsable del proyecto.
   descartes y métricas por segmento. Booleanos «sí»/«no»; fracciones como
   fracción; `-0` se escribe `0`. La opción «CSV para Excel en español» añade el
   BOM de UTF-8. El ZIP fija fecha, sistema de origen y permisos de cada entrada.
+  Todos los campos llevan nombre en español, también los nuevos del OU
+  (`valor_critico_dickey_fuller`, `nivel_dickey_fuller`,
+  `valores_criticos_residuo_estimado`); las ventanas de estabilidad incluyen
+  `evaluable` y `motivo` (E10), y la sección `prueba` dice si la prueba se pidió,
+  si se ejecutó y si está contaminada (S10a).
 - **Alternativas:** prefijo solo en los CSV; una columna por prueba.
 - **Justificación:** la marca de datos sintéticos debe viajar con cualquier
   archivo suelto (D5); sin BOM, Excel en Windows no muestra bien las tildes; un
@@ -520,15 +946,38 @@ el responsable del proyecto.
 - **Justificación:** usa solo información pasada y no desperdicia datos.
 - **Fecha:** 2026-10-10
 
-### A7 — Demo reproducible
+### A7 — Demo reproducible (actualizada)
 - **Decisión:** `examples/demo_ko_pep.py` lee los metadatos de `<archivo>.meta.json`
   si existe (lo crean `make fetch-example` y el generador sintético); si no, exige
   `--currency`, `--asset-class` y `--price-type` (D4). Usa la caché `data/cache`
   (o `--cache-dir`), ejecuta la prueba solo con `--incluir-prueba` y admite
-  `--reproducir <run_config.json>` (solo caché, nunca descarga).
-- **Alternativas:** caché temporal en cada ejecución.
+  `--reproducir <run_config.json>` (solo caché, nunca descarga). Además
+  (2026-10-10):
+  - `--exec-a`/`--exec-b`: CSV del instrumento ejecutable de cada pierna (índices
+    y futuros), con su `.meta.json` o con `--asset-class-exec-a`, etc. Los
+    ejecutables heredan la moneda y el tipo de precio generales, pero su clase de
+    activo debe declararse aparte (suele diferir: índice frente a ETF). Sin proxy,
+    la demo muestra el análisis y explica el bloqueo `PROXY_REQUERIDO`.
+  - Metadatos con `parse_metadata`/`build_metadata`; registra cada CSV con su
+    nombre original (D10) y avisa si los datos se tratan como SINTÉTICOS (por la
+    columna `tipo_datos` o por el prefijo `SINTETICO_`, detectado con
+    `origin_from_filename`).
+  - Errores siempre en español y sin trazas de Python (código de salida 2),
+    también los de argparse (traducidos) y los de archivos.
+  - `--reproducir` respeta `include_test` del `run_config.json` y no admite
+    `--csv-*`, `--exec-*`, `--start` ni `--end`. La orden «Para reproducir» que
+    imprime incluye `--cache-dir` y `--excel-es` si se usaron: reproduce los mismos
+    archivos byte a byte (comprobado por una prueba, también con la prueba
+    incluida y con proxy).
+  - Muestra la marca «Prueba contaminada» con el texto de la exportación (S10a), el
+    banner «solo ilustrativo» con sus motivos una sola vez (O5a) y, en el OU, el
+    resultado de Dickey–Fuller frente a su valor crítico (O7).
+- **Alternativas:** caché temporal en cada ejecución; heredar también la clase de
+  activo en los ejecutables; imprimir la orden de reproducción sin las opciones de
+  caché y formato.
 - **Justificación:** con una caché persistente el `run_config.json` exportado se
-  puede reproducir más tarde.
+  puede reproducir más tarde; la orden impresa debe reproducir exactamente lo
+  mismo (antes, con `--excel-es` o una caché propia, no lo hacía).
 - **Fecha:** 2026-10-10
 
 ### A8 — Umbral de evidencia y q de la FDR
@@ -544,17 +993,23 @@ el responsable del proyecto.
   - Yahoo: `yfinance` configurado para LANZAR sus errores
     (`hide_exceptions = False`); si no, un fallo de red llega como tabla vacía y
     se confundiría con «símbolo sin datos». `max_retries` son reintentos tras el
-    primer intento: con 4, hasta 5 llamadas y esperas de 1, 2, 4 y 8 s (D3).
+    primer intento: con 4, hasta 5 llamadas y esperas de 1, 2, 4 y 8 s (D3). Los
+    avisos de logging de yfinance se silencian (D16); los valores por defecto
+    salen de Settings (I7).
   - Caché: el hash de la instantánea combina el contenido con la identidad de la
     serie (activo, moneda, tipo de precio, intervalo y rango pedido); la fecha de
-    descarga no entra en el hash.
+    descarga no entra en el hash. El id se verifica al leer (D12).
   - CSV: se relee en cada carga (el usuario puede subir un archivo corregido con
     el mismo símbolo; cada versión queda como instantánea propia); si no es UTF-8
-    válido se interpreta como Windows-1252 (Excel en español).
-  - OU: `near_unit_root` (Dickey–Fuller al 5 % con constante) es solo un aviso;
-    la validez sigue siendo 0 < b < 1 (O5). Spread constante o determinista →
-    `INSUFFICIENT`. Con NaN en el spread solo se usan pares consecutivos finitos.
-    Ljung–Box con `model_df=1`. Simulación con horizonte máximo de 2.520 pasos.
+    válido se interpreta como Windows-1252 (Excel en español). La columna
+    opcional `tipo_datos` y el prefijo `SINTETICO_` del nombre marcan los datos
+    como sintéticos (D10).
+  - OU: `near_unit_root` (b̂ entre 0 y 1 pero indistinguible de 1 según
+    Dickey–Fuller) hace el ajuste NO válido (O7; antes era solo un aviso). Spread
+    constante, determinista o nulo frente a la escala de las series →
+    `INSUFFICIENT` (O8). Con NaN en el spread solo se usan pares consecutivos
+    finitos. Ljung–Box con `model_df=1`. Simulación con horizonte máximo de 2.520
+    pasos.
   - Backtest: salida forzada (`ExitReason.FORCED`, máxima prioridad, sin
     enfriamiento ni rearme) si el capital se agota con posición abierta o si una
     reducción de apalancamiento con unidades enteras dejaría una pierna en 0. La
@@ -563,4 +1018,33 @@ el responsable del proyecto.
 - **Alternativas:** documentarlas solo en los docstrings.
 - **Justificación:** son decisiones no especificadas que afectan resultados o
   mensajes; deben quedar auditables en un único lugar.
+- **Fecha:** 2026-10-10
+
+### A10 — Un segmento que no se puede simular no tumba el análisis
+- **Decisión:** si el motor rechaza un segmento con un `LabError`, `run_pair` no
+  simula ese segmento. La causa va a `discard_reasons` (`SIMULACION_NO_POSIBLE`),
+  a `RunResult.segment_errors` y a la sección SEGMENTOS del LEEME; los demás
+  segmentos y el análisis se conservan, y el resultado pasa a ser solo
+  ilustrativo (O5a). Los errores que no son `LabError` (defectos de programación)
+  se propagan.
+- **Alternativas:** abortar toda la ejecución.
+- **Justificación:** defensa en profundidad del hallazgo «spread en precios con
+  precio ≤ 0» (el análisis además bloquea la estrategia con precios ejecutables
+  ≤ 0, S12); perder la validación y la exportación por un segmento es
+  desproporcionado.
+- **Fecha:** 2026-10-10
+
+### A11 — Integración de las correcciones de la revisión
+- **Decisión:** las correcciones de la revisión adversarial de la fase 1 se
+  integraron con estas reglas de convivencia: (1) las razones de descarte que el
+  runner conoce al simular se registran con `add_discard_reasons` para que
+  `illustrative_only`, el banner y la exportación no se contradigan (O5a); (2) la
+  exportación traduce todos los campos nuevos (A4); (3) los ejemplos usan las
+  funciones nuevas del núcleo (`parse_metadata`, `build_metadata`,
+  `origin_from_filename`, `register(..., filename=...)`) y el generador escribe
+  `tipo_datos` y `seed` (D9, D10).
+- **Alternativas:** dejar cada corrección aislada en su módulo.
+- **Justificación:** varias correcciones cambiaban contratos compartidos (OU,
+  descartes, RunConfig); sin integrarlas, la exportación decía
+  `solo_ilustrativo = no` con razones de descarte y exportaba campos en inglés.
 - **Fecha:** 2026-10-10

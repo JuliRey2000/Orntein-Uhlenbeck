@@ -9,8 +9,10 @@ import pandas as pd
 import pytest
 from scipy.stats import norm
 from statsmodels.regression.linear_model import OLS
+from statsmodels.tsa.adfvalues import mackinnoncrit, mackinnonp
 
 from mrlab.domain.errors import ConfigError, ModelError
+from mrlab.domain.models import SpreadType
 from mrlab.model.ou import (
     MAX_SIM_PATHS,
     MIN_OBS_OU,
@@ -19,6 +21,7 @@ from mrlab.model.ou import (
     OUStatus,
     conditional_mean,
     conditional_variance,
+    dickey_fuller_critical_value,
     fit_ou,
     forecast,
     rolling_zscore,
@@ -26,6 +29,7 @@ from mrlab.model.ou import (
     simulate_paths_summary,
     zscore,
 )
+from mrlab.model.spread import compute_spread, fit_hedge_ratio
 
 OU_PARAMS = ("lam", "mu", "sigma", "sigma_eq", "half_life", "mu_se")
 
@@ -69,6 +73,9 @@ def test_recovers_parameters_seed_42():
     assert fit.mu_se == pytest.approx(0.089 * sigma_eq, rel=0.15)
     assert fit.nobs == 5000
     assert fit.warnings == [] and not fit.near_unit_root
+    # Decisión O7: la validez exige que Dickey–Fuller rechace la raíz unitaria (t ≈ −11).
+    assert fit.df_stat < -10 and fit.df_stat <= fit.df_crit
+    assert "rechaza la raíz unitaria" in fit.message
 
 
 def test_mu_interval_coverage_and_lambda_bias_over_many_seeds():
@@ -125,32 +132,144 @@ def _assert_no_ou_numbers(fit: OUFit) -> None:
         assert getattr(fit, name) is None, name
 
 
+def _walk(seed: int, n: int = 1000) -> np.ndarray:
+    return np.cumsum(np.random.default_rng(seed).standard_normal(n))
+
+
+def _ols_residual(y: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """Residuo de la MCO y = α + β·x (como el spread de formación del pipeline)."""
+    design = np.column_stack([np.ones(x.size), x])
+    return y - design @ np.linalg.lstsq(design, y, rcond=None)[0]
+
+
 def test_random_walk_is_non_stationary_without_half_life():
-    # Con esta semilla el paseo aleatorio da b̂ ≥ 1. Ojo: por el sesgo de Dickey–Fuller,
-    # en ≈ 95 % de los paseos aleatorios b̂ < 1 (ver la prueba siguiente).
-    walk = np.cumsum(np.random.default_rng(0).standard_normal(1000))
-    fit = fit_ou(walk)
-    assert fit.b >= 1  # guarda: la prueba solo tiene sentido si b̂ ≥ 1
+    # Semilla 42: b̂ < 1 (sesgo de Dickey–Fuller). Con la regla anterior (solo 0 < b < 1)
+    # este paseo aleatorio salía «válido», con vida media; la decisión O7 exige además que
+    # Dickey–Fuller rechace la raíz unitaria.
+    fit = fit_ou(_walk(42))
+    assert 0 < fit.b < 1
 
     assert fit.status == OUStatus.NON_STATIONARY
     _assert_no_ou_numbers(fit)
+    assert fit.near_unit_root
     assert NOT_OU_MESSAGE.lower() in fit.message.lower()
-    assert fit.a is not None and fit.nobs == 999  # la regresión sí se informa
+    assert "no se puede distinguir el spread de un paseo aleatorio" in fit.message
+    # La regresión y la prueba sí se informan: b, el estadístico y el valor crítico.
+    assert fit.a is not None and fit.nobs == 999
+    assert fit.df_stat > fit.df_crit
+    assert fit.df_crit == pytest.approx(mackinnoncrit(N=1, regression="c", nobs=999)[1])
+    for number in (fit.b, fit.df_stat, fit.df_crit):
+        decimals = 4 if number == fit.b else 2
+        assert f"{number:.{decimals}f}".replace(".", ",") in fit.message
+    assert fit.warnings == []
 
 
-def test_random_walks_with_b_below_one_are_flagged_near_unit_root():
-    """El criterio b ≥ 1 casi nunca detecta un paseo aleatorio (b̂ está sesgado hacia abajo):
-    por eso un ajuste 'válido' cuyo b̂ no se distingue de 1 lleva ``near_unit_root``."""
-    flagged, b_below_one = 0, 0
+def test_random_walk_with_b_at_least_one_is_non_stationary():
+    fit = fit_ou(_walk(0))
+    assert fit.b >= 1
+    assert fit.status == OUStatus.NON_STATIONARY
+    _assert_no_ou_numbers(fit)
+    assert not fit.near_unit_root  # la causa es b ≥ 1, no la prueba de raíz unitaria
+    assert "≥ 1" in fit.message
+
+
+def test_random_walks_are_non_stationary_in_90_percent_of_seeds():
+    """Sección 14 («random walk → no estacionario y sin vida media»), robusta a la semilla."""
+    non_stationary = 0
+    for seed in range(100):
+        fit = fit_ou(_walk(seed))
+        if fit.status == OUStatus.NON_STATIONARY:
+            non_stationary += 1
+            _assert_no_ou_numbers(fit)
+        if fit.near_unit_root:  # «b no se distingue de 1» implica ajuste no válido
+            assert not fit.valid and fit.status == OUStatus.NON_STATIONARY
+        assert fit.valid == (0 < fit.b < 1 and fit.df_stat <= fit.df_crit)
+    assert non_stationary >= 90
+
+
+def test_unit_root_test_uses_residual_critical_values_for_estimated_spreads():
+    """Con el residuo de una MCO estimada hay que usar los valores críticos N = 2 (Engle–Granger):
+    con N = 1, dos paseos aleatorios independientes parecen «revertir» con demasiada frecuencia."""
+    valid_n1 = valid_n2 = 0
     for seed in range(200):
-        fit = fit_ou(np.cumsum(np.random.default_rng(seed).standard_normal(1000)))
-        b_below_one += fit.b < 1
-        flagged += (not fit.valid) or fit.near_unit_root
-        if fit.near_unit_root:
-            assert any("no se distingue de un paseo aleatorio" in w for w in fit.warnings)
-            assert "no hay evidencia" in fit.message
-    assert b_below_one / 200 > 0.85  # el sesgo existe…
-    assert flagged / 200 >= 0.85  # …y la gran mayoría queda marcada igualmente
+        rng = np.random.default_rng(seed)
+        y, x = np.cumsum(rng.standard_normal(1000)), np.cumsum(rng.standard_normal(1000))
+        spread = _ols_residual(y, x)
+        as_observed = fit_ou(spread)
+        as_residual = fit_ou(spread, estimated_residual=True)
+        valid_n1 += as_observed.valid
+        valid_n2 += as_residual.valid
+        assert as_residual.df_estimated_residual and not as_observed.df_estimated_residual
+        assert as_residual.df_stat == as_observed.df_stat
+        assert as_residual.df_crit < as_observed.df_crit  # N = 2 es más exigente
+    assert valid_n2 / 200 <= 0.10  # tamaño nominal del 5 %
+    assert valid_n1 / 200 >= 0.15  # el valor crítico de una serie observada no sirve aquí
+
+
+def test_seed_where_only_residual_critical_value_detects_the_random_walk():
+    rng = np.random.default_rng(1007)
+    y, x = np.cumsum(rng.normal(0, 0.01, 1500)), np.cumsum(rng.normal(0, 0.01, 1500))
+    spread = _ols_residual(y[:900], x[:900])
+    observed, residual = fit_ou(spread), fit_ou(spread, estimated_residual=True)
+    assert residual.df_crit < residual.df_stat < observed.df_crit
+    assert observed.valid
+    assert residual.status == OUStatus.NON_STATIONARY and residual.near_unit_root
+    _assert_no_ou_numbers(residual)
+    assert "Engle–Granger" in residual.message and "residuo" in residual.message
+
+
+def test_dickey_fuller_critical_values():
+    for estimated, n_vars in ((False, 1), (True, 2)):
+        table = mackinnoncrit(N=n_vars, regression="c", nobs=899)
+        for level, crit in zip((0.01, 0.05, 0.10), table, strict=True):
+            assert dickey_fuller_critical_value(level, 899, estimated_residual=estimated) == crit
+        # Otros niveles: valor asintótico coherente con los p-values de MacKinnon.
+        c25 = dickey_fuller_critical_value(0.025, 899, estimated_residual=estimated)
+        assert table[0] < c25 < table[1]
+        assert mackinnonp(c25, regression="c", N=n_vars) == pytest.approx(0.025, abs=1e-6)
+    for bad in (0.0, 1.0, -0.1, float("nan")):
+        with pytest.raises(ConfigError):
+            dickey_fuller_critical_value(bad, 899)
+        with pytest.raises(ConfigError):
+            fit_ou(_walk(1), unit_root_alpha=bad)
+
+
+def test_unit_root_alpha_moves_the_decision():
+    # AR(1) con b cercano a 1: rechaza al 10 % pero no al 1 %.
+    x = _ar1(0.985, 1000, seed=5)
+    loose, strict = fit_ou(x, unit_root_alpha=0.10), fit_ou(x, unit_root_alpha=0.01)
+    assert loose.df_stat == strict.df_stat
+    assert strict.df_crit < loose.df_stat <= loose.df_crit
+    assert loose.valid and loose.df_alpha == 0.10
+    assert strict.status == OUStatus.NON_STATIONARY and strict.near_unit_root
+    assert "al 1 %" in strict.message
+
+
+def test_scale_detects_rounding_noise_of_identical_legs():
+    """Misma serie en las dos piernas: el spread es ruido de coma flotante (~1e-16)."""
+    log_p = pd.Series(
+        np.log(50.0) + np.cumsum(np.random.default_rng(5).normal(0, 0.012, 900)),
+        index=pd.bdate_range("2015-01-01", periods=900, name="date"),
+    )
+    prices = np.exp(log_p)
+    hedge = fit_hedge_ratio(prices, prices, SpreadType.LOG, "KO", "KO")
+    spread = compute_spread(prices, prices, hedge)
+    assert float(spread.std()) < 1e-12
+
+    unscaled = fit_ou(spread, estimated_residual=True)
+    assert unscaled.valid  # sin escala absoluta no se distingue del ruido (el defecto original)
+    scale = float(np.std(np.log(prices)))
+    fit = fit_ou(spread, estimated_residual=True, scale=scale)
+    assert fit.status == OUStatus.INSUFFICIENT
+    _assert_no_ou_numbers(fit)
+    assert "ruido de redondeo" in fit.message
+
+    # Un spread real no se ve afectado por la escala.
+    ou = simulate_ou_exact(0.1, 0.0, 0.01, 0.0, 999, 1, seed=3)[0]
+    assert fit_ou(ou, scale=scale) == fit_ou(ou)
+    for bad in (0.0, -1.0, float("inf")):
+        with pytest.raises(ConfigError):
+            fit_ou(ou, scale=bad)
 
 
 def test_explosive_series_is_non_stationary():

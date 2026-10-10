@@ -30,6 +30,14 @@ Precisiones de la implementación:
   Windows no reconoce las tildes. ``LEEME.txt`` describe el formato usado.
 - El ZIP fija también el sistema de origen y los permisos de cada entrada, para
   que los bytes no dependan del sistema operativo.
+- «Prueba contaminada» dice solo lo que se verificó (``RunResult.test_contaminated``):
+  «SÍ», «no (según el historial registrado en run_config.json…)» o «no aplica:
+  la prueba no se ejecutó», con una nota sobre el alcance del historial (el
+  registro persistente de estudios llega en la fase 2). ``pruebas_estadisticas.csv``
+  lo repite en la sección ``prueba`` (solicitada, ejecutada, contaminada,
+  configuraciones_en_historial).
+- Un segmento que no se pudo simular (``RunResult.segment_errors``) figura en
+  SEGMENTOS con su causa.
 """
 
 from __future__ import annotations
@@ -138,6 +146,27 @@ DAILY_HEADERS = {
 
 STATS_COLUMNS = [DATA_TYPE_COLUMN, "seccion", "elemento", "campo", "valor"]
 
+#: «Prueba contaminada: …» según ``RunResult.test_contaminated`` (True / False / None).
+TEST_CONTAMINATED_TEXT = {
+    True: (
+        "SÍ — según el historial registrado en run_config.json, la prueba ya se había ejecutado "
+        "con otra configuración (p. ej. umbrales cambiados después de verla): sus resultados ya no "
+        "son una evaluación fuera de muestra."
+    ),
+    False: (
+        "no (según el historial registrado en run_config.json, la prueba solo se ha ejecutado "
+        "con esta configuración)."
+    ),
+    None: "no aplica: la prueba no se ejecutó.",
+}
+TEST_HISTORY_NOTE = (
+    "  Alcance: el historial de ejecuciones de la prueba viaja dentro de run_config.json; si se "
+    "borra o se edita a mano, esta marca no puede detectarlo. El registro persistente de estudios "
+    "llega en la fase 2."
+)
+#: Valor de ``contaminada`` en ``pruebas_estadisticas.csv``.
+_CONTAMINATED_CELL = {True: "sí", False: "no", None: "no aplica"}
+
 #: Nombres en español de los campos de los modelos exportados en ``pruebas_estadisticas.csv``.
 FIELD_NAMES_ES = {
     # Hedge ratio
@@ -165,6 +194,9 @@ FIELD_NAMES_ES = {
     "time_unit": "unidad_tiempo",
     "message": "mensaje",
     "df_stat": "estadistico_dickey_fuller",
+    "df_crit": "valor_critico_dickey_fuller",
+    "df_alpha": "nivel_dickey_fuller",
+    "df_estimated_residual": "valores_criticos_residuo_estimado",
     "near_unit_root": "cerca_de_raiz_unitaria",
     "mean": "media",
     "std": "desv",
@@ -378,6 +410,16 @@ def _stats_rows(result: RunResult) -> list[tuple[str, str, str, Any]]:
     )
     add("estado", "causa", [(c.code, c.message) for c in an.causes])
     add("descarte", "razon", [(c.code, c.message) for c in an.discard_reasons])
+    add(
+        "prueba",
+        "par",
+        [
+            ("solicitada", result.test_included),
+            ("ejecutada", Segment.TEST in result.backtests),
+            ("contaminada", _CONTAMINATED_CELL[_contaminated(result)]),
+            ("configuraciones_en_historial", len(result.config.test_history)),
+        ],
+    )
 
     for symbol, res in an.integration.items():
         pairs: list[tuple[str, Any]] = [("clasificacion", res.classification)]
@@ -451,6 +493,8 @@ def _stats_rows(result: RunResult) -> list[tuple[str, str, str, Any]]:
                     ("alfa", w.alpha),
                     ("beta", w.beta),
                     ("pasa", w.passed),
+                    ("evaluable", w.evaluable),
+                    ("motivo", w.reason),
                 ],
             )
 
@@ -561,6 +605,9 @@ def _segment_lines(result: RunResult) -> list[str]:
         span = f"{start} a {end} ({counts[segment]} observaciones)" if start else "vacío"
         if segment in result.backtests:
             note = "backtest incluido"
+        elif segment in result.segment_errors:
+            reason = result.segment_errors[segment].rstrip(". ")
+            note = f"sin backtest; no se pudo simular: {_lower_first(reason)}"
         elif not result.analysis.strategy_allowed:
             note = "sin backtest (estrategia bloqueada)"
         elif segment == Segment.TEST and not result.test_included:
@@ -571,6 +618,15 @@ def _segment_lines(result: RunResult) -> list[str]:
             note += "; dentro de muestra, solo ilustrativo"
         lines.append(f"- {SEGMENT_LABELS[segment]}: {span} — {note}.")
     return lines
+
+
+def _contaminated(result: RunResult) -> bool | None:
+    flag = result.test_contaminated
+    return None if flag is None else bool(flag)
+
+
+def _lower_first(text: str) -> str:
+    return text[:1].lower() + text[1:]
 
 
 def _price_note(result: RunResult) -> str:
@@ -625,13 +681,8 @@ def readme_txt(result: RunResult, excel_es: bool = False) -> str:
         "",
         "SEGMENTOS (fechas de corte congeladas en run_config.json)",
         *_segment_lines(result),
-        "Prueba contaminada: "
-        + (
-            "SÍ — los umbrales se cambiaron después de ejecutar la prueba: sus resultados ya no "
-            "son una evaluación fuera de muestra."
-            if result.test_contaminated
-            else "no."
-        ),
+        f"Prueba contaminada: {TEST_CONTAMINATED_TEXT[_contaminated(result)]}",
+        TEST_HISTORY_NOTE,
         "",
     ]
     bt = next(iter(result.backtests.values()), None)

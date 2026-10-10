@@ -8,8 +8,10 @@ CONTRATO:
   pierna y a cada ajuste de cantidades (rebalanceo).
 - ``carry_costs(short_notional, gross_exposure, equity, days, costs)`` →
   (préstamo, financiación), devengados por días NATURALES / day_count:
-  préstamo = borrow_rate × |nocional corto| × días/365;
-  financiación = financing_rate × max(0, exposición bruta − capital) × días/365.
+  préstamo = borrow_rate × |nocional corto| × días/day_count;
+  financiación = financing_rate × max(0, exposición bruta − capital) × días/day_count
+  (day_count = 365 por defecto, decisión C2; ``CostParams`` exige 0 < day_count ≤ 366,
+  así que nunca hay división por cero ni devengos negativos).
   Los montos se miden al cierre ANTERIOR (posición mantenida en el intervalo).
   Sin exposición no hay financiación (el efectivo no se remunera ni se cobra).
 - Dividendos: ya incluidos en el precio ajustado; nunca se suman aparte.

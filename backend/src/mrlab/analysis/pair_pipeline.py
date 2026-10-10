@@ -6,14 +6,16 @@ Estados posibles (4.5), EXACTAMENTE estos, con la causa explicada:
   ⚠️ Supuestos dudosos
   ⚠️ Resultado inestable entre ventanas
   ⛔ Datos insuficientes   (también cubre bloqueos por datos no aptos: monedas
-                            distintas o precios ≤ 0 con spread logarítmico)
+                            distintas o desconocidas, precios ≤ 0 con spread
+                            logarítmico, el mismo activo dos veces)
 Precedencia del estado principal: ⛔ > supuestos dudosos > evidencia
 insuficiente > inestable > ✅. Se listan TODAS las causas activas.
 Nunca usar "cointegración garantizada" ni "par rentable".
 
 CONTRATO ``analyze_pair(a, b, config, exec_a=None, exec_b=None)``:
- 1. ``validate_pair`` (tipo de spread, mínimo 500 en formación). Bloqueado →
-    PairAnalysis con status INSUFFICIENT_DATA, causas, y el resto en None.
+ 1. ``validate_pair`` (tipo de spread, mínimo 500 en formación). Bloqueado (o el
+    mismo activo dos veces) → PairAnalysis con status INSUFFICIENT_DATA,
+    causas, y el resto en None.
  2. ``compute_split`` sobre las fechas alineadas (o ``config.frozen_split`` si se
     pasa: entonces se respetan esas fechas).
  3. Transformar (log/precio). Con SOLO formación: ADF/KPSS de cada serie,
@@ -27,11 +29,18 @@ CONTRATO ``analyze_pair(a, b, config, exec_a=None, exec_b=None)``:
     1, 5, 20 desde el último dato de formación, diagnóstico de residuos,
     estabilidad del OU por ventanas.
  6. Estado + causas + ``discard_reasons`` (para el panel "¿Por qué se descartó
-    este par?"): p ajustado > α, inestabilidad, b fuera de (0,1), vida media
+    este par?"): p ajustado > α, inestabilidad, OU no válido, vida media
     fuera de rango (>126 o <1), datos insuficientes, supuestos dudosos,
-    filtro de correlación (si se activó y no se cumple).
- 7. ``strategy_allowed`` = no bloqueado y OU válido. ``illustrative_only`` =
-    estado distinto de ✅ (el backtest se permite con aviso "solo ilustrativo").
+    filtro de correlación (si se activó y no se cumple), y las razones que
+    bloquean la simulación (proxy requerido, precios ejecutables ≤ 0, series
+    colineales).
+ 7. ``strategy_allowed`` = no bloqueado, OU válido y ninguna razón de
+    ``STRATEGY_BLOCKING_CODES``. ``illustrative_only`` = estado distinto de ✅
+    o alguna razón de descarte (el backtest se permite con el aviso «solo
+    ilustrativo», que cita los motivos: ``illustrative_reasons`` e
+    ``illustrative_banner``). Las razones que se conocen después del análisis
+    (las añade el runner) se registran con ``add_discard_reasons``, que
+    mantiene esa regla.
  8. Si se pasan exec_a/exec_b (proxy ejecutable para índices), se alinean con
     las series de análisis; si no, se ejecuta sobre las mismas series.
 
@@ -41,8 +50,25 @@ Precisiones de la implementación:
   y ``causes`` contiene una única causa con la decisión de Engle–Granger.
 - La validez del OU NO es un estado (la especificación fija cinco): un OU no
   válido bloquea la estrategia y aparece en ``discard_reasons`` con
-  ``status=None``, igual que la vida media fuera de rango, ``near_unit_root`` y
-  el filtro de correlación.
+  ``status=None``, igual que la vida media fuera de rango y el filtro de
+  correlación. Decisión O7: el OU solo es válido si 0 < b < 1 y Dickey–Fuller
+  rechaza la raíz unitaria al nivel ``alpha_level``, con los valores críticos
+  del residuo de una regresión estimada (N = 2), también en la estabilidad
+  del OU por ventanas. Si no la rechaza → ``OU_NO_ESTACIONARIO``.
+- Dirección colineal (Engle–Granger con estadístico −∞): no se ajusta el OU
+  (``INSUFFICIENT`` con el motivo) y se descarta con ``SERIES_COLINEALES``.
+  Además ``fit_ou`` recibe como escala absoluta la desviación de f(y) en
+  formación: un spread que es solo ruido de redondeo nunca es un OU válido.
+- Índice o futuro sin instrumento ejecutable → ``PROXY_REQUERIDO`` (se sugiere
+  el proxy, nunca se sustituye); el análisis estadístico se muestra igual.
+- Precios EJECUTABLES (series o proxy) ≤ 0 en cualquier tramo →
+  ``PRECIO_EJECUTABLE_NO_POSITIVO`` (la simulación necesita precios positivos
+  para dimensionar y valorar las piernas). Esas fechas no se excluyen.
+- Las incidencias de la limpieza de cada instrumento ejecutable se añaden al
+  ``ValidationReport`` con el símbolo y la etiqueta «instrumento ejecutable».
+- El calendario se determina con las clases de TODOS los instrumentos usados
+  (análisis + ejecutables): cripto analizado + ejecutable de bolsa → mixto
+  (252 periodos, día de negociación, aviso de desfase de cierre).
 - ``zscore`` es siempre el z con μ y σ_eq FIJOS de formación. El z móvil
   (``StrategyParams.zscore_mode="movil"``) lo calcula el runner a partir de
   ``spread``: es solo una comparación pedagógica.
@@ -50,31 +76,37 @@ Precisiones de la implementación:
   por debajo de ``min_train_obs``, el estado es ⛔ con los números.
 - Los errores de datos durante los cálculos (p. ej. una serie constante en
   formación) se convierten en una causa ⛔ ``CALCULO_NO_POSIBLE`` en lugar de
-  propagarse.
+  propagarse. Una ventana de estabilidad no evaluable NO es un error: cuenta
+  como ventana fallida.
+- ``AnalysisConfig`` valida la coherencia de sus parámetros (ConfigError en
+  español), p. ej. ``stability_window ≥ 2·(maxlag + 1) + 30``.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from dataclasses import replace as dc_replace
 from enum import StrEnum
 
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from mrlab.backtest.split import SampleSplit, SplitConfig, compute_split, segment_slice
-from mrlab.data.calendar import time_unit_label
+from mrlab.data.calendar import CLOSE_TIME_MISMATCH_WARNING, calendar_type, time_unit_label
 from mrlab.data.validation import (
     AlignedPair,
     Severity,
+    ValidationIssue,
     ValidationReport,
     clean_series,
+    format_dates,
     format_int,
     validate_pair,
 )
-from mrlab.domain.errors import AnalysisBlocked, DataError
+from mrlab.domain.errors import AnalysisBlocked, ConfigError, DataError
 from mrlab.domain.models import CalendarType, PriceSeries, Segment, SpreadType
 from mrlab.model.diagnostics import (
     OUStability,
@@ -83,6 +115,7 @@ from mrlab.model.diagnostics import (
     rolling_ou_stability,
 )
 from mrlab.model.ou import (
+    MIN_OBS_OU,
     MU_REFERENCE_NOTE,
     PARAMETER_UNCERTAINTY_NOTE,
     OUFit,
@@ -136,7 +169,8 @@ STATUS_PRECEDENCE = (
     PairStatus.EVIDENCE,
 )
 
-#: Banner permanente de la decisión O5 cuando el par no es ✅ pero el OU es válido.
+#: Banner permanente de la decisión O5 cuando el par no superó los filtros pero el OU es
+#: válido. ``PairAnalysis.illustrative_banner`` lo completa con los motivos concretos.
 ILLUSTRATIVE_BANNER = "El par no superó los filtros: resultado solo ilustrativo."
 
 SYNTHETIC_WARNING = (
@@ -148,6 +182,51 @@ STRATEGY_BLOCKED_NOTE = (
     "Sin un OU válido no hay μ ni σ_eq, así que no se puede calcular el z-score: la estrategia "
     "queda bloqueada para este par."
 )
+
+SIMULATION_BLOCKED_NOTE = (
+    "La simulación de la estrategia queda bloqueada para este par; el análisis estadístico se "
+    "muestra igualmente."
+)
+
+COLLINEAR_OU_MESSAGE = (
+    "Las dos series son prácticamente idénticas salvo escala (la regresión de formación las "
+    "explica casi por completo y Engle–Granger no es fiable): el spread es casi nulo y solo "
+    "contiene ruido numérico, así que no se ajusta el OU. Revisa si se eligió dos veces el mismo "
+    "activo o dos series duplicadas."
+)
+
+#: Razones de descarte que bloquean la simulación (además de las que hacen ⛔ el estado).
+STRATEGY_BLOCKING_CODES = frozenset(
+    {
+        "OU_NO_ESTACIONARIO",
+        "OU_B_NO_POSITIVO",
+        "OU_DATOS_INSUFICIENTES",
+        "SERIES_COLINEALES",
+        "PROXY_REQUERIDO",
+        "PROXY_NO_EJECUTABLE",
+        "PRECIO_EJECUTABLE_NO_POSITIVO",
+    }
+)
+
+#: Observaciones exigidas por encima del mínimo técnico de Engle–Granger en cada ventana.
+STABILITY_WINDOW_MARGIN = 30
+
+SEGMENT_NAMES = {
+    Segment.TRAIN: "formación",
+    Segment.VALIDATION: "validación",
+    Segment.TEST: "prueba",
+}
+
+
+def min_stability_window(maxlag: int) -> int:
+    """Ventana mínima de estabilidad: 2·(maxlag + 1) (mínimo de ``coint``) + 30 observaciones."""
+    return 2 * (maxlag + 1) + STABILITY_WINDOW_MARGIN
+
+
+def min_train_observations(maxlag: int) -> int:
+    """Formación mínima con la que las pruebas pueden calcularse (ADF con constante sobre las
+    diferencias y el OU)."""
+    return max(MIN_OBS_OU, 2 * (maxlag + 2) + 1)
 
 
 class AnalysisConfig(BaseModel):
@@ -169,6 +248,74 @@ class AnalysisConfig(BaseModel):
     forecast_horizons: tuple[int, ...] = (1, 5, 20)
     forecast_level: float = 0.95
 
+    @model_validator(mode="after")
+    def _coherent(self) -> AnalysisConfig:
+        """Parámetros coherentes entre sí; si no, ConfigError con la explicación en español."""
+        problems: list[str] = []
+        if self.fdr_method not in FDR_METHOD_LABELS:
+            problems.append(
+                f"el método de corrección debe ser «bh» (Benjamini–Hochberg) o «by» "
+                f"(Benjamini–Yekutieli); se recibió «{self.fdr_method}»"
+            )
+        if self.maxlag < 0:
+            problems.append(f"los rezagos máximos deben ser 0 o más (se recibió {self.maxlag})")
+        else:
+            min_window = min_stability_window(self.maxlag)
+            if self.stability_window < min_window:
+                problems.append(
+                    f"la ventana de estabilidad debe tener al menos {min_window} observaciones "
+                    f"con {self.maxlag} rezagos máximos: 2·(rezagos + 1) = "
+                    f"{2 * (self.maxlag + 1)}, que es lo mínimo que exige Engle–Granger, más "
+                    f"{STABILITY_WINDOW_MARGIN} para que la prueba tenga sentido (se recibió "
+                    f"{self.stability_window})"
+                )
+            min_train = min_train_observations(self.maxlag)
+            if self.min_train_obs < min_train:
+                problems.append(
+                    f"el mínimo de observaciones en formación debe ser al menos {min_train} con "
+                    f"{self.maxlag} rezagos máximos (se recibió {self.min_train_obs})"
+                )
+        if self.stability_step < 1:
+            problems.append(
+                f"el paso entre ventanas debe ser al menos 1 (se recibió {self.stability_step})"
+            )
+        if not 0.0 <= self.max_fail_frac <= 1.0:
+            problems.append(
+                "la fracción máxima de ventanas fallidas debe estar entre 0 y 1 (se recibió "
+                f"{self.max_fail_frac})"
+            )
+        if not (
+            math.isfinite(self.half_life_min)
+            and math.isfinite(self.half_life_max)
+            and 0.0 <= self.half_life_min < self.half_life_max
+        ):
+            problems.append(
+                "la vida media mínima debe ser 0 o más y menor que la máxima (se recibió "
+                f"mínima {self.half_life_min} y máxima {self.half_life_max})"
+            )
+        if not -1.0 <= self.correlation_min <= 1.0:
+            problems.append(
+                "la correlación mínima del filtro debe estar entre −1 y 1 (se recibió "
+                f"{self.correlation_min})"
+            )
+        if not self.forecast_horizons or any(h < 1 for h in self.forecast_horizons):
+            problems.append(
+                "los horizontes de pronóstico deben ser enteros mayores o iguales a 1 (se "
+                f"recibió {list(self.forecast_horizons)})"
+            )
+        if not 0.0 < self.forecast_level < 1.0:
+            problems.append(
+                "el nivel de los intervalos de pronóstico debe estar entre 0 y 1, por ejemplo "
+                f"0,95 (se recibió {self.forecast_level})"
+            )
+        if problems:
+            raise ConfigError(
+                "Configuración del análisis no válida: " + "; ".join(problems) + ".",
+                code="CONFIGURACION_ANALISIS_INVALIDA",
+                details={"problemas": problems},
+            )
+        return self
+
 
 class Cause(BaseModel):
     code: str
@@ -189,7 +336,7 @@ class PairAnalysis:
     illustrative_only: bool
     aligned: AlignedPair | None = None
     exec_prices: pd.DataFrame | None = None  # columnas "a", "b" ejecutables, mismas fechas
-    calendar: CalendarType | None = None
+    calendar: CalendarType | None = None  # calendario efectivo (análisis + ejecutables)
     split: SampleSplit | None = None
     integration: dict[str, IntegrationResult] = field(default_factory=dict)
     eg: dict[Direction, EGResult] = field(default_factory=dict)
@@ -209,6 +356,8 @@ class PairAnalysis:
     eg_decision: EGDecision | None = None  # dirección, p ajustados y mensaje de la decisión
     exec_symbol_a: str | None = None  # instrumento ejecutable de cada pierna (None = el mismo)
     exec_symbol_b: str | None = None
+    #: Por qué el resultado es solo ilustrativo (estado no ✅ y razones de descarte).
+    illustrative_reasons: list[str] = field(default_factory=list)
 
     @property
     def dependent_symbol(self) -> str | None:
@@ -221,6 +370,19 @@ class PairAnalysis:
     @property
     def blocked(self) -> bool:
         return self.status == PairStatus.INSUFFICIENT_DATA
+
+    @property
+    def illustrative_banner(self) -> str | None:
+        """Texto del banner «solo ilustrativo» con sus motivos (None si no corresponde).
+
+        Empieza siempre por ``ILLUSTRATIVE_BANNER``; el runner lo usa en cada backtest.
+        """
+        if not self.illustrative_only:
+            return None
+        if not self.illustrative_reasons:
+            return ILLUSTRATIVE_BANNER
+        label = "Motivo" if len(self.illustrative_reasons) == 1 else "Motivos"
+        return f"{ILLUSTRATIVE_BANNER} {label}: " + " ".join(self.illustrative_reasons)
 
 
 # --------------------------------------------------------------------------- formato
@@ -243,6 +405,10 @@ def _dedupe(items: list[str]) -> list[str]:
     return list(dict.fromkeys(items))
 
 
+def _currency(code: str | None) -> str | None:
+    return code.strip() if code and code.strip() else None
+
+
 # --------------------------------------------------------------------------- estado
 
 
@@ -260,57 +426,156 @@ def _by_precedence(causes: list[Cause]) -> list[Cause]:
 # --------------------------------------------------------------------------- piezas
 
 
+EFFECTIVE_MIXED_CALENDAR_WARNING = (
+    "Calendario efectivo mixto (cripto + bolsa): se combinan series de cripto con instrumentos "
+    "ejecutables de bolsa (o al revés). El análisis y la simulación usan solo las fechas en que "
+    "cotizan todos los instrumentos, el OU se mide en días de negociación y la anualización usa "
+    "252 periodos."
+)
+
+
+@dataclass(frozen=True)
+class _Execution:
+    """Instrumentos ejecutables alineados con el análisis (ver ``_executable_prices``)."""
+
+    aligned: AlignedPair
+    prices: pd.DataFrame  # columnas "a", "b"
+    symbols: tuple[str | None, str | None]  # proxy de cada pierna (None = la propia serie)
+    issues: list[ValidationIssue]  # incidencias de la limpieza de los proxies
+    calendar: CalendarType  # calendario de TODOS los instrumentos usados
+
+
+def _same_asset_cause(a: PriceSeries, b: PriceSeries) -> Cause | None:
+    """⛔ si las dos piernas son el mismo activo (mismo proveedor y símbolo)."""
+    if a.meta.provider != b.meta.provider:
+        return None
+    if a.symbol.strip().upper() != b.symbol.strip().upper():
+        return None
+    return Cause(
+        code="MISMO_ACTIVO",
+        status=PairStatus.INSUFFICIENT_DATA,
+        message=(
+            f"Se eligió dos veces el mismo activo («{a.symbol}» del proveedor "
+            f"«{a.meta.provider}»). Un par necesita dos series distintas: con la misma serie en "
+            "las dos piernas el spread es cero salvo ruido numérico y ninguna prueba tiene "
+            "sentido. Elige otro activo para una de las piernas."
+        ),
+    )
+
+
+def _non_executable_kind(series: PriceSeries) -> str:
+    kinds = {"indice": "un índice", "futuro": "un futuro continuo"}
+    return kinds.get(series.meta.asset.asset_class.value, "un instrumento no ejecutable")
+
+
+def _proxy_required_cause(series: PriceSeries) -> Cause:
+    asset = series.meta.asset
+    suggestion = (
+        f" El proxy sugerido es «{asset.suggested_proxy}»: indícalo de forma explícita como "
+        "instrumento ejecutable (nunca se sustituye en silencio)."
+        if asset.suggested_proxy
+        else " Elige un instrumento ejecutable que lo replique (por ejemplo, un ETF); nunca se "
+        "sustituye en silencio."
+    )
+    return Cause(
+        code="PROXY_REQUERIDO",
+        status=None,
+        message=(
+            f"«{asset.symbol}» es {_non_executable_kind(series)}: no se puede comprar ni vender "
+            f"directamente, así que la simulación necesita un instrumento ejecutable.{suggestion} "
+            f"{SIMULATION_BLOCKED_NOTE}"
+        ),
+    )
+
+
+def _exec_issue(issue: ValidationIssue, exec_symbol: str, analysis_symbol: str) -> ValidationIssue:
+    """Incidencia de la limpieza de un proxy, rotulada como «instrumento ejecutable»."""
+    body = issue.message.removeprefix(f"{exec_symbol}: ")
+    if issue.code == "PRECIO_NO_POSITIVO":
+        body = (
+            f"{len(issue.dates)} precio(s) menores o iguales a cero "
+            f"({format_dates(issue.dates)}). La simulación necesita precios positivos para "
+            "dimensionar y valorar las piernas, así que la estrategia queda bloqueada."
+        )
+    return issue.model_copy(
+        update={
+            "symbol": exec_symbol,
+            "message": (
+                f"Instrumento ejecutable «{exec_symbol}» (se opera en lugar de "
+                f"«{analysis_symbol}»): {body}"
+            ),
+        }
+    )
+
+
 def _executable_prices(
     aligned: AlignedPair,
     series: tuple[PriceSeries, PriceSeries],
     execs: tuple[PriceSeries | None, PriceSeries | None],
     warnings: list[str],
     causes: list[Cause],
-) -> tuple[AlignedPair, pd.DataFrame, tuple[str | None, str | None]]:
+    discards: list[Cause],
+) -> _Execution:
     """Precios ejecutables (columnas "a", "b") en las mismas fechas que el análisis.
 
-    Sin proxy, cada pierna se ejecuta sobre su propia serie. Con proxy, solo se
-    usan las fechas en que también cotiza el proxy (nunca se rellena).
+    Sin proxy, cada pierna se ejecuta sobre su propia serie (si es un índice o futuro, la
+    simulación queda bloqueada con ``PROXY_REQUERIDO``). Con proxy, solo se usan las fechas
+    en que también cotiza el proxy (nunca se rellena); sus precios ≤ 0 se conservan y
+    bloquean la simulación más adelante.
     """
     prices = aligned.prices
     columns: dict[str, pd.Series] = {"a": prices["a"], "b": prices["b"]}
     index = prices.index
     exec_symbols: list[str | None] = []
+    issues: list[ValidationIssue] = []
+    classes = [s.meta.asset.asset_class for s in series]
     for leg, analysis_series, exec_series in zip(("a", "b"), series, execs, strict=True):
         asset = analysis_series.meta.asset
         if exec_series is None:
             exec_symbols.append(None)
             if not asset.executable:
-                proxy = (
-                    f" El proxy sugerido es {asset.suggested_proxy}."
-                    if asset.suggested_proxy
-                    else ""
-                )
-                warnings.append(
-                    f"«{asset.symbol}» no se puede comprar ni vender directamente (índice o futuro "
-                    f"continuo): el backtest lo opera como si fuera ejecutable, solo como "
-                    f"aproximación.{proxy} Elige un instrumento ejecutable para simular con más "
-                    "realismo; nunca se sustituye en silencio."
-                )
+                discards.append(_proxy_required_cause(analysis_series))
             continue
+        exec_asset = exec_series.meta.asset
         exec_symbols.append(exec_series.symbol)
-        clean, _ = clean_series(exec_series)
-        close = clean.data["close"].astype(float)
-        bad = close[~(close > 0)]
-        if not bad.empty:
-            warnings.append(
-                f"El instrumento ejecutable «{exec_series.symbol}» tiene {len(bad)} precio(s) "
-                "menores o iguales a cero: esas fechas se excluyen del análisis."
+        classes.append(exec_asset.asset_class)
+        clean, report = clean_series(exec_series)
+        issues.extend(_exec_issue(i, exec_series.symbol, asset.symbol) for i in report.issues)
+        if not exec_asset.executable:
+            discards.append(
+                Cause(
+                    code="PROXY_NO_EJECUTABLE",
+                    status=None,
+                    message=(
+                        f"El instrumento elegido para operar «{asset.symbol}», "
+                        f"«{exec_series.symbol}», es {_non_executable_kind(exec_series)}: tampoco "
+                        "se puede comprar ni vender directamente. Elige un instrumento ejecutable "
+                        f"(por ejemplo, un ETF). {SIMULATION_BLOCKED_NOTE}"
+                    ),
+                )
             )
-            close = close[close > 0]
-        cur_exec = exec_series.meta.asset.currency
-        if cur_exec != asset.currency:
+        cur, cur_exec = _currency(asset.currency), _currency(exec_asset.currency)
+        if cur_exec is None:
+            causes.append(
+                Cause(
+                    code="MONEDA_DESCONOCIDA",
+                    status=PairStatus.INSUFFICIENT_DATA,
+                    message=(
+                        f"La moneda del instrumento ejecutable «{exec_series.symbol}» es "
+                        f"desconocida («{asset.symbol}» cotiza en {cur}). Sin la moneda no se "
+                        "puede comprobar que ambos coticen en la misma, así que el análisis "
+                        "queda bloqueado. Si cargaste un CSV, declara su moneda; si no, prueba "
+                        "con otro proveedor."
+                    ),
+                )
+            )
+        elif cur_exec != cur:
             causes.append(
                 Cause(
                     code="MONEDA_PROXY_DISTINTA",
                     status=PairStatus.INSUFFICIENT_DATA,
                     message=(
-                        f"«{asset.symbol}» cotiza en {asset.currency} y su instrumento ejecutable "
+                        f"«{asset.symbol}» cotiza en {cur} y su instrumento ejecutable "
                         f"«{exec_series.symbol}» en {cur_exec}: deben estar en la misma moneda."
                     ),
                 )
@@ -320,6 +585,7 @@ def _executable_prices(
             "provienen de instrumentos distintos (riesgo de base; por ejemplo, un índice de precios "
             "no incluye dividendos y un ETF ajustado sí)."
         )
+        close = clean.data["close"].astype(float)
         index = index.intersection(close.index)
         columns[leg] = close
 
@@ -331,9 +597,83 @@ def _executable_prices(
         )
     exec_prices = pd.DataFrame({k: v.reindex(index) for k, v in columns.items()}, index=index)
     exec_prices.index.name = "date"
-    if dropped:
-        aligned = dc_replace(aligned, prices=prices.loc[index])
-    return aligned, exec_prices, (exec_symbols[0], exec_symbols[1])
+    calendar = calendar_type(classes)
+    if dropped or calendar != aligned.calendar:
+        aligned = dc_replace(aligned, prices=prices.loc[index], calendar=calendar)
+    return _Execution(
+        aligned=aligned,
+        prices=exec_prices,
+        symbols=(exec_symbols[0], exec_symbols[1]),
+        issues=issues,
+        calendar=calendar,
+    )
+
+
+def _report_with_execution(
+    report: ValidationReport, execution: _Execution, warnings: list[str]
+) -> ValidationReport:
+    """Informe de validación con las incidencias de los proxies y el calendario efectivo."""
+    added = list(execution.issues)
+    if execution.calendar != report.calendar and execution.calendar == CalendarType.MIXED:
+        added.append(
+            ValidationIssue(
+                code="DESFASE_CIERRE_CRIPTO",
+                severity=Severity.WARNING,
+                message=CLOSE_TIME_MISMATCH_WARNING,
+            )
+        )
+        warnings.append(EFFECTIVE_MIXED_CALENDAR_WARNING)
+    if not added and execution.calendar == report.calendar:
+        return report
+    n_exec = sum(i.severity != Severity.INFO for i in execution.issues)
+    status = report.status_message
+    if n_exec:
+        status += (
+            f" Además, los instrumentos ejecutables tienen {n_exec} incidencia(s) que conviene "
+            "revisar."
+        )
+    return report.model_copy(
+        update={
+            "calendar": execution.calendar,
+            "issues": [*report.issues, *added],
+            "status_message": status,
+        }
+    )
+
+
+def _non_positive_exec_discards(
+    exec_prices: pd.DataFrame, split: SampleSplit, symbols: dict[str, str]
+) -> list[Cause]:
+    """Precios ejecutables ≤ 0 en cualquier tramo: la simulación no puede dimensionar ni
+    valorar las piernas (cantidad = nocional / precio), así que se bloquea."""
+    out: list[Cause] = []
+    for leg in ("a", "b"):
+        column = exec_prices[leg]
+        bad = column[~(column > 0)]
+        if bad.empty:
+            continue
+        segments = [SEGMENT_NAMES[s] for s in Segment if not segment_slice(bad, split, s).empty]
+        if len(segments) == 1:
+            where = f" en el tramo de {segments[0]}"
+        elif segments:
+            where = f" en los tramos de {', '.join(segments[:-1])} y {segments[-1]}"
+        else:
+            where = ""
+        first = bad.index[0].date().isoformat()
+        out.append(
+            Cause(
+                code="PRECIO_EJECUTABLE_NO_POSITIVO",
+                status=None,
+                message=(
+                    f"El instrumento ejecutable «{symbols[leg]}» tiene {format_int(len(bad))} "
+                    f"precio(s) menores o iguales a cero{where} (el primero el {first}). La "
+                    "simulación necesita precios positivos para dimensionar las piernas "
+                    "(cantidad = nocional / precio) y valorar la posición. "
+                    f"{SIMULATION_BLOCKED_NOTE}"
+                ),
+            )
+        )
+    return out
 
 
 def _integration_cause(res: IntegrationResult) -> Cause:
@@ -413,6 +753,7 @@ def _stability_causes(stability: EGStability) -> list[Cause]:
 def _ou_discards(ou: OUFit, cfg: AnalysisConfig) -> list[Cause]:
     """Razones de descarte que vienen del modelo OU (no cambian el estado del par)."""
     if not ou.valid:
+        # Incluye b indistinguible de 1 (decisión O7): el mensaje del ajuste lo explica.
         codes = {
             OUStatus.NON_STATIONARY: "OU_NO_ESTACIONARIO",
             OUStatus.NON_POSITIVE_B: "OU_B_NO_POSITIVO",
@@ -425,7 +766,7 @@ def _ou_discards(ou: OUFit, cfg: AnalysisConfig) -> list[Cause]:
                 message=f"{ou.message} {STRATEGY_BLOCKED_NOTE}",
             )
         ]
-    assert ou.half_life is not None and ou.b is not None
+    assert ou.half_life is not None
     units = _plural(ou.time_unit)
     out: list[Cause] = []
     if ou.half_life > cfg.half_life_max:
@@ -448,20 +789,6 @@ def _ou_discards(ou: OUFit, cfg: AnalysisConfig) -> list[Cause]:
                 message=(
                     f"Vida media de {_fmt(ou.half_life, 2)} {units}, por debajo del mínimo de "
                     f"{_fmt(cfg.half_life_min, 0)}: con datos diarios no es operable ni fiable."
-                ),
-            )
-        )
-    if ou.near_unit_root:
-        df_txt = f" (estadístico de Dickey–Fuller {_fmt(ou.df_stat, 2)})" if ou.df_stat else ""
-        out.append(
-            Cause(
-                code="RAIZ_UNITARIA_CERCANA",
-                status=None,
-                message=(
-                    f"El AR(1) del spread tiene b = {_fmt(ou.b)}, que no se distingue "
-                    f"estadísticamente de 1 al 5 %{df_txt}: el spread podría comportarse como un "
-                    f"paseo aleatorio y la vida media de {_fmt(ou.half_life, 1)} {units} es muy "
-                    "imprecisa."
                 ),
             )
         )
@@ -512,9 +839,14 @@ def analyze_pair(
     if a.is_synthetic or b.is_synthetic:
         warnings.append(SYNTHETIC_WARNING)
 
-    # 1. Bloqueos de la validación (moneda, precios ≤ 0 con log, < 500 en formación).
+    # 1. Bloqueos: el mismo activo dos veces y los de la validación (moneda, precios ≤ 0
+    #    con log, < 500 en formación).
+    blocking: list[Cause] = []
+    same_asset = _same_asset_cause(a, b)
+    if same_asset is not None:
+        blocking.append(same_asset)
     if report.blocked or aligned is None:
-        blocking = [
+        blocking += [
             Cause(code=i.code, status=PairStatus.INSUFFICIENT_DATA, message=i.message)
             for i in report.issues
             if i.severity == Severity.ERROR and i.symbol is None
@@ -525,15 +857,18 @@ def analyze_pair(
                 message=report.status_message,
             )
         ]
+    if blocking or aligned is None:
         return _finish(out, blocking, [], warnings)
 
-    # 2. Precios ejecutables y división de la muestra (fechas congeladas si se pasan).
+    # 2. Precios ejecutables, calendario efectivo y división de la muestra.
     causes: list[Cause] = []
-    aligned, exec_prices, (exec_sym_a, exec_sym_b) = _executable_prices(
-        aligned, (a, b), (exec_a, exec_b), warnings, causes
-    )
-    out.aligned, out.exec_prices = aligned, exec_prices
-    out.exec_symbol_a, out.exec_symbol_b = exec_sym_a, exec_sym_b
+    discards: list[Cause] = []
+    execution = _executable_prices(aligned, (a, b), (exec_a, exec_b), warnings, causes, discards)
+    aligned = execution.aligned
+    out.validation = _report_with_execution(report, execution, warnings)
+    out.calendar = execution.calendar
+    out.aligned, out.exec_prices = aligned, execution.prices
+    out.exec_symbol_a, out.exec_symbol_b = execution.symbols
     prices = aligned.prices
     if len(prices) == 0:
         causes.append(
@@ -543,7 +878,7 @@ def analyze_pair(
                 message="No quedan fechas comunes entre las series de análisis y las ejecutables.",
             )
         )
-        return _finish(out, causes, [], warnings)
+        return _finish(out, causes, discards, warnings)
     split = frozen_split or compute_split(prices.index, cfg.split)
     out.split = split
     train = segment_slice(prices, split, Segment.TRAIN)
@@ -560,10 +895,14 @@ def analyze_pair(
             )
         )
     if any(c.status == PairStatus.INSUFFICIENT_DATA for c in causes):
-        return _finish(out, causes, [], warnings)
+        return _finish(out, causes, discards, warnings)
+    exec_names = {
+        "a": execution.symbols[0] or sym_a,
+        "b": execution.symbols[1] or sym_b,
+    }
+    discards.extend(_non_positive_exec_discards(execution.prices, split, exec_names))
 
     # 3–5. Pruebas, spread y OU (solo formación para estimar).
-    discards: list[Cause] = []
     try:
         _statistics(out, cfg, prices, train, causes, discards, warnings, family_pvalues)
     except (DataError, AnalysisBlocked) as exc:
@@ -620,6 +959,7 @@ def _statistics(
 
     dep, indep = ("a", "b") if decision.direction == Direction.A_ON_B else ("b", "a")
     chosen = results[decision.direction]
+    collinear = not math.isfinite(chosen.statistic)
     out.stability = rolling_eg_stability(
         f_train[dep],
         f_train[indep],
@@ -644,30 +984,60 @@ def _statistics(
     out.spread = spread
     spread_train = segment_slice(spread, out.split, Segment.TRAIN)
 
-    # OU con formación (sección 6).
+    # OU con formación (sección 6). El spread es el RESIDUO de la regresión de cointegración
+    # estimada con estos datos: valores críticos N = 2 (decisión O7).
     assert out.calendar is not None
     time_unit = time_unit_label(out.calendar)
-    ou = fit_ou(
-        spread_train,
-        time_unit=time_unit,
-        half_life_max=cfg.half_life_max,
-        half_life_min=cfg.half_life_min,
-    )
-    out.ou = ou
-    warnings.extend(ou.warnings)
-    discards.extend(_ou_discards(ou, cfg))
-    if ou.valid:
-        out.zscore = zscore(spread, ou)
-        out.forecasts = forecast(
-            ou, float(spread_train.iloc[-1]), cfg.forecast_horizons, cfg.forecast_level
+    if collinear:
+        out.ou = OUFit(
+            status=OUStatus.INSUFFICIENT,
+            valid=False,
+            nobs=max(len(spread_train) - 1, 0),
+            time_unit=time_unit,
+            df_alpha=cfg.alpha_level,
+            df_estimated_residual=True,
+            message=COLLINEAR_OU_MESSAGE,
         )
-        out.residuals = residual_diagnostics(spread_train, ou)
-        if out.residuals.autocorrelation_detected:
-            warnings.append(out.residuals.message)
-        out.ou_stability = rolling_ou_stability(
-            spread_train, cfg.stability_window, cfg.stability_step, time_unit=time_unit
+        discards.append(
+            Cause(
+                code="SERIES_COLINEALES",
+                status=None,
+                message=f"{COLLINEAR_OU_MESSAGE} {STRATEGY_BLOCKED_NOTE}",
+            )
         )
-        warnings.extend([PARAMETER_UNCERTAINTY_NOTE, MU_REFERENCE_NOTE])
+    else:
+        scale = float(np.std(f_train[dep].to_numpy(dtype=float)))
+        scale_arg = scale if math.isfinite(scale) and scale > 0 else None
+        ou = fit_ou(
+            spread_train,
+            time_unit=time_unit,
+            half_life_max=cfg.half_life_max,
+            half_life_min=cfg.half_life_min,
+            unit_root_alpha=cfg.alpha_level,
+            estimated_residual=True,
+            scale=scale_arg,
+        )
+        out.ou = ou
+        warnings.extend(ou.warnings)
+        discards.extend(_ou_discards(ou, cfg))
+        if ou.valid:
+            out.zscore = zscore(spread, ou)
+            out.forecasts = forecast(
+                ou, float(spread_train.iloc[-1]), cfg.forecast_horizons, cfg.forecast_level
+            )
+            out.residuals = residual_diagnostics(spread_train, ou)
+            if out.residuals.autocorrelation_detected:
+                warnings.append(out.residuals.message)
+            out.ou_stability = rolling_ou_stability(
+                spread_train,
+                cfg.stability_window,
+                cfg.stability_step,
+                time_unit=time_unit,
+                unit_root_alpha=cfg.alpha_level,
+                estimated_residual=True,
+                scale=scale_arg,
+            )
+            warnings.extend([PARAMETER_UNCERTAINTY_NOTE, MU_REFERENCE_NOTE])
 
     # Filtro exploratorio de correlación (opcional; nunca es una prueba de cointegración).
     out.correlation_train = _train_correlation(train)
@@ -706,11 +1076,47 @@ def _finish(
         *[c for c in out.causes if c.status != PairStatus.EVIDENCE],
         *discards,
     ]
-    out.strategy_allowed = out.status != PairStatus.INSUFFICIENT_DATA and bool(
-        out.ou is not None and out.ou.valid
+    blocks_simulation = any(d.code in STRATEGY_BLOCKING_CODES for d in discards)
+    out.strategy_allowed = (
+        out.status != PairStatus.INSUFFICIENT_DATA
+        and out.ou is not None
+        and out.ou.valid
+        and not blocks_simulation
     )
-    out.illustrative_only = out.status != PairStatus.EVIDENCE
-    if out.strategy_allowed and out.illustrative_only:
-        warnings.append(ILLUSTRATIVE_BANNER)
+    # Solo ilustrativo si el par no es ✅ o si el panel «¿Por qué se descartó?» tiene alguna
+    # razón (p. ej. vida media fuera de [1, 126]): el banner cita los motivos.
+    reasons: list[str] = []
+    if out.status != PairStatus.EVIDENCE:
+        reasons.append(f"Estado del par: {STATUS_LABELS[out.status]}.")
+    reasons.extend(d.message for d in discards)
+    out.illustrative_reasons = _dedupe(reasons)
+    out.illustrative_only = bool(out.illustrative_reasons)
+    banner = out.illustrative_banner
+    if out.strategy_allowed and banner is not None:
+        warnings.append(banner)
     out.warnings = _dedupe(warnings)
     return out
+
+
+def add_discard_reasons(analysis: PairAnalysis, causes: Iterable[Cause]) -> None:
+    """Añade razones de descarte calculadas DESPUÉS de ``analyze_pair`` (p. ej. por el runner:
+    costes que superan el PnL bruto en validación, un segmento que no se pudo simular).
+
+    Mantiene la decisión O5: toda razón del panel «¿Por qué se descartó?» hace el resultado
+    solo ilustrativo, así que se actualizan ``illustrative_reasons``, ``illustrative_only`` y
+    el banner de ``warnings``. No cambia el estado ni ``strategy_allowed``.
+    """
+    new = list(causes)
+    if not new:
+        return
+    old_banner = analysis.illustrative_banner
+    analysis.discard_reasons.extend(new)
+    analysis.illustrative_reasons = _dedupe(
+        [*analysis.illustrative_reasons, *(c.message for c in new)]
+    )
+    analysis.illustrative_only = True
+    warnings = [w for w in analysis.warnings if w != old_banner]
+    banner = analysis.illustrative_banner
+    if analysis.strategy_allowed and banner is not None:
+        warnings.append(banner)
+    analysis.warnings = _dedupe(warnings)

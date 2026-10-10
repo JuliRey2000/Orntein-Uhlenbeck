@@ -211,3 +211,107 @@ def test_synthetic_series_without_retrieved_at(tmp_path):
     assert SnapshotCache(tmp_path / "otra").put(a).meta.snapshot_id == stored.meta.snapshot_id
     assert cache.latest("synthetic", a.symbol).snapshot_id == stored.meta.snapshot_id
     assert cache.get(stored.meta.snapshot_id).meta.coverage_end == date(2018, 10, 5)
+
+
+# --------------------------------------------------------------------------- verificación
+# Hallazgo de la revisión: una instantánea alterada se usaba en silencio.
+
+
+def _rewrite_parquet(path, change_data=None, change_meta=None):
+    """Altera un Parquet de la caché conservando (o cambiando) sus metadatos."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(path)
+    metadata = dict(table.schema.metadata)
+    df = table.to_pandas()
+    if change_data is not None:
+        df = change_data(df)
+    if change_meta is not None:
+        meta = json.loads(metadata[b"mrlab_meta"])
+        change_meta(meta)
+        metadata[b"mrlab_meta"] = json.dumps(meta).encode()
+    new = pa.Table.from_pandas(df, preserve_index=True).replace_schema_metadata(metadata)
+    pq.write_table(new, path)
+
+
+def _tamper_close(df):
+    df = df.copy()
+    df.iloc[1:, df.columns.get_loc("close")] *= 1.25
+    return df
+
+
+def test_tampered_snapshot_is_rejected_when_read(tmp_path):
+    cache = SnapshotCache(tmp_path)
+    sid = cache.put(series()).meta.snapshot_id
+    _rewrite_parquet(next(tmp_path.glob("yahoo/KO/*.parquet")), change_data=_tamper_close)
+    with pytest.raises(DataError) as exc_info:
+        cache.get(sid)
+    err = exc_info.value
+    assert err.code == "SNAPSHOT_CORRUPTO"
+    assert "alterada" in err.message and "vuelve a cargar" in err.message
+    assert err.details["id_recalculado"] != sid
+
+
+def test_tampered_metadata_is_rejected_when_read(tmp_path):
+    cache = SnapshotCache(tmp_path)
+    sid = cache.put(series()).meta.snapshot_id
+
+    def other_currency(meta):
+        meta["asset"]["currency"] = "EUR"
+
+    _rewrite_parquet(next(tmp_path.glob("yahoo/KO/*.parquet")), change_meta=other_currency)
+    with pytest.raises(DataError) as exc_info:
+        cache.get(sid)
+    assert exc_info.value.code == "SNAPSHOT_CORRUPTO"
+
+
+def test_snapshot_copied_under_another_id_is_rejected(tmp_path):
+    cache = SnapshotCache(tmp_path)
+    sid_a = cache.put(series(values=(1.0, 2.0, 3.0))).meta.snapshot_id
+    sid_b = cache.put(series(values=(4.0, 5.0, 6.0))).meta.snapshot_id
+    folder = tmp_path / "yahoo" / "KO"
+    (folder / f"{sid_b}.parquet").write_bytes((folder / f"{sid_a}.parquet").read_bytes())
+    with pytest.raises(DataError) as exc_info:
+        cache.get(sid_b)
+    assert exc_info.value.code == "SNAPSHOT_CORRUPTO"
+    assert cache.get(sid_a).meta.snapshot_id == sid_a
+
+
+def test_put_rewrites_a_tampered_or_damaged_snapshot(tmp_path):
+    cache = SnapshotCache(tmp_path)
+    original = series(values=np.linspace(10.0, 20.0, 50))
+    stored = cache.put(original)
+    path = next(tmp_path.glob("yahoo/KO/*.parquet"))
+
+    _rewrite_parquet(path, change_data=_tamper_close)
+    repaired = cache.put(original)  # volver a cargar los datos originales la repara
+    assert repaired.meta.snapshot_id == stored.meta.snapshot_id
+    pd.testing.assert_frame_equal(cache.get(stored.meta.snapshot_id).data, stored.data)
+
+    path.write_bytes(b"basura")  # también un archivo ilegible
+    cache.put(original)
+    pd.testing.assert_frame_equal(cache.get(stored.meta.snapshot_id).data, stored.data)
+
+
+def test_snapshot_written_before_a_new_model_field_still_verifies(tmp_path):
+    """La verificación usa la identidad guardada: un campo nuevo no invalida la caché."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from mrlab.data.cache import _id_from, _identity_of, canonical_frame
+
+    data = canonical_frame(series().data)
+    old_meta = json.loads(series().meta.model_dump_json())
+    del old_meta["asset"]["timezone"]  # como si el modelo aún no tuviera ese campo
+    del old_meta["seed"]
+    sid = _id_from(_identity_of(old_meta), data)
+    old_meta["snapshot_id"] = sid
+    path = tmp_path / "yahoo" / "KO" / f"{sid}.parquet"
+    path.parent.mkdir(parents=True)
+    table = pa.Table.from_pandas(data, preserve_index=True)
+    metadata = {**table.schema.metadata, b"mrlab_meta": json.dumps(old_meta).encode()}
+    pq.write_table(table.replace_schema_metadata(metadata), path)
+
+    loaded = SnapshotCache(tmp_path).get(sid)
+    assert loaded.meta.snapshot_id == sid and loaded.meta.asset.timezone is None

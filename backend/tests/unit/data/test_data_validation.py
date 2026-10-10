@@ -143,6 +143,27 @@ def test_suspicious_jump_over_50_percent_is_a_warning():
     assert "50 %" in jump.message and "ajuste" in jump.message
 
 
+@pytest.mark.parametrize(
+    "prices, flagged",
+    [
+        ([100.0, 101.0, 50.7, 51.0], True),  # split 2:1 sin ajustar con el mercado al alza
+        ([100.0, 101.0, 202.8, 203.0], True),  # contrasplit 1:2
+        ([100.0, 66.0, 66.5], True),  # −34 %: |ln| = 0,416 > ln 1,5
+        ([100.0, 68.0, 68.5], False),  # −32 %: |ln| = 0,386
+        ([100.0, 149.0, 149.5], False),  # +49 %
+        ([100.0, 151.0, 151.5], True),  # +51 %
+    ],
+)
+def test_suspicious_jump_threshold_is_symmetric_in_logs(prices, flagged):
+    """Hallazgo de la revisión: un split 2:1 sin ajustar (≈ −50 %) no se marcaba."""
+    s = make_series(prices, dates=pd.bdate_range("2020-01-01", periods=len(prices)))
+    _, val = clean_series(s)
+    assert bool(val.suspicious_jumps) is flagged
+    if flagged:
+        message = issue(val.issues, "SALTO_SOSPECHOSO").message
+        assert "split" in message and "33,3 %" in message and "50 %" in message
+
+
 def test_crypto_gap_is_reported_but_not_filled():
     days = pd.date_range("2021-01-01", periods=10, freq="D").delete([3, 4])
     s = make_series(np.arange(1.0, 9.0), dates=days, asset_class=AssetClass.CRYPTO)
@@ -198,6 +219,22 @@ def test_non_positive_prices_block_log_spread_only():
     assert "SPREAD_LOG_BLOQUEADO" not in codes(report_p.issues)
     assert issue(report_p.issues, "PRECIOS_NO_POSITIVOS").severity == Severity.WARNING
     assert aligned_p is not None
+
+
+def test_status_message_is_not_apt_when_there_are_error_issues():
+    """Hallazgo de la revisión: «Datos aptos» con incidencias de severidad error."""
+    close = walk(1000, 4)
+    close[500] = 0.0
+    close[501] = -0.5
+    a = make_series(walk(1000, 3), symbol="A")
+    b = make_series(close, symbol="B")
+    report, _ = validate_pair(a, b, SpreadType.PRICE)
+    assert not report.blocked
+    assert any(i.severity == Severity.ERROR for i in report.issues)
+    assert "aptos" not in report.status_message
+    assert report.status_message.startswith("Datos utilizables con incidencias")
+    assert "«B»" in report.status_message and "cero" in report.status_message
+    assert "1.000 observaciones comunes, 600 en formación" in report.status_message
 
 
 def test_non_positive_price_outside_common_dates_does_not_block():

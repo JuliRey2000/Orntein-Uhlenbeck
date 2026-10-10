@@ -5,8 +5,8 @@ CONTRATO:
   (",", ":"), ``ensure_ascii=False``, fechas ISO, floats con ``repr``; acepta
   modelos pydantic (``model_dump(mode="json")``).
 - ``config_hash(cfg)``: sha256 hex de ``canonical_json`` del RunConfig SIN los
-  campos ``config_hash`` y ``code_version`` (la identidad de la configuración no
-  depende de la versión del código, que se registra aparte).
+  campos ``config_hash``, ``code_version``, ``series`` y ``test_history`` (ver
+  ``HASH_EXCLUDED``).
 - ``git_version()``: variable de entorno ``GIT_COMMIT`` si existe; si no
   ``git rev-parse HEAD`` (+ "-dirty" si hay cambios sin confirmar); si falla,
   "desconocido". Nunca lanza excepción.
@@ -22,6 +22,26 @@ Precisiones de la implementación:
 - Un ``run_config.json`` escrito a mano SIN ``config_hash`` se acepta (no hay
   nada que verificar) y se le calcula el hash al cargarlo; uno con hash que no
   coincide se rechaza. Un ``schema_version`` mayor que el soportado también.
+- Identidad (``config_hash``): ``series`` se excluye entero porque solo describe
+  los datos (fecha de descarga o lectura, cobertura, notas) y las referencias
+  fijadas por ``snapshot_id`` en ``pair`` ya identifican el contenido; así los
+  mismos CSV registrados en momentos distintos dan el mismo hash. ``test_history``
+  se excluye porque es un registro de ejecuciones, no un parámetro.
+- ``include_test`` (forma parte del hash): si la ejecución incluye el segmento
+  de prueba. ``test_history``: hashes de las configuraciones con las que se ha
+  ejecutado la prueba; el runner lo usa para marcar «prueba contaminada»
+  (decisión S10, versión mínima de la fase 1: el registro viaja dentro del
+  archivo; el registro persistente de estudios llega en la fase 2).
+- Versión de esquema 2 (añade ``include_test`` y ``test_history`` y cambia la
+  definición del hash). Un archivo de la versión 1 se verifica con la
+  definición de entonces (el JSON tal como se guardó, sin
+  ``config_hash`` ni ``code_version``) y se devuelve actualizado a la versión 2
+  con su hash nuevo; si no coincide, se rechaza como cualquier archivo editado.
+- Errores de formato: mensaje propio en español con la ruta de cada campo
+  (p. ej. ``strategy.entry_z``), el problema y el valor recibido; los detalles
+  (``details["errores"]``) llevan lo mismo estructurado. Un error de
+  coherencia de los parámetros (p. ej. ``UMBRALES_INCONSISTENTES`` o
+  ``COSTES_INVALIDOS``) conserva su código y nombra el archivo.
 """
 
 from __future__ import annotations
@@ -39,14 +59,19 @@ from pydantic import BaseModel, Field, ValidationError
 
 from mrlab.analysis.pair_pipeline import AnalysisConfig
 from mrlab.backtest.split import SampleSplit
-from mrlab.domain.errors import ConfigError
+from mrlab.domain.errors import ConfigError, LabError
 from mrlab.domain.models import DataOrigin, SeriesMeta
 from mrlab.strategy.params import CostParams, StrategyParams
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 UNKNOWN_VERSION = "desconocido"
-_HASH_EXCLUDED = {"config_hash", "code_version"}
+#: Campos que NO forman parte de la identidad de la configuración.
+HASH_EXCLUDED = frozenset({"config_hash", "code_version", "series", "test_history"})
+#: Definición del hash en la versión 1 del esquema (solo para verificar archivos antiguos).
+_HASH_EXCLUDED_V1 = frozenset({"config_hash", "code_version"})
 _GIT_TIMEOUT_S = 5
+_MAX_REPORTED_ERRORS = 5
+_MAX_VALUE_CHARS = 60
 
 
 class SeriesRef(BaseModel):
@@ -72,9 +97,11 @@ class RunConfig(BaseModel):
     costs: CostParams = CostParams()
     frozen_split: SampleSplit | None = None
     seeds: dict[str, int] = Field(default_factory=dict)
+    include_test: bool = False  # ¿la ejecución incluye el segmento de prueba?
     data_origin: DataOrigin | None = None
-    series: list[SeriesMeta] = Field(default_factory=list)
-    code_version: str | None = None
+    series: list[SeriesMeta] = Field(default_factory=list)  # fuera del hash
+    test_history: list[str] = Field(default_factory=list)  # fuera del hash (decisión S10)
+    code_version: str | None = None  # fuera del hash
     config_hash: str | None = None
 
 
@@ -122,10 +149,19 @@ def canonical_json(obj: Any) -> str:
     return _dumps(obj, indent=None)
 
 
-def config_hash(cfg: RunConfig) -> str:
-    """Identidad de la configuración (sin ``config_hash`` ni ``code_version``)."""
-    payload = cfg.model_dump(mode="json", exclude=_HASH_EXCLUDED)
+def _sha256(payload: Any) -> str:
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def config_hash(cfg: RunConfig) -> str:
+    """Identidad de la configuración (sin los campos de ``HASH_EXCLUDED``)."""
+    return _sha256(cfg.model_dump(mode="json", exclude=set(HASH_EXCLUDED)))
+
+
+def _legacy_v1_hash(cfg: RunConfig) -> str:
+    """Hash de la versión 1: el JSON tal como se guardó (campos presentes en el archivo),
+    sin ``config_hash`` ni ``code_version``."""
+    return _sha256(cfg.model_dump(mode="json", exclude=set(_HASH_EXCLUDED_V1), exclude_unset=True))
 
 
 def _git(*args: str) -> str:
@@ -169,6 +205,107 @@ def run_config_bytes(cfg: RunConfig) -> bytes:
     return (_dumps(stamped, indent=2) + "\n").encode("utf-8")
 
 
+# --------------------------------------------------------------------------- errores de formato
+
+#: Tipo de error de pydantic → problema en español (``{...}`` se rellena con ``ctx``).
+_PROBLEMS_ES: dict[str, str] = {
+    "missing": "falta este campo",
+    "extra_forbidden": "campo no reconocido",
+    "float_parsing": "debe ser un número",
+    "float_type": "debe ser un número",
+    "finite_number": "debe ser un número finito",
+    "int_parsing": "debe ser un número entero",
+    "int_type": "debe ser un número entero",
+    "int_from_float": "debe ser un número entero (sin decimales)",
+    "int_parsing_size": "es un número entero demasiado grande",
+    "bool_parsing": "debe ser true o false",
+    "bool_type": "debe ser true o false",
+    "string_type": "debe ser un texto entre comillas",
+    "dict_type": "debe ser un objeto JSON ({…})",
+    "model_type": "debe ser un objeto JSON ({…})",
+    "model_attributes_type": "debe ser un objeto JSON ({…})",
+    "list_type": "debe ser una lista JSON ([…])",
+    "date_type": "debe ser una fecha AAAA-MM-DD",
+    "date_parsing": "debe ser una fecha AAAA-MM-DD",
+    "date_from_datetime_parsing": "debe ser una fecha AAAA-MM-DD",
+    "date_from_datetime_inexact": "debe ser una fecha AAAA-MM-DD (sin hora)",
+    "datetime_type": "debe ser una fecha y hora ISO (AAAA-MM-DDTHH:MM:SS)",
+    "datetime_parsing": "debe ser una fecha y hora ISO (AAAA-MM-DDTHH:MM:SS)",
+    "datetime_from_date_parsing": "debe ser una fecha y hora ISO (AAAA-MM-DDTHH:MM:SS)",
+    "greater_than": "debe ser mayor que {gt}",
+    "greater_than_equal": "debe ser mayor o igual que {ge}",
+    "less_than": "debe ser menor que {lt}",
+    "less_than_equal": "debe ser como máximo {le}",
+    "literal_error": "debe ser uno de estos valores: {expected}",
+    "enum": "debe ser uno de estos valores: {expected}",
+    "string_too_short": "es demasiado corto",
+    "string_too_long": "es demasiado largo",
+    "too_short": "tiene muy pocos elementos",
+    "too_long": "tiene demasiados elementos",
+}
+
+
+def _field_path(loc: tuple[Any, ...]) -> str:
+    text = ""
+    for part in loc:
+        text += f"[{part}]" if isinstance(part, int) else (f".{part}" if text else str(part))
+    return text or "configuración"
+
+
+def _ctx_text(value: Any) -> str:
+    text = str(value).replace(" or ", " o ")
+    return text.replace(".", ",") if isinstance(value, float) else text
+
+
+def _problem(err: dict[str, Any]) -> str:
+    kind = err.get("type", "")
+    ctx = err.get("ctx") or {}
+    if kind in ("value_error", "assertion_error") and "error" in ctx:
+        return str(ctx["error"])  # mensaje de un validador propio
+    template = _PROBLEMS_ES.get(kind)
+    if template is None:
+        return f"valor no válido (tipo de error «{kind}»)"
+    try:
+        return template.format(**{k: _ctx_text(v) for k, v in ctx.items()})
+    except (KeyError, IndexError):
+        return template
+
+
+def _received(value: Any) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            text = repr(value)
+    return text if len(text) <= _MAX_VALUE_CHARS else text[: _MAX_VALUE_CHARS - 1] + "…"
+
+
+def _validation_problems(exc: ValidationError) -> list[dict[str, str | None]]:
+    problems = []
+    for err in exc.errors():
+        missing = err.get("type") == "missing"
+        problems.append(
+            {
+                "campo": _field_path(tuple(err.get("loc", ()))),
+                "problema": _problem(err),
+                "recibido": None if missing else _received(err.get("input")),
+            }
+        )
+    return problems
+
+
+def _describe(problem: dict[str, str | None]) -> str:
+    text = f"«{problem['campo']}» {problem['problema']}"
+    if problem["recibido"] is not None:
+        text += f" (recibido: {problem['recibido']})"
+    return text
+
+
+# --------------------------------------------------------------------------- cargar
+
+
 def load_run_config(path: Path | str) -> RunConfig:
     """Lee un ``run_config.json`` y verifica que su hash corresponda a su contenido."""
     path = Path(path)
@@ -194,7 +331,7 @@ def load_run_config(path: Path | str) -> RunConfig:
             details={"path": str(path)},
         )
     version = raw.get("schema_version", SCHEMA_VERSION)
-    if not isinstance(version, int) or version > SCHEMA_VERSION:
+    if not isinstance(version, int) or isinstance(version, bool) or version > SCHEMA_VERSION:
         raise ConfigError(
             f"El archivo {path.name} usa la versión de esquema {version!r}, más nueva que la que "
             f"entiende esta versión del laboratorio ({SCHEMA_VERSION}). Actualiza el laboratorio.",
@@ -204,25 +341,38 @@ def load_run_config(path: Path | str) -> RunConfig:
     try:
         cfg = RunConfig.model_validate(raw)
     except ValidationError as exc:
-        problems = "; ".join(
-            f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in exc.errors()[:5]
-        )
+        problems = _validation_problems(exc)
+        listed = "; ".join(_describe(p) for p in problems[:_MAX_REPORTED_ERRORS])
+        if len(problems) > _MAX_REPORTED_ERRORS:
+            listed += f"; y {len(problems) - _MAX_REPORTED_ERRORS} problema(s) más"
         raise ConfigError(
-            f"El archivo {path.name} no tiene el formato de un run_config.json ({problems}).",
+            f"El archivo {path.name} no tiene el formato de un run_config.json: {listed}. Si lo "
+            "editaste a mano, corrige esos campos o vuelve a exportarlo desde el laboratorio.",
             code="RUN_CONFIG_INVALIDO",
-            details={"path": str(path)},
+            details={"path": str(path), "errores": problems},
+        ) from None
+    except LabError as exc:  # coherencia de parámetros (umbrales, costes…)
+        raise ConfigError(
+            f"El archivo {path.name} tiene parámetros no válidos: {exc.message}",
+            code=exc.code,
+            details={**exc.details, "path": str(path)},
         ) from exc
 
-    expected = config_hash(cfg)
-    if cfg.config_hash is None:
-        return cfg.model_copy(update={"config_hash": expected})
-    if cfg.config_hash != expected:
+    legacy = cfg.schema_version < SCHEMA_VERSION
+    # Un archivo de la versión 1 se verifica con la definición del hash de entonces.
+    stored_def = _legacy_v1_hash(cfg) if legacy else config_hash(cfg)
+    if cfg.config_hash is not None and cfg.config_hash != stored_def:
         raise ConfigError(
             f"El hash de {path.name} no coincide con su contenido (guardado {cfg.config_hash[:12]}…, "
-            f"calculado {expected[:12]}…): el archivo se modificó después de exportarlo. Para "
+            f"calculado {stored_def[:12]}…): el archivo se modificó después de exportarlo. Para "
             "reproducir un análisis usa el archivo original; si quieres cambiar parámetros, hazlo "
             "desde el laboratorio para obtener una configuración nueva con su propio hash.",
             code="RUN_CONFIG_HASH_DISTINTO",
-            details={"path": str(path), "guardado": cfg.config_hash, "calculado": expected},
+            details={"path": str(path), "guardado": cfg.config_hash, "calculado": stored_def},
         )
+    if legacy:
+        cfg = cfg.model_copy(update={"schema_version": SCHEMA_VERSION})
+    expected = config_hash(cfg)
+    if cfg.config_hash != expected:
+        cfg = cfg.model_copy(update={"config_hash": expected})
     return cfg

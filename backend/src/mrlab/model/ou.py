@@ -10,11 +10,15 @@ Estimación exacta con observaciones equiespaciadas (Δt = 1 observación):
 
 CONTRATO:
 - ``fit_ou``: AR(1) por MCO con constante sobre el spread de formación;
-  ``s2 = SRC/(n−2)``. Si b ≥ 1 → status NON_STATIONARY; si b ≤ 0 →
-  NON_POSITIVE_B; menos de 30 puntos → INSUFFICIENT. En todos esos casos
-  ``valid=False`` y lam/mu/sigma/sigma_eq/half_life/mu_se = None, con
-  ``message`` en español ("el spread no muestra reversión estacionaria
-  compatible con un OU"). Nunca producir números engañosos.
+  ``s2 = SRC/(n−2)``. El ajuste solo es VÁLIDO si 0 < b < 1 Y la prueba de
+  Dickey–Fuller sobre ese AR(1) (estadístico (b̂ − 1)/EE(b̂), sin rezagos, con
+  constante) RECHAZA la raíz unitaria al nivel ``unit_root_alpha`` (decisión
+  O7). Si b ≥ 1, o si 0 < b < 1 pero la prueba no rechaza (``near_unit_root``)
+  → status NON_STATIONARY; si b ≤ 0 → NON_POSITIVE_B; menos de 30 puntos,
+  spread constante, determinista o nulo frente a ``scale`` → INSUFFICIENT. En
+  todos esos casos ``valid=False`` y lam/mu/sigma/sigma_eq/half_life/mu_se =
+  None, con ``message`` en español ("el spread no muestra reversión
+  estacionaria compatible con un OU"). Nunca producir números engañosos.
   Advertencias (si válido): vida media > 126 → demasiado lenta para operar con
   este horizonte; vida media < 1 → no operable ni fiable con datos diarios.
   ``mu_se = σ_eq·sqrt((1+b)/((1−b)·n))`` (error estándar asintótico de μ̂).
@@ -38,13 +42,22 @@ Notas de implementación:
   el número de pares de la regresión.
 - Un spread constante o sin componente aleatorio → INSUFFICIENT (no hay
   variación que modelar).
-- Paseo aleatorio y sesgo de Dickey–Fuller: con un paseo aleatorio, el b̂ de MCO
-  queda por debajo de 1 en ≈ 95 % de las muestras, así que el criterio b ≥ 1
-  casi nunca lo detecta. Por eso, si el ajuste es válido pero
-  (b̂ − 1)/EE(b̂) no baja del valor crítico de Dickey–Fuller al 5 % (con
-  constante, MacKinnon), se marca ``near_unit_root`` y se añade una advertencia.
-  Es solo un aviso: la validez sigue siendo 0 < b < 1 (decisión O5) y la
-  evidencia de reversión la da Engle–Granger.
+- Paseo aleatorio y sesgo de Dickey–Fuller (decisión O7): con un paseo
+  aleatorio, el b̂ de MCO queda por debajo de 1 en ≈ 95 % de las muestras, así
+  que el criterio b ≥ 1 casi nunca lo detecta. Por eso la validez exige además
+  que (b̂ − 1)/EE(b̂) quede por debajo del valor crítico de MacKinnon con
+  constante al nivel ``unit_root_alpha``: con N = 1 para una serie observada
+  (por defecto) y con N = 2 (``estimated_residual=True``) cuando el spread es el
+  RESIDUO de una regresión de cointegración estimada con los mismos datos (la
+  MCO lo hace parecer más estacionario; son los valores críticos de
+  Engle–Granger). Para 1 %, 5 % y 10 % se usan los valores con corrección de
+  muestra finita (``mackinnoncrit``); para otros niveles, el valor asintótico
+  que se obtiene invirtiendo ``mackinnonp``. Si no se rechaza: NON_STATIONARY,
+  ``near_unit_root=True`` y se conservan a, b, df_stat y df_crit.
+- ``scale`` (opcional): escala absoluta de las series de origen (p. ej. la
+  desviación de f(y) en formación). Si la desviación del spread es menor que
+  1e-10·scale, el spread es ruido de redondeo (dos piernas idénticas o
+  proporcionales) → INSUFFICIENT.
 - λ, la vida media y los horizontes de pronóstico están en ``time_unit`` (con
   Δt = 1, una observación = un día de negociación, decisión O4).
 """
@@ -57,8 +70,9 @@ from enum import StrEnum
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel
+from scipy.optimize import brentq
 from scipy.stats import norm
-from statsmodels.tsa.adfvalues import mackinnoncrit
+from statsmodels.tsa.adfvalues import mackinnoncrit, mackinnonp
 
 from mrlab.domain.errors import ConfigError, ModelError
 
@@ -69,6 +83,11 @@ HALF_LIFE_MAX_WARN = 126.0
 HALF_LIFE_MIN_WARN = 1.0
 MIN_OBS_OU = 30
 SIM_BAND_K = 2.0  # bandas de la simulación: ± 2 desviaciones estándar
+UNIT_ROOT_ALPHA_DEFAULT = 0.05
+#: Niveles con valores críticos de muestra finita de MacKinnon (``mackinnoncrit``).
+DF_TABLE_LEVELS = (0.01, 0.05, 0.10)
+#: Un spread con desviación < SCALE_REL_TOL·escala de las series es ruido de redondeo.
+SCALE_REL_TOL = 1e-10
 
 NOT_OU_MESSAGE = "El spread no muestra reversión estacionaria compatible con un OU"
 
@@ -118,9 +137,12 @@ class OUFit(BaseModel):
     time_unit: str = TIME_UNIT_DEFAULT
     message: str = ""
     warnings: list[str] = []
-    # Diagnóstico de raíz unitaria (solo informativo, ver notas del módulo)
+    # Prueba de raíz unitaria del AR(1) (decisión O7, ver notas del módulo)
     df_stat: float | None = None  # (b̂ − 1)/EE(b̂): estadístico de Dickey–Fuller sin rezagos
-    near_unit_root: bool = False  # válido, pero b̂ no se distingue de 1 al 5 %
+    df_crit: float | None = None  # valor crítico de MacKinnon (con constante) al nivel df_alpha
+    df_alpha: float = UNIT_ROOT_ALPHA_DEFAULT
+    df_estimated_residual: bool = False  # True → valores críticos N = 2 (residuo estimado)
+    near_unit_root: bool = False  # 0 < b̂ < 1 pero b̂ no se distingue de 1 (implica no válido)
 
 
 class OUForecast(BaseModel):
@@ -208,9 +230,61 @@ def _fmt_g(x: float) -> str:
     return f"{x:g}".replace(".", ",")
 
 
+def _fmt_sci(x: float) -> str:
+    """Número muy pequeño o muy grande en notación científica con coma decimal: «4,77e-16»."""
+    return f"{x:.2e}".replace(".", ",")
+
+
+def _fmt_pct(fraction: float) -> str:
+    """0.05 → «5 %», 0.025 → «2,5 %»."""
+    return f"{_fmt_g(round(fraction * 100, 6))} %"
+
+
 def _plural(time_unit: str) -> str:
     """'día de negociación' → 'días de negociación' (otras unidades se dejan igual)."""
     return "días" + time_unit[3:] if time_unit.startswith("día") else time_unit
+
+
+# --------------------------------------------------------------------------- raíz unitaria
+
+
+def dickey_fuller_critical_value(
+    alpha: float, nobs: int, *, estimated_residual: bool = False
+) -> float:
+    """Valor crítico (cola izquierda) de Dickey–Fuller con constante, de MacKinnon.
+
+    ``estimated_residual=False`` → N = 1 (serie observada); ``True`` → N = 2 (residuo
+    de una regresión de cointegración estimada, los valores de Engle–Granger). Para
+    1 %, 5 % y 10 % se usan los valores con corrección de muestra finita
+    (``mackinnoncrit`` con ``nobs``); para otros niveles, el valor asintótico que
+    resulta de invertir la aproximación de p-values ``mackinnonp``.
+    """
+    if not (math.isfinite(alpha) and 0.0 < alpha < 1.0):
+        raise ConfigError(
+            "El nivel de la prueba de raíz unitaria debe estar entre 0 y 1 (por ejemplo 0,05).",
+            code="NIVEL_INVALIDO",
+            details={"alpha": alpha},
+        )
+    n_vars = 2 if estimated_residual else 1
+    table = mackinnoncrit(N=n_vars, regression="c", nobs=nobs)
+    for level, crit in zip(DF_TABLE_LEVELS, table, strict=True):
+        if math.isclose(alpha, level, rel_tol=0.0, abs_tol=1e-12):
+            return float(crit)
+    return float(brentq(lambda s: mackinnonp(s, regression="c", N=n_vars) - alpha, -50.0, 50.0))
+
+
+def _df_comparison(stat: float, crit: float, alpha: float, estimated_residual: bool) -> str:
+    """«estadístico de Dickey–Fuller −3,04 frente al valor crítico −3,34 al 5 % (…)»."""
+    which = (
+        "valor crítico de Engle–Granger, porque el spread es el residuo de una regresión "
+        "estimada con estos mismos datos"
+        if estimated_residual
+        else "valor crítico de MacKinnon con constante"
+    )
+    return (
+        f"estadístico de Dickey–Fuller {_fmt(stat, 2)} frente al valor crítico {_fmt(crit, 2)} "
+        f"al {_fmt_pct(alpha)}; {which}"
+    )
 
 
 # --------------------------------------------------------------------------- estimación
@@ -223,10 +297,32 @@ def fit_ou(
     *,
     half_life_max: float = HALF_LIFE_MAX_WARN,
     half_life_min: float = HALF_LIFE_MIN_WARN,
+    unit_root_alpha: float = UNIT_ROOT_ALPHA_DEFAULT,
+    estimated_residual: bool = False,
+    scale: float | None = None,
 ) -> OUFit:
-    """Ajusta el OU por su discretización exacta: AR(1) por MCO con constante."""
+    """Ajusta el OU por su discretización exacta: AR(1) por MCO con constante.
+
+    El ajuste es válido solo si 0 < b < 1 y Dickey–Fuller rechaza la raíz unitaria al
+    nivel ``unit_root_alpha`` (decisión O7). ``estimated_residual=True`` usa los valores
+    críticos para el residuo de una regresión de cointegración estimada (N = 2).
+    ``scale``: escala absoluta de las series de origen; un spread con desviación menor que
+    ``1e-10·scale`` es ruido de redondeo → INSUFFICIENT.
+    """
     if not (math.isfinite(dt) and dt > 0):
         raise ConfigError("Δt debe ser un número positivo.", code="DT_INVALIDO", details={"dt": dt})
+    if not (math.isfinite(unit_root_alpha) and 0.0 < unit_root_alpha < 1.0):
+        raise ConfigError(
+            "El nivel de la prueba de raíz unitaria debe estar entre 0 y 1 (por ejemplo 0,05).",
+            code="NIVEL_INVALIDO",
+            details={"unit_root_alpha": unit_root_alpha},
+        )
+    if scale is not None and not (math.isfinite(scale) and scale > 0):
+        raise ConfigError(
+            "La escala de referencia del spread debe ser un número positivo.",
+            code="ESCALA_INVALIDA",
+            details={"scale": scale},
+        )
     x = np.asarray(spread, dtype=float)
     if x.ndim != 1:
         raise ConfigError("El spread debe ser una serie unidimensional.", code="SPREAD_INVALIDO")
@@ -235,7 +331,13 @@ def fit_ou(
     usable = np.isfinite(prev) & np.isfinite(nxt)
     prev, nxt = prev[usable], nxt[usable]
     n = int(prev.size)
-    base = {"nobs": n, "dt": dt, "time_unit": time_unit}
+    base = {
+        "nobs": n,
+        "dt": dt,
+        "time_unit": time_unit,
+        "df_alpha": unit_root_alpha,
+        "df_estimated_residual": estimated_residual,
+    }
 
     if n + 1 < MIN_OBS_OU:
         n_points = n + 1 if n else int(np.isfinite(x).sum())
@@ -259,6 +361,21 @@ def fit_ou(
             message="El spread es constante: no hay variación que modelar con un OU.",
             **base,
         )
+    if scale is not None:
+        spread_sd = float(np.std(x[np.isfinite(x)]))
+        if spread_sd < SCALE_REL_TOL * scale:
+            return OUFit(
+                status=OUStatus.INSUFFICIENT,
+                valid=False,
+                message=(
+                    "La variación del spread es prácticamente nula frente al nivel de las series "
+                    f"(desviación estándar {_fmt_sci(spread_sd)} frente a una escala de "
+                    f"{_fmt_sci(scale)}): lo que queda es ruido de redondeo numérico, típico "
+                    "cuando las dos piernas son la misma serie o una es un múltiplo exacto de la "
+                    "otra. Un OU no es un modelo adecuado para estos datos."
+                ),
+                **base,
+            )
     b = float(d0 @ (nxt - m1)) / sxx
     a = float(m1 - b * m0)
     resid = nxt - a - b * prev
@@ -278,7 +395,20 @@ def fit_ou(
         )
     b_se = math.sqrt(s2 / sxx)
     a_se = math.sqrt(s2 * (1.0 / n + m0 * m0 / sxx))
-    regression = {"a": a, "b": b, "a_se": a_se, "b_se": b_se, "s2": s2, "df_stat": (b - 1.0) / b_se}
+    df_stat = (b - 1.0) / b_se
+    df_crit = dickey_fuller_critical_value(
+        unit_root_alpha, n, estimated_residual=estimated_residual
+    )
+    regression = {
+        "a": a,
+        "b": b,
+        "a_se": a_se,
+        "b_se": b_se,
+        "s2": s2,
+        "df_stat": df_stat,
+        "df_crit": df_crit,
+    }
+    comparison = _df_comparison(df_stat, df_crit, unit_root_alpha, estimated_residual)
 
     if b >= 1.0:
         return OUFit(
@@ -306,6 +436,22 @@ def fit_ou(
             **regression,
             **base,
         )
+    if df_stat > df_crit:
+        return OUFit(
+            status=OUStatus.NON_STATIONARY,
+            valid=False,
+            near_unit_root=True,
+            message=(
+                f"{NOT_OU_MESSAGE}: el coeficiente AR(1) estimado es b = {_fmt(b)}, menor que 1, "
+                f"pero no se distingue estadísticamente de 1 ({comparison}). Con estos datos no "
+                "se puede distinguir el spread de un paseo aleatorio: un b algo menor que 1 es "
+                "lo esperable incluso en un paseo aleatorio (sesgo de Dickey–Fuller), así que no "
+                "hay evidencia de que las desviaciones se corrijan. No se calculan λ, μ, σ, vida "
+                "media ni bandas."
+            ),
+            **regression,
+            **base,
+        )
 
     lam = -math.log(b) / dt
     mu = a / (1.0 - b)
@@ -314,8 +460,6 @@ def fit_ou(
     half_life = math.log(2.0) / lam
     mu_se = sigma_eq * math.sqrt((1.0 + b) / ((1.0 - b) * n))
     units = _plural(time_unit)
-    df_crit_5 = float(mackinnoncrit(N=1, regression="c", nobs=n)[1])
-    near_unit_root = regression["df_stat"] > df_crit_5
 
     warnings: list[str] = []
     if half_life > half_life_max:
@@ -328,26 +472,13 @@ def fit_ou(
             f"Vida media de {_fmt(half_life, 2)} {units} (< {_fmt_g(half_life_min)}): con datos "
             "diarios no es operable ni fiable."
         )
-    if near_unit_root:
-        warnings.append(
-            f"b = {_fmt(b)} está muy cerca de 1: con estos datos no se distingue de un paseo "
-            f"aleatorio (estadístico de Dickey–Fuller {_fmt(regression['df_stat'], 2)}, por encima "
-            f"del valor crítico al 5 % de {_fmt(df_crit_5, 2)}). λ y la vida media son muy "
-            "imprecisos y el spread podría no revertir. Este cálculo no reemplaza la prueba de "
-            "cointegración."
-        )
-        message = (
-            f"El AR(1) del spread tiene 0 < b < 1 (b = {_fmt(b)}), con una vida media estimada de "
-            f"{_fmt(half_life, 1)} {units}, pero b no se distingue estadísticamente de 1: no hay "
-            "evidencia de que las desviaciones respecto de μ se corrijan (ver advertencias)."
-        )
-    else:
-        message = (
-            f"El AR(1) del spread tiene 0 < b < 1 (b = {_fmt(b)}): en esta muestra las "
-            "desviaciones respecto de μ tienden a corregirse, con una vida media estimada de "
-            f"{_fmt(half_life, 1)} {units}. Que el ajuste sea válido no prueba por sí solo que el "
-            "spread revierta: esa evidencia la da la prueba de cointegración."
-        )
+    message = (
+        f"El AR(1) del spread tiene 0 < b < 1 (b = {_fmt(b)}) y la prueba de Dickey–Fuller "
+        f"rechaza la raíz unitaria ({comparison}): en esta muestra las desviaciones respecto de "
+        f"μ tienden a corregirse, con una vida media estimada de {_fmt(half_life, 1)} {units}. "
+        "Que el ajuste sea válido no garantiza que el spread siga revirtiendo fuera de la "
+        "muestra: la evidencia de cointegración la da la prueba de Engle–Granger."
+    )
 
     return OUFit(
         status=OUStatus.VALID,
@@ -360,7 +491,6 @@ def fit_ou(
         mu_se=mu_se,
         message=message,
         warnings=warnings,
-        near_unit_root=near_unit_root,
         **regression,
         **base,
     )

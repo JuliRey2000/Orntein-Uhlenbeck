@@ -15,7 +15,7 @@ from datetime import date, datetime
 from enum import StrEnum
 
 import pandas as pd
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class AssetClass(StrEnum):
@@ -83,6 +83,14 @@ class AssetInfo(BaseModel):
     executable: bool = True  # False para índices y futuros → exige proxy
     suggested_proxy: str | None = None
     notes: tuple[str, ...] = ()
+
+    @model_validator(mode="before")
+    @classmethod
+    def _indices_and_futures_are_not_executable(cls, data):
+        """Un índice o un futuro nunca es ejecutable, lo declare quien lo declare (D1)."""
+        if isinstance(data, dict) and AssetClass(data.get("asset_class", AssetClass.OTHER)) in NON_EXECUTABLE_CLASSES:
+            data = {**data, "executable": False}
+        return data
 
     @property
     def is_synthetic(self) -> bool:

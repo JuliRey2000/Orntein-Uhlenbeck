@@ -90,7 +90,9 @@ def test_readme_has_disclaimer_execution_convention_and_dividends(historical_res
     assert readme.count(DISCLAIMER) == 2  # al principio y al final
     assert EXECUTION_CONVENTION in readme
     assert DIVIDENDS_NOTE in readme  # cierre ajustado: dividendos ya incluidos
-    assert "Prueba contaminada: no." in readme
+    # Sin prueba no se afirma «no contaminada»: no aplica (antes decía «no.» siempre).
+    assert "Prueba contaminada: no aplica: la prueba no se ejecutó." in readme
+    assert "Prueba contaminada: no." not in readme
     assert "NO ejecutado" in readme  # la prueba no se ejecutó
 
 
@@ -99,8 +101,39 @@ def test_contaminated_test_is_reported(historical_result):
     try:
         readme = export_files(historical_result)["LEEME.txt"].decode("utf-8")
     finally:
-        historical_result.test_contaminated = False
+        historical_result.test_contaminated = None
     assert "Prueba contaminada: SÍ" in readme
+
+
+def test_readme_states_where_the_contamination_check_comes_from(synthetic_result):
+    # La prueba se ejecutó por primera vez con esta configuración: «no», con su fuente.
+    assert synthetic_result.test_contaminated is False
+    files = export_files(synthetic_result)
+    readme = files["SINTETICO_LEEME.txt"].decode("utf-8")
+    assert (
+        "Prueba contaminada: no (según el historial registrado en run_config.json, la prueba "
+        "solo se ha ejecutado con esta configuración)." in readme
+    )
+    assert "fase 2" in readme  # el registro persistente de estudios llega después
+    config = files["SINTETICO_run_config.json"].decode("utf-8")
+    assert '"include_test": true' in config
+    assert synthetic_result.config.config_hash in config.split('"test_history"')[1]
+
+
+@pytest.mark.parametrize(
+    ("contaminated", "expected"),
+    [(None, "no aplica"), (False, "no"), (True, "sí")],
+)
+def test_statistics_file_reports_the_test_state(historical_result, contaminated, expected):
+    historical_result.test_contaminated = contaminated
+    try:
+        rows = csv_rows(export_files(historical_result)["pruebas_estadisticas.csv"])
+    finally:
+        historical_result.test_contaminated = None
+    test_rows = {r[3]: r[4] for r in rows if r[1] == "prueba"}
+    assert test_rows["contaminada"] == expected
+    assert test_rows["solicitada"] == "no" and test_rows["ejecutada"] == "no"
+    assert test_rows["configuraciones_en_historial"] == "0"
 
 
 def test_export_has_no_variable_timestamps(historical_result, synthetic_result):
@@ -172,3 +205,44 @@ def test_blocked_analysis_still_exports(tmp_path):
     readme = files["LEEME.txt"].decode("utf-8")
     assert "⛔ Datos insuficientes" in readme and "EUR" in readme
     assert "el análisis se detuvo antes" in readme
+
+
+# --------------------------------------------------------------------------- campos en español
+
+#: Campos del OU que se exportan con su símbolo matemático (iguales en ambos idiomas).
+MATH_FIELDS = {"a", "b", "s2", "nobs", "dt", "mu", "sigma", "sigma_eq"}
+
+
+def test_statistics_file_names_every_ou_field_in_spanish(historical_result):
+    # Hallazgo de integración: df_crit, df_alpha y df_estimated_residual (decisión O7) salían
+    # con su nombre en inglés en pruebas_estadisticas.csv.
+    from mrlab.model.ou import OUFit
+
+    rows = csv_rows(export_files(historical_result)["pruebas_estadisticas.csv"])
+    ou_fields = {r[3] for r in rows if r[1] == "ou"}
+    english = (set(OUFit.model_fields) - MATH_FIELDS) & ou_fields
+    assert not english, f"campos del OU sin traducir: {sorted(english)}"
+    assert {
+        "estadistico_dickey_fuller",
+        "valor_critico_dickey_fuller",
+        "nivel_dickey_fuller",
+        "valores_criticos_residuo_estimado",
+    } <= ou_fields
+
+
+def test_statistics_file_reports_non_evaluable_stability_windows(tmp_path):
+    # Una ventana de estabilidad no evaluable (tramo plano) se exporta con su motivo.
+    log_a, log_b = cointegrated_log_prices(n=1500, seed=11, lam=0.1)
+    log_a[300:600], log_b[300:600] = log_a[299], log_b[299]
+    data = service(tmp_path / "cache", csv=csv_provider(tmp_path / "uploads", log_a, log_b))
+    result = run_pair(pair_config("csv"), data)
+    rows = csv_rows(export_files(result)["pruebas_estadisticas.csv"])
+    windows = [r for r in rows if r[1] == "estabilidad_eg" and r[2].startswith("ventana")]
+    evaluable = {r[2]: r[4] for r in windows if r[3] == "evaluable"}
+    reasons = {r[2]: r[4] for r in windows if r[3] == "motivo"}
+    assert set(evaluable.values()) == {"sí", "no"}
+    for element, flag in evaluable.items():
+        if flag == "no":
+            assert "constante" in reasons[element]
+        else:
+            assert reasons[element] == ""

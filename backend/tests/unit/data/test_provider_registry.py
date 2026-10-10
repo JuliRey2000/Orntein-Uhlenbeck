@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from mrlab.config import BACKEND_ROOT
+from mrlab.config import BACKEND_ROOT, Settings
 from mrlab.data.providers.csv_provider import CSVProvider
 from mrlab.data.providers.synthetic import SyntheticProvider
 from mrlab.data.providers.yahoo import YahooProvider
@@ -128,3 +128,32 @@ def test_register_requires_provider_interface():
     with pytest.raises(ConfigError) as exc_info:
         registry.register("roto", object())  # type: ignore[arg-type]
     assert exc_info.value.code == "PROVEEDOR_INVALIDO"
+
+
+def test_yahoo_defaults_come_from_settings(monkeypatch):
+    monkeypatch.setenv("MRLAB_YAHOO_MAX_RETRIES", "1")
+    monkeypatch.setenv("MRLAB_YAHOO_BACKOFF_BASE_SECONDS", "0.25")
+    yahoo = ProviderRegistry.from_toml(PROVIDERS_TOML).get("yahoo")
+    assert (yahoo.max_retries, yahoo.backoff_base) == (1, 0.25)
+
+
+def test_toml_options_take_precedence_over_settings(tmp_path):
+    path = write(
+        tmp_path,
+        """
+[providers.yahoo]
+class = "mrlab.data.providers.yahoo:YahooProvider"
+max_retries = 2
+""",
+    )
+    settings = Settings(yahoo_max_retries=7, yahoo_backoff_base_seconds=3.0)
+    yahoo = ProviderRegistry.from_toml(path, settings=settings).get("yahoo")
+    assert (yahoo.max_retries, yahoo.backoff_base) == (2, 3.0)
+
+
+def test_invalid_retry_setting_is_a_spanish_config_error(tmp_path):
+    settings = Settings(yahoo_max_retries=-1)
+    with pytest.raises(ConfigError) as exc_info:
+        ProviderRegistry.from_toml(PROVIDERS_TOML, settings=settings)
+    assert exc_info.value.code == "CONFIG_PROVEEDORES_INVALIDA"
+    assert "MRLAB_YAHOO_MAX_RETRIES" in exc_info.value.message

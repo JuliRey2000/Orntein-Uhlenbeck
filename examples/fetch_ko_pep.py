@@ -32,7 +32,7 @@ except ImportError:  # permite ejecutarlo sin instalar el paquete
 
 from mrlab import DISCLAIMER  # noqa: E402
 from mrlab.config import get_settings  # noqa: E402
-from mrlab.data.providers.csv_provider import CSVMetadata, CSVProvider  # noqa: E402
+from mrlab.data.providers.csv_provider import CSVProvider, build_metadata  # noqa: E402
 from mrlab.data.providers.yahoo import YahooProvider  # noqa: E402
 from mrlab.domain.errors import LabError  # noqa: E402
 from mrlab.domain.models import DataOrigin, PriceSeries, PriceType  # noqa: E402
@@ -60,7 +60,7 @@ def fetch(
             "Declárala a mano al usar la demo (--currency)."
         )
     retrieved = series.meta.retrieved_at.isoformat() if series.meta.retrieved_at else "?"
-    meta = CSVMetadata(
+    meta = build_metadata(  # errores en español (CSV_METADATOS_INVALIDOS)
         symbol=asset.symbol,
         name=asset.name,
         currency=asset.currency,

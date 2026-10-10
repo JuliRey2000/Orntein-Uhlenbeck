@@ -8,9 +8,10 @@ CONTRATO:
   * COINTEGRATED: log B = log(b_start_price) + paseo aleatorio (drift b_drift,
     vol b_vol); X = OU exacto (``mrlab.model.ou.simulate_ou_exact``) con
     (ou_lambda, ou_mu, ou_sigma, x0 o μ); log A = α + β·log B + X.
-  * COINTEGRATED_LOW_CORRELATION: igual pero b_vol pequeño respecto a ou_sigma
-    (valores por defecto del escenario: b_vol=0.004, ou_sigma=0.015, λ=0.1) →
-    rendimientos poco correlacionados pero cointegrados.
+  * COINTEGRATED_LOW_CORRELATION: igual pero con un OU rápido cuyo cambio
+    diario domina al de B (valores por defecto del escenario: b_vol=0.01,
+    ou_sigma=0.03, λ=0.5) → rendimientos poco correlacionados (≈ 0,35) pero
+    cointegrados, y ambas series compatibles con I(1).
   * CORRELATED_NOT_COINTEGRATED: dos paseos aleatorios con incrementos
     correlacionados ``rho`` → alta correlación, sin cointegración.
   * INDEPENDENT: dos paseos aleatorios independientes (se ignora ``rho``).
@@ -20,7 +21,8 @@ CONTRATO:
 - Metadatos: origin=SINTETICO, price_type=SYNTHETIC, currency "USD",
   asset_class=EQUITY (calendario y costes de acciones), provider "synthetic",
   nombre que empiece por "SINTÉTICO — ", ``retrieved_at=None``,
-  ``source_note`` con escenario, parámetros y semilla.
+  ``source_note`` con escenario, parámetros y semilla, y ``SeriesMeta.seed`` con
+  la semilla (para registrarla en ``run_config.json``).
 - Símbolos deterministas: presets fijos ("SINT-COI-A"/"SINT-COI-B",
   "SINT-CNC-A"/"SINT-CNC-B" correlado no cointegrado, "SINT-CBC-A"/"SINT-CBC-B"
   cointegrado baja correlación, "SINT-IND-A"/"SINT-IND-B" independientes; todos
@@ -111,11 +113,19 @@ SCENARIO_LABELS: dict[SyntheticScenario, str] = {
     scenario: label for scenario, label in PRESET_SYMBOLS.values()
 }
 
+#: Valores por defecto propios de cada escenario. Los de «cointegrado con baja
+#: correlación» se eligieron para que, con la semilla del preset, ambas series sean
+#: «compatibles con I(1)» (ADF + KPSS, decisión E2), haya cointegración clara y la
+#: correlación de los log-rendimientos en formación quede por debajo de 0,5:
+#: corr(r_A, r_B) = b_vol / sqrt(b_vol² + 2·σ_eq²·(1 − e^{−λ})) ≈ 0,35, con
+#: σ_eq = σ/sqrt(2λ) = 3 % y vida media ln 2/λ ≈ 1,4 días. Con un OU lento y muy
+#: grande frente al paseo de B (λ = 0,1, σ = 0,015, b_vol = 0,004) la serie A
+#: parecía estacionaria en niveles y el par salía «⚠️ Supuestos dudosos».
 SCENARIO_DEFAULTS: dict[SyntheticScenario, dict[str, float]] = {
     SyntheticScenario.COINTEGRATED_LOW_CORRELATION: {
-        "b_vol": 0.004,
-        "ou_sigma": 0.015,
-        "ou_lambda": 0.1,
+        "b_vol": 0.01,
+        "ou_sigma": 0.03,
+        "ou_lambda": 0.5,
     },
 }
 
@@ -254,6 +264,7 @@ def generate_pair(
             coverage_end=cov_end,
             n_obs=n_obs,
             source_note=note,
+            seed=p.seed,
         )
         return PriceSeries(meta=meta, data=data)
 

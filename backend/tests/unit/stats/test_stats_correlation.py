@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from mrlab.domain.errors import DataError
+from mrlab.domain.errors import ConfigError, DataError
 from mrlab.stats.correlation import (
     correlation_matrix,
     log_returns,
@@ -177,6 +177,58 @@ def test_normalized_prices_without_common_dates() -> None:
 
 
 def test_invalid_rolling_window() -> None:
+    # Error del laboratorio (código estable y mensaje en español), no un ValueError crudo.
     df = price_frame(n=50)
-    with pytest.raises(ValueError):
+    with pytest.raises(ConfigError, match="al menos 2 observaciones") as exc:
         rolling_correlation(df["X"], df["Y"], window=1)
+    assert exc.value.code == "VENTANA_INVALIDA"
+
+
+def _with_duplicate(series: pd.Series, position: int, first_value: float) -> pd.Series:
+    """La serie con la fecha ``position`` repetida: primero ``first_value`` y después el valor
+    original (como llega cruda del proveedor o de la caché)."""
+    dup = pd.Series([first_value], index=series.index[[position]], name=series.name)
+    return pd.concat([series.iloc[:position], dup, series.iloc[position:]])
+
+
+def test_duplicate_dates_keep_the_last_value_like_the_validation() -> None:
+    df = price_frame(n=120)
+    x, y = df["X"], df["Y"]
+    y_dup = _with_duplicate(y, 30, first_value=y.iloc[30] * 3)  # el primero es erróneo
+    assert y_dup.index.has_duplicates
+
+    expected = correlation_matrix({"X": x, "Y": y})
+    got = correlation_matrix({"X": x, "Y": y_dup})
+    pd.testing.assert_frame_equal(got.pearson, expected.pearson)
+    pd.testing.assert_frame_equal(got.spearman, expected.spearman)
+    pd.testing.assert_frame_equal(got.nobs, expected.nobs)
+    pd.testing.assert_series_equal(
+        rolling_correlation(x, y_dup, window=20),
+        rolling_correlation(x, y, window=20),
+        check_freq=False,
+    )
+    pd.testing.assert_frame_equal(
+        normalized_prices({"X": x, "Y": y_dup}),
+        normalized_prices({"X": x, "Y": y}),
+        check_freq=False,
+    )
+    pd.testing.assert_series_equal(log_returns(y_dup), log_returns(y), check_freq=False)
+
+
+def test_duplicate_dates_in_unsorted_input_keep_the_last_appearance() -> None:
+    df = price_frame(n=60)
+    y = df["Y"]
+    # Desordenada y con la fecha 10 repetida: el orden estable conserva la última aparición.
+    y_dup = _with_duplicate(y, 10, first_value=y.iloc[10] * 2).iloc[::-1]
+    # Al invertir, la aparición «última» del archivo es ahora el valor erróneo (×2).
+    returns = log_returns(y_dup)
+    assert not returns.index.has_duplicates
+    assert returns.index.is_monotonic_increasing
+    expected_level = y.copy()
+    expected_level.iloc[10] = y.iloc[10] * 2
+    pd.testing.assert_series_equal(returns, log_returns(expected_level), check_freq=False)
+
+
+def test_series_without_dates_raise_data_error() -> None:
+    with pytest.raises(DataError, match="indexada por fecha"):
+        log_returns(pd.Series([1.0, 2.0, 3.0], name="SIN_FECHAS"))
