@@ -1,0 +1,24 @@
+# Registro de proveedores de datos.
+# Para añadir uno nuevo (p. ej. Tiingo): implementa la interfaz DataProvider
+# (mrlab/data/providers/base.py) y añade una sección aquí. Las claves de API se
+# leen del entorno (.env) en el backend; nunca llegan al navegador.
+
+default = "yahoo"
+
+[providers.yahoo]
+class = "mrlab.data.providers.yahoo:YahooProvider"
+enabled = true
+
+[providers.csv]
+class = "mrlab.data.providers.csv_provider:CSVProvider"
+enabled = true
+
+[providers.synthetic]
+class = "mrlab.data.providers.synthetic:SyntheticProvider"
+enabled = true
+
+# Ejemplo (no implementado en v1):
+# [providers.tiingo]
+# class = "mrlab.data.providers.tiingo:TiingoProvider"
+# enabled = false
+# api_key_env = "TIINGO_API_KEY"

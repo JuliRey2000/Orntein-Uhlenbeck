@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+build/
+dist/
+
+# Datos locales (caché, estudios, salidas)
+data/cache/*
+!data/cache/.gitkeep
+data/studies/*
+!data/studies/.gitkeep
+data/uploads/*
+!data/uploads/.gitkeep
+examples/output/
+
+# Node
+node_modules/
+frontend/dist/
+coverage/
+
+# Entorno
+.env
+.DS_Store
+*.log
