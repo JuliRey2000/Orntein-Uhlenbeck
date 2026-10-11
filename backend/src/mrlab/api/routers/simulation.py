@@ -36,6 +36,8 @@ MAX_HIST_BINS = 40
 
 
 class SimulateRequest(BaseModel):
+    """Parámetros de la simulación SINTÉTICA de un proceso OU."""
+
     model_config = ConfigDict(
         extra="forbid",
         json_schema_extra={
@@ -80,7 +82,10 @@ class SimulateRequest(BaseModel):
         description=f"Trayectorias simuladas (de 1 a {MAX_SIM_PATHS}); todas entran en las estadísticas.",
     )
     seed: int = Field(
-        42, ge=0, le=2**63 - 1, description="Semilla (entero ≥ 0): misma semilla, mismas trayectorias."
+        42,
+        ge=0,
+        le=2**63 - 1,
+        description="Semilla (entero ≥ 0): misma semilla, mismas trayectorias.",
     )
     paths_returned: int = Field(
         DEFAULT_PATHS_RETURNED,
@@ -94,6 +99,8 @@ class SimulateRequest(BaseModel):
 
 
 class HistogramOut(BaseModel):
+    """Histograma: número de trayectorias según el día en que cruzaron μ por primera vez."""
+
     bins: list[float] = Field(
         description="Bordes de los intervalos (len(bins) = len(counts) + 1), en días."
     )
@@ -101,6 +108,8 @@ class HistogramOut(BaseModel):
 
 
 class SimulationOut(EducationalOut):
+    """Simulación SINTÉTICA de un proceso OU con la transición exacta."""
+
     synthetic: bool = Field(True, description="Siempre True: la simulación es SINTÉTICA.")
     label: str = Field(SYNTHETIC_LABEL, description="Etiqueta permanente: «SINTÉTICO».")
     lam: float = Field(description="λ usado.")
@@ -175,7 +184,7 @@ def crossing_histogram(times: list[float | None]) -> HistogramOut:
         "SINTÉTICOS y nunca modifican datos históricos ni la caché."
     ),
     response_description=OK,
-    responses=ERROR_RESPONSES,
+    responses={code: ERROR_RESPONSES[code] for code in (400, 422, 500)},
 )
 def simulate(req: SimulateRequest) -> SimulationOut:
     summary = simulate_paths_summary(

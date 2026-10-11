@@ -36,7 +36,7 @@ Precisiones de la implementación:
   si no, False. h se añade al historial si no estaba. Si la prueba no se
   simula, ``test_contaminated = None`` («no aplica») y el historial se
   conserva sin cambios. El historial viaja en run_config.json; el registro
-  persistente de estudios llega en la fase 2.
+  persistente son los estudios de la API (``mrlab.studies``).
 - ``seeds``: las del RunConfig más las de ``SeriesMeta.seed`` de cada serie
   generada (clave = símbolo).
 - Sin ``snapshot_id``, la referencia debe traer ``start`` y ``end``.
@@ -109,7 +109,7 @@ class RunResult:
     #: Segmentos que no se pudieron simular → mensaje del error (en español).
     segment_errors: dict[Segment, str] = field(default_factory=dict)
     #: Origen y motivo de ``test_contaminated`` cuando lo decide un registro externo al
-    #: ``run_config.json`` (el registro persistente de estudios de la fase 2, ``mrlab.studies``).
+    #: ``run_config.json`` (el registro persistente de los estudios, ``mrlab.studies``).
     #: None = la marca sale solo del historial del run_config.json (decisión S10a).
     test_contamination_note: str | None = None
 

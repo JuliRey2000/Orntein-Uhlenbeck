@@ -4,6 +4,11 @@ Envuelven modelos del núcleo (``AssetInfo``, ``SeriesMeta``, ``ValidationReport
 forma JSON: mismas claves, mismos tipos y mismos validadores; solo añaden descripciones en español
 al esquema OpenAPI. Un endpoint puede devolver directamente el modelo del núcleo y declarar como
 ``response_model`` la versión de este módulo: FastAPI lo convierte al serializar.
+
+Todos aceptan además una instancia del modelo del núcleo como valor de un campo
+(``from_attributes=True``): ``LoadResponse(series=[serie.meta])`` funciona sin convertir a mano
+(pydantic, por defecto, solo acepta en un campo la clase declarada o sus subclases, no la clase
+madre).
 """
 
 from __future__ import annotations
@@ -22,6 +27,11 @@ from mrlab.domain.models import AssetClass, AssetInfo, DataOrigin, PriceType, Se
 
 def _values(enum: Any) -> str:
     return ", ".join(f"«{m.value}»" for m in enum)
+
+
+def out_config(descriptions: dict[str, str]) -> ConfigDict:
+    """Configuración de un modelo «Out»: descripciones en español y ``from_attributes``."""
+    return ConfigDict(from_attributes=True, json_schema_extra=describe(descriptions))
 
 
 def describe(descriptions: dict[str, str]) -> Callable[[dict[str, Any], type], None]:
@@ -68,7 +78,7 @@ ASSET_FIELDS = {
 class AssetInfoOut(AssetInfo):
     """Identidad económica de un activo (sección 2.2)."""
 
-    model_config = ConfigDict(json_schema_extra=describe(ASSET_FIELDS))
+    model_config = out_config(ASSET_FIELDS)
 
 
 SERIES_META_FIELDS = {
@@ -99,7 +109,7 @@ SERIES_META_FIELDS = {
 class SeriesMetaOut(SeriesMeta):
     """Metadatos de una serie descargada o cargada (sección 2.2)."""
 
-    model_config = ConfigDict(json_schema_extra=describe(SERIES_META_FIELDS))
+    model_config = out_config(SERIES_META_FIELDS)
 
     asset: AssetInfoOut
 
@@ -107,33 +117,29 @@ class SeriesMetaOut(SeriesMeta):
 class ProxySuggestionOut(ProxySuggestion):
     """Proxy ejecutable sugerido para un índice o futuro (nunca se sustituye en silencio)."""
 
-    model_config = ConfigDict(
-        json_schema_extra=describe(
-            {
-                "reference": "Símbolo de la referencia no ejecutable (p. ej. «^GSPC»).",
-                "name": "Nombre de la referencia.",
-                "proxy": "Instrumento ejecutable sugerido (p. ej. «SPY»).",
-                "note": "Explicación del riesgo de base entre la referencia y el proxy.",
-            }
-        )
+    model_config = out_config(
+        {
+            "reference": "Símbolo de la referencia no ejecutable (p. ej. «^GSPC»).",
+            "name": "Nombre de la referencia.",
+            "proxy": "Instrumento ejecutable sugerido (p. ej. «SPY»).",
+            "note": "Explicación del riesgo de base entre la referencia y el proxy.",
+        }
     )
 
 
 class ExampleOut(PresetPair):
     """Par de ejemplo precargado. No se asume que ninguno esté cointegrado."""
 
-    model_config = ConfigDict(
-        json_schema_extra=describe(
-            {
-                "key": "Identificador del ejemplo.",
-                "provider": "Proveedor de los datos del ejemplo.",
-                "symbol_a": "Símbolo de la pierna A.",
-                "symbol_b": "Símbolo de la pierna B.",
-                "title": "Título para mostrar.",
-                "description": "Descripción pedagógica (no promete ningún resultado).",
-                "synthetic": "True si el ejemplo usa datos SINTÉTICOS.",
-            }
-        )
+    model_config = out_config(
+        {
+            "key": "Identificador del ejemplo.",
+            "provider": "Proveedor de los datos del ejemplo.",
+            "symbol_a": "Símbolo de la pierna A.",
+            "symbol_b": "Símbolo de la pierna B.",
+            "title": "Título para mostrar.",
+            "description": "Descripción pedagógica (no promete ningún resultado).",
+            "synthetic": "True si el ejemplo usa datos SINTÉTICOS.",
+        }
     )
 
     available: bool = Field(
@@ -147,41 +153,37 @@ class ExampleOut(PresetPair):
 class ValidationIssueOut(ValidationIssue):
     """Incidencia detectada al validar los datos."""
 
-    model_config = ConfigDict(
-        json_schema_extra=describe(
-            {
-                "code": "Código estable de la incidencia (p. ej. «DUPLICADOS», «MONEDA_DISTINTA»).",
-                "severity": "Severidad: «info», «advertencia» o «error».",
-                "message": "Explicación en español.",
-                "symbol": "Símbolo afectado (null si la incidencia es del par).",
-                "dates": "Fechas afectadas (AAAA-MM-DD).",
-                "details": "Datos adicionales de la incidencia.",
-            }
-        )
+    model_config = out_config(
+        {
+            "code": "Código estable de la incidencia (p. ej. «DUPLICADOS», «MONEDA_DISTINTA»).",
+            "severity": "Severidad: «info», «advertencia» o «error».",
+            "message": "Explicación en español.",
+            "symbol": "Símbolo afectado (null si la incidencia es del par).",
+            "dates": "Fechas afectadas (AAAA-MM-DD).",
+            "details": "Datos adicionales de la incidencia.",
+        }
     )
 
 
 class SeriesValidationOut(SeriesValidation):
     """Resultado de la limpieza de una serie (nunca se rellenan fechas ni valores)."""
 
-    model_config = ConfigDict(
-        json_schema_extra=describe(
-            {
-                "symbol": "Símbolo de la serie.",
-                "n_raw": "Observaciones recibidas.",
-                "n_clean": "Observaciones tras la limpieza (sin duplicados ni faltantes).",
-                "unsorted": "True si las fechas no estaban en orden cronológico.",
-                "duplicates_removed": "Fechas duplicadas eliminadas (se conserva la última).",
-                "duplicate_dates": "Fechas que estaban duplicadas.",
-                "missing_values": "Precios faltantes (se eliminan; nunca se rellenan).",
-                "missing_dates": "Fechas con precio faltante.",
-                "non_positive": "Precios menores o iguales a cero.",
-                "non_positive_dates": "Fechas con precio ≤ 0.",
-                "suspicious_jumps": "Fechas con saltos sospechosos (posible error de ajuste).",
-                "crypto_gaps": "Fechas que faltan en una serie cripto (calendario de 7 días).",
-                "issues": "Incidencias de la serie.",
-            }
-        )
+    model_config = out_config(
+        {
+            "symbol": "Símbolo de la serie.",
+            "n_raw": "Observaciones recibidas.",
+            "n_clean": "Observaciones tras la limpieza (sin duplicados ni faltantes).",
+            "unsorted": "True si las fechas no estaban en orden cronológico.",
+            "duplicates_removed": "Fechas duplicadas eliminadas (se conserva la última).",
+            "duplicate_dates": "Fechas que estaban duplicadas.",
+            "missing_values": "Precios faltantes (se eliminan; nunca se rellenan).",
+            "missing_dates": "Fechas con precio faltante.",
+            "non_positive": "Precios menores o iguales a cero.",
+            "non_positive_dates": "Fechas con precio ≤ 0.",
+            "suspicious_jumps": "Fechas con saltos sospechosos (posible error de ajuste).",
+            "crypto_gaps": "Fechas que faltan en una serie cripto (calendario de 7 días).",
+            "issues": "Incidencias de la serie.",
+        }
     )
 
     issues: list[ValidationIssueOut] = []
@@ -207,7 +209,7 @@ VALIDATION_FIELDS = {
 class ValidationReportOut(ValidationReport):
     """Informe de validación de datos de un par (sección 2.3)."""
 
-    model_config = ConfigDict(json_schema_extra=describe(VALIDATION_FIELDS))
+    model_config = out_config(VALIDATION_FIELDS)
 
     series: list[SeriesValidationOut]
     issues: list[ValidationIssueOut] = []

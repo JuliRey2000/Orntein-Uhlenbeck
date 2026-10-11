@@ -33,10 +33,10 @@ Precisiones de la implementación:
 - «Prueba contaminada» dice solo lo que se verificó (``RunResult.test_contaminated``):
   «SÍ», «no (según el historial registrado en run_config.json…)» o «no aplica:
   la prueba no se ejecutó», con una nota sobre el alcance del historial (el
-  registro persistente de estudios llega en la fase 2). ``pruebas_estadisticas.csv``
+  registro persistente son los estudios de la API, ``mrlab.studies``). ``pruebas_estadisticas.csv``
   lo repite en la sección ``prueba`` (solicitada, ejecutada, contaminada,
-  configuraciones_en_historial). Si el resultado viene de un estudio (fase 2,
-  ``RunResult.test_contamination_note``), la marca y su motivo salen del registro
+  configuraciones_en_historial). Si el resultado viene de un estudio
+  (``RunResult.test_contamination_note``), la marca y su motivo salen del registro
   persistente del estudio (línea «Prueba contaminada: SÍ/no — …» y fila
   ``registro_estudio``).
 - Un segmento que no se pudo simular (``RunResult.segment_errors``) figura en
@@ -166,12 +166,13 @@ TEST_HISTORY_NOTE = (
     "  Alcance: el historial de ejecuciones de la prueba viaja dentro de run_config.json. Si se "
     "borra o se edita a mano, o si una ejecución nueva parte de una configuración sin ese "
     "historial (p. ej. un run_config.json copiado antes de ejecutar la prueba, o una exportación "
-    "en otra carpeta), esta marca no puede detectarlo. El registro persistente de estudios llega "
-    "en la fase 2."
+    "en otra carpeta), esta marca no puede detectarlo. Para un registro persistente, ejecuta la "
+    "prueba dentro de un estudio del laboratorio (API: POST /api/studies), que guarda cada "
+    "ejecución de la prueba y cada cambio de configuración en data/studies/."
 )
 #: Valor de ``contaminada`` en ``pruebas_estadisticas.csv``.
 _CONTAMINATED_CELL = {True: "sí", False: "no", None: "no aplica"}
-#: Marca del LEEME cuando la decide el registro persistente de un estudio (fase 2).
+#: Marca del LEEME cuando la decide el registro persistente de un estudio.
 _STUDY_CONTAMINATED_WORD = {True: "SÍ", False: "no", None: "no aplica"}
 STUDY_REGISTRY_NOTE = (
     "  Alcance: esta marca la decide el registro persistente del estudio en el laboratorio "

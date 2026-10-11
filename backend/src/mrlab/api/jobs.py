@@ -179,14 +179,23 @@ class JobManager:
         ]
 
     def cancel(self, job_id: str) -> Job:
-        job = self.get(job_id)
-        if job.status in _FINISHED:
-            raise ConfigError(
-                f"El trabajo ya terminó (estado: {job.status}); no se puede cancelar.",
-                code="TRABAJO_YA_TERMINADO",
-                details={"job_id": job_id, "status": job.status},
-            )
+        self.get(job_id)  # 404 si no existe
         with self._lock:
+            # El estado se comprueba DENTRO del lock: si el trabajo terminó entre la consulta y
+            # este punto, se responde «ya terminó» en lugar de marcar cancel_requested.
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise DataError(
+                    f"No existe el trabajo «{job_id}» (puede haberse descartado por antigüedad).",
+                    code="TRABAJO_NO_ENCONTRADO",
+                    details={"job_id": job_id},
+                )
+            if job.status in _FINISHED:
+                raise ConfigError(
+                    f"El trabajo ya terminó (estado: {job.status}); no se puede cancelar.",
+                    code="TRABAJO_YA_TERMINADO",
+                    details={"job_id": job_id, "status": job.status},
+                )
             future = self._futures.get(job_id)
             if future is not None and future.cancel():
                 self._jobs[job_id] = self._jobs[job_id].model_copy(

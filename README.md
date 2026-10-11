@@ -21,6 +21,8 @@ descarte con causas concretas.
 - [Instalación sin Docker](#instalación-sin-docker)
 - [Pruebas](#pruebas)
 - [Demo](#demo)
+- [API (fase 2)](#api-fase-2)
+- [Docker](#docker)
 - [Fuentes de datos](#fuentes-de-datos)
 - [Limitaciones de la v1](#limitaciones-de-la-v1)
 - [Estructura del repositorio](#estructura-del-repositorio)
@@ -55,15 +57,18 @@ el laboratorio lo sigue tratando como SINTÉTICO y te lo avisa.
 
 ## Estado actual
 
-El proyecto avanza por fases. **La fase 1, el núcleo de cálculo en Python, está
-terminada** (paquete `mrlab`, en `backend/src/mrlab`), con sus pruebas y una demo
-por línea de comandos. Las fases 2 y 3 son las siguientes.
+El proyecto avanza por fases. **Las fases 1 y 2 están terminadas**: el núcleo de
+cálculo en Python (paquete `mrlab`, en `backend/src/mrlab`) con una demo por línea
+de comandos, y la **API FastAPI** sobre ese núcleo, con su documentación
+interactiva en `/docs`, la caché de datos, los estudios (registro persistente de
+la prueba fuera de muestra), los errores en español y la imagen Docker del
+backend. La fase 3, la interfaz web, es la siguiente.
 
 | Fase | Contenido | Estado |
 |---|---|---|
 | 1 | Núcleo Python: proveedores de datos, validación, cointegración, spread, OU, backtest de un par, métricas, exportación CSV/JSON, demo | **Terminada** (dos rondas de revisión) |
-| 2 | API FastAPI, caché, errores en español | Pendiente |
-| 3 | Interfaz web (9 pestañas), informe HTML, Docker, `docs/GUIA_ALUMNO.md` | Pendiente |
+| 2 | API FastAPI, caché, estudios, trabajos en segundo plano, errores en español, Docker del backend | **Terminada** |
+| 3 | Interfaz web (9 pestañas), informe HTML, servicio frontend en Docker, `docs/GUIA_ALUMNO.md` | Pendiente |
 | 4 | Ranking de pares con FDR, walk-forward, recalibración de β | Pendiente |
 | 5 | Cartera multi-par | Pendiente |
 
@@ -84,10 +89,16 @@ Las decisiones que tomaron esas correcciones están en
 [`docs/DECISIONS.md`](docs/DECISIONS.md) (entre otras, O7, E8, O5a, S10a, S10b,
 A2, A2a, A7 y D10–D17).
 
-**Pendiente (fases 2 y 3):** la API, la interfaz web, la configuración de Docker,
-el informe HTML autocontenido y la guía del alumno (`docs/GUIA_ALUMNO.md`). Por
-ahora, `docker compose up` y `make dev` no están disponibles: el laboratorio se
-usa desde Python y desde la demo.
+**Estado de la fase 2.** La API expone todo el núcleo: carga de datos (Yahoo,
+CSV y sintéticos) con caché, validación, correlaciones, análisis del par,
+simulación OU, backtest de formación y validación, comparación de pares en segundo
+plano, estudios, exportación ZIP y reproducción desde `run_config.json`. Sus
+pruebas de integración usan un proveedor falso, sin red. Las decisiones de esta
+fase están en [`docs/DECISIONS.md`](docs/DECISIONS.md) (sección «API (fase 2)»).
+
+**Pendiente (fase 3):** la interfaz web, el informe HTML autocontenido y la guía
+del alumno (`docs/GUIA_ALUMNO.md`). Mientras tanto, el laboratorio se usa desde la
+API (`make dev` y `/docs`), desde Python o desde la demo.
 
 ## Requisitos
 
@@ -100,13 +111,15 @@ usa desde Python y desde la demo.
   herramientas de línea de comandos de Xcode (`xcode-select --install`). En
   Windows requiere Git Bash o WSL; si no lo tienes, usa los comandos equivalentes
   de PowerShell que aparecen en cada sección.
-- **Internet** solo para descargar datos de Yahoo Finance. Las pruebas y la demo
-  por defecto funcionan sin conexión.
+- **Internet** solo para descargar datos de Yahoo Finance. Las pruebas, la demo
+  por defecto y la API con datos sintéticos o CSV funcionan sin conexión.
+- **Docker** con Docker Compose (opcional): para levantar la API sin instalar
+  Python (ver [Docker](#docker)).
 
 ## Instalación sin Docker
 
 Desde la carpeta raíz del repositorio, crea un entorno virtual e instala el
-paquete en modo editable con las dependencias de desarrollo.
+paquete en modo editable con la API y las dependencias de desarrollo.
 
 **Linux / macOS:**
 
@@ -116,7 +129,7 @@ cd Orntein-Uhlenbeck
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -e "backend[dev]"
+pip install -e "backend[api,dev]"
 ```
 
 **Windows (PowerShell):**
@@ -127,7 +140,7 @@ cd Orntein-Uhlenbeck
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -e "backend[dev]"
+pip install -e "backend[api,dev]"
 ```
 
 Si PowerShell no permite ejecutar `Activate.ps1`, habilítalo solo para esa
@@ -135,18 +148,24 @@ ventana con `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` y vuelv
 a activarlo.
 
 Con `make` disponible y el entorno virtual activado, `make install` hace la misma
-instalación (`pip install -e "backend[dev]"`).
+instalación (`pip install -e "backend[api,dev]"`). El extra `api` instala FastAPI,
+uvicorn y lo necesario para la API; las pruebas de la API lo necesitan.
 
 ### Comandos de make
 
 | Comando | Qué hace | Equivalente sin make |
 |---|---|---|
-| `make install` | Instala el paquete y las dependencias de desarrollo | `pip install -e "backend[dev]"` |
+| `make install` | Instala el paquete con la API y las dependencias de desarrollo | `pip install -e "backend[api,dev]"` |
 | `make test` | Ejecuta todas las pruebas | `cd backend` y luego `python -m pytest` |
 | `make test-fast` | Ejecuta las pruebas sin las marcadas como lentas | `cd backend` y luego `python -m pytest -m "not slow"` |
 | `make demo` | Ejecuta la demo con el par sintético (sin internet) | `python examples/demo_ko_pep.py` |
 | `make fetch-example` | Descarga KO y PEP de Yahoo Finance a `examples/data/real/` | `python examples/fetch_ko_pep.py` |
-| `make lint` | Revisa el estilo del código con ruff | `python -m ruff check backend examples` |
+| `make lint` | Revisa el estilo del código con ruff (reglas y formato) | `python -m ruff check backend examples` y `python -m ruff format --check backend examples` |
+| `make dev` | API con recarga automática en `http://127.0.0.1:8000` | `python -m uvicorn mrlab.api.main:app --reload --reload-dir backend/src --host 127.0.0.1 --port 8000` |
+| `make api` | API sin recarga (un solo proceso) | `python -m uvicorn mrlab.api.main:app --host 127.0.0.1 --port 8000 --workers 1` |
+| `make openapi` | Exporta el esquema OpenAPI a `backend/openapi.json` | `python backend/scripts/export_openapi.py` |
+| `make docker-config` | Valida `docker-compose.yml` (sin el daemon de Docker) | `docker compose config --quiet` |
+| `make docker-up` | Construye y levanta la API en Docker | `docker compose up --build` |
 
 ## Pruebas
 
@@ -162,18 +181,21 @@ python -m pytest
 ```
 
 - Las pruebas son deterministas (semillas fijas) y **no necesitan internet**: las
-  del proveedor de Yahoo usan respuestas simuladas.
-- La suite completa (775 pruebas) tarda unos cinco minutos y medio (5 min 24 s en
-  el equipo donde se verificó, con un solo núcleo ocupado). Algo más de dos minutos
-  corresponden a las pruebas de la demo, que la ejecutan de punta a punta varias
-  veces (también la reproducción byte a byte), y buena parte del resto a las
-  pruebas de Monte Carlo de la cointegración y del OU: cada ajuste OU incluye una
-  prueba de Dickey–Fuller aumentada con selección de rezagos.
-- Dos pruebas están marcadas como lentas (`slow`): el tamaño de la prueba de raíz
+  del proveedor de Yahoo usan respuestas simuladas, y las de la API (carpeta
+  `backend/tests/api/`) un proveedor falso con `fastapi.testclient`.
+- La suite completa (1.113 pruebas) tarda unos cuatro minutos (4 min 8 s en el
+  equipo donde se verificó). Algo más de dos minutos corresponden a las pruebas de
+  la demo, que la ejecutan de punta a punta varias veces (también la reproducción
+  byte a byte), y buena parte del resto a las pruebas de Monte Carlo de la
+  cointegración y del OU: cada ajuste OU incluye una prueba de Dickey–Fuller
+  aumentada con selección de rezagos.
+- Tres pruebas están marcadas como lentas (`slow`): el tamaño de la prueba de raíz
   unitaria en las ventanas de estabilidad con 400 pares de paseos aleatorios
-  (≈ 45 s) y la robustez del escenario SINT-CBC con 30 semillas (≈ 15 s).
-  `make test-fast` (o `python -m pytest -m "not slow"` dentro de `backend`) las
-  excluye y tarda alrededor de un minuto menos.
+  (≈ 45 s), la robustez del escenario SINT-CBC con 30 semillas (≈ 15 s) y el
+  arranque real de la API con uvicorn (≈ 2 s). `make test-fast` (o
+  `python -m pytest -m "not slow"` dentro de `backend`) las excluye.
+- Una prueba comprueba que `backend/openapi.json` está al día: si cambias la API,
+  regenéralo con `make openapi`.
 
 ## Demo
 
@@ -229,11 +251,12 @@ En la fase 1, el historial que permite detectarlo viaja dentro del propio
   `DEMO_CARPETA_DE_OTRO_PAR`): usa otra `--output-dir` o, si de verdad quieres
   descartar ese historial, `--reiniciar-historial`.
 
-**Limitación de la fase 1:** la marca no puede detectar una ejecución anterior de
+**Limitación de la demo:** la marca no puede detectar una ejecución anterior de
 la prueba si borras o editas el historial a mano, si exportas en otra carpeta
 (`--output-dir`) o si partes de un `run_config.json` copiado antes de ejecutar la
-prueba y exportas fuera de la carpeta original. El registro persistente de
-estudios, que lo resuelve, llega en la fase 2.
+prueba y exportas fuera de la carpeta original. Los **estudios de la API** lo
+resuelven con un registro persistente (ver [Estudios y prueba
+contaminada](#estudios-y-prueba-contaminada)).
 
 Si el par no superó los filtros (estado distinto de ✅ o alguna razón de
 descarte), el backtest se muestra con el aviso **«resultado solo ilustrativo»** y
@@ -331,6 +354,217 @@ redistribuirlos. KO/PEP es un ejemplo clásico de manual: el laboratorio **no
 asume** que esté cointegrado, y el resultado puede ser cualquiera de los cinco
 estados.
 
+## API (fase 2)
+
+La API expone todo el laboratorio por HTTP, con JSON en español. Es la base de la
+interfaz web de la fase 3, y ya se puede usar desde la documentación interactiva,
+desde `curl` o desde PowerShell.
+
+### Arrancar la API
+
+Con el entorno virtual activado (instalación con `backend[api,dev]`):
+
+```bash
+make dev
+# o, sin make (Linux, macOS o PowerShell):
+python -m uvicorn mrlab.api.main:app --reload --reload-dir backend/src --host 127.0.0.1 --port 8000
+```
+
+- **Documentación interactiva:** <http://127.0.0.1:8000/docs> (Swagger) y
+  <http://127.0.0.1:8000/redoc>. Cada ruta, parámetro y campo está descrito en
+  español, con sus errores posibles. Esas dos páginas cargan sus estilos desde
+  internet; sin conexión, el esquema sigue disponible en `/openapi.json` y en el
+  archivo versionado `backend/openapi.json` (se regenera con `make openapi`).
+- **Estado:** <http://127.0.0.1:8000/api/health> devuelve la versión y el hash
+  del código.
+- Usa **un solo proceso** de uvicorn (no `--workers 2` ni más): la caché y los
+  estudios viven en disco y sus bloqueos son por proceso (decisión F1).
+- Importar la aplicación no crea carpetas ni usa la red: `data/cache/`,
+  `data/studies/` y `data/uploads/` se crean en el primer uso.
+
+### Convenciones
+
+- Todas las rutas empiezan por `/api`. Fechas en formato `AAAA-MM-DD`. Las series
+  temporales van en columnas (`dates` + `values`) y un valor faltante o no finito
+  se envía como `null` (nunca `NaN`).
+- Toda respuesta con resultados lleva `disclaimer` (el aviso educativo) y
+  `synthetic` (`true` si interviene algún dato SINTÉTICO).
+- Los errores tienen siempre la misma forma, con un mensaje en español que dice qué
+  hacer:
+
+  ```json
+  {"error": {"code": "PRUEBA_SOLO_EN_ESTUDIO", "message": "El backtest no ejecuta el periodo de prueba…", "details": {}}}
+  ```
+
+  Códigos HTTP: 400 configuración no válida, 404 recurso inexistente, 409 trabajo
+  ya terminado, 413 archivo demasiado grande, 422 datos no válidos o análisis
+  bloqueado, 429 límite de peticiones del proveedor (con `Retry-After`), 502 fallo
+  del proveedor, 503 sin conexión con el proveedor.
+- Las peticiones de análisis, backtest y exportación llevan la configuración
+  completa (`RunConfig`, la misma de `run_config.json`). La respuesta devuelve la
+  configuración **fijada** (instantáneas de datos y fechas de corte) para
+  reproducir el resultado.
+- El periodo de **prueba** nunca se ejecuta fuera de un estudio:
+  `include_test: true` en `/api/pairs/analyze`, `/api/backtest` o `/api/export`
+  responde 400 `PRUEBA_SOLO_EN_ESTUDIO`.
+
+### Rutas principales
+
+| Ruta | Para qué sirve |
+|---|---|
+| `GET /api/health`, `/api/providers`, `/api/examples`, `/api/proxies`, `/api/glossary` | Estado, proveedores (con sus avisos), pares de ejemplo, proxies sugeridos y textos de ayuda |
+| `GET /api/assets/search?q=`, `/api/assets/{proveedor}/{símbolo}` | Buscar activos y ver sus metadatos (índices: proxy **sugerido**, nunca sustituido) |
+| `POST /api/data/load`, `/api/data/csv`, `/api/data/synthetic` | Cargar series de un proveedor (con caché), subir un CSV o generar un par SINTÉTICO |
+| `GET /api/data/cache`, `/api/data/series`; `POST /api/data/validate` | Instantáneas de la caché, precios de una instantánea e informe de validación |
+| `POST /api/correlations`, `/api/pairs/analyze` | Correlaciones de rendimientos; análisis completo del par (estado, causas, OU) |
+| `POST /api/ou/simulate` | Simulación SINTÉTICA de un proceso OU (transición exacta) |
+| `POST /api/backtest`, `/api/backtest/compare` | Backtest de formación y validación; comparación de pares en segundo plano |
+| `GET /api/jobs`, `/api/jobs/{id}`; `DELETE /api/jobs/{id}` | Progreso, resultado y cancelación de los trabajos en segundo plano |
+| `POST /api/studies`, `/api/studies/{id}/test`; `PUT /api/studies/{id}/config` … | Estudios: congelar la configuración y ejecutar la prueba una sola vez |
+| `POST /api/export`, `/api/runs/replay`, `/api/runs/replay/json` | Exportación ZIP reproducible y reproducción exacta desde `run_config.json` |
+
+### Ejemplos con curl (Linux y macOS)
+
+El par **SINTÉTICO** `SINT-COI-A`/`SINT-COI-B` viene incluido y no necesita
+internet. Guarda primero la configuración del par en `par.json`:
+
+```json
+{
+  "pair": {
+    "a": {"provider": "synthetic", "symbol": "SINT-COI-A", "start": "2018-01-01", "end": "2023-12-31"},
+    "b": {"provider": "synthetic", "symbol": "SINT-COI-B", "start": "2018-01-01", "end": "2023-12-31"}
+  }
+}
+```
+
+```bash
+API=http://127.0.0.1:8000/api
+
+curl "$API/health"
+
+# Cargar las series (quedan en la caché con su snapshot_id)
+curl -X POST "$API/data/load" -H "Content-Type: application/json" \
+  -d '{"provider": "synthetic", "symbols": ["SINT-COI-A", "SINT-COI-B"], "start": "2018-01-01", "end": "2023-12-31"}'
+
+# Analizar el par y simular formación y validación
+curl -X POST "$API/pairs/analyze" -H "Content-Type: application/json" -d @par.json
+curl -X POST "$API/backtest" -H "Content-Type: application/json" -d @par.json
+
+# Simulación SINTÉTICA de un OU
+curl -X POST "$API/ou/simulate" -H "Content-Type: application/json" \
+  -d '{"lam": 0.05, "mu": 0, "sigma": 0.02, "x0": 0.1, "horizon": 252, "n_paths": 200, "seed": 42}'
+
+# Subir un CSV propio (declarando moneda, clase de activo y tipo de precio)
+curl -X POST "$API/data/csv" -F "file=@KO.csv" -F "symbol=KO" -F "currency=USD" \
+  -F "asset_class=accion" -F "price_type=cierre_ajustado"
+
+# Exportar el análisis (ZIP reproducible; el nombre lo da el servidor)
+curl -X POST "$API/export" -H "Content-Type: application/json" \
+  -d "{\"config\": $(cat par.json)}" -OJ
+```
+
+Con datos de Yahoo Finance (requiere internet), usa `"provider": "yahoo"` y
+símbolos como `KO` y `PEP`.
+
+### Ejemplos con PowerShell (Windows)
+
+```powershell
+$api = "http://127.0.0.1:8000/api"
+Invoke-RestMethod "$api/health"
+
+$par = @{
+  pair = @{
+    a = @{ provider = "synthetic"; symbol = "SINT-COI-A"; start = "2018-01-01"; end = "2023-12-31" }
+    b = @{ provider = "synthetic"; symbol = "SINT-COI-B"; start = "2018-01-01"; end = "2023-12-31" }
+  }
+}
+$cuerpo = $par | ConvertTo-Json -Depth 10
+
+$analisis = Invoke-RestMethod -Method Post -Uri "$api/pairs/analyze" -ContentType "application/json" -Body $cuerpo
+$analisis.analysis.status_label
+
+$backtest = Invoke-RestMethod -Method Post -Uri "$api/backtest" -ContentType "application/json" -Body $cuerpo
+$backtest.segments.validacion.metrics
+```
+
+Si un texto que envías lleva tildes o «ñ», pásalo como bytes UTF-8:
+`-Body ([System.Text.Encoding]::UTF8.GetBytes($cuerpo))`. En PowerShell 7,
+`Invoke-RestMethod -Form @{ file = Get-Item .\KO.csv; symbol = "KO"; … }` sube un
+CSV a `/api/data/csv`.
+
+### Estudios y prueba contaminada
+
+La muestra de **prueba** (el último 20 %) se evalúa una sola vez, con la
+configuración congelada, y **solo dentro de un estudio**. El estudio se guarda en
+`data/studies/` y sobrevive a los reinicios:
+
+1. `POST /api/studies` con `{"config": <par.json>, "name": "…"}` congela la
+   configuración: fija las instantáneas de datos y las fechas de corte. Devuelve el
+   `id` del estudio.
+2. `POST /api/studies/{id}/test` ejecuta la prueba y la registra (hash de la
+   configuración y fecha). La respuesta trae el backtest con formación, validación
+   y prueba, y `contaminated: false`.
+3. Si después cambias cualquier parámetro con `PUT /api/studies/{id}/config`
+   (por ejemplo `{"strategy": {"entry_z": 2.5}}`), el estudio queda marcado como
+   **prueba contaminada** de forma permanente, con el motivo y la fecha, aunque
+   vuelvas a los valores originales. La respuesta lo avisa en `warning`.
+4. `GET /api/studies/{id}/export` descarga el ZIP del estudio; el `LEEME.txt` dice
+   «Prueba contaminada: SÍ — según el registro persistente del estudio…» y por qué.
+
+```bash
+curl -X POST "$API/studies" -H "Content-Type: application/json" \
+  -d "{\"config\": $(cat par.json), \"name\": \"Practica SINT-COI\"}"
+# → {"study": {"id": "4b12da1e…", …}, "test_viewed": false, "contaminated": false, …}
+ID=<id del estudio>
+curl -X POST "$API/studies/$ID/test"                      # contaminated: false
+curl -X PUT "$API/studies/$ID/config" -H "Content-Type: application/json" \
+  -d '{"strategy": {"entry_z": 2.5}}'                     # contaminated: true, con warning
+curl "$API/studies/$ID/export" -OJ                        # ZIP con la marca en el LEEME
+```
+
+La marca no se «lava» creando otro estudio del mismo par con umbrales ajustados,
+ni borrando el estudio y volviéndolo a crear: un estudio nuevo importa las
+ejecuciones de la prueba de otros estudios del mismo par cuyo periodo de prueba
+se solapa (también de los eliminados, cuyo registro se conserva en
+`data/studies/eliminados/`) y nace contaminado si alguna usó otra configuración.
+
+### Trabajos en segundo plano
+
+`POST /api/backtest/compare` con `{"configs": [<par 1>, <par 2>, …]}` (de 2 a 10
+pares) responde 202 con un `job_id`. El progreso y el resultado se consultan en
+`GET /api/jobs/{job_id}`; `DELETE /api/jobs/{job_id}` lo cancela. Cada par se
+simula con su propio capital, las filas conservan el orden de la petición (nunca se
+ordenan por PnL) y el error de un par no detiene a los demás.
+
+## Docker
+
+La imagen del backend (Python 3.12, usuario sin privilegios) se construye desde
+`backend/Dockerfile` y se levanta con `docker-compose.yml`:
+
+```bash
+make docker-up
+# o, sin make:
+docker compose up --build
+```
+
+- API en <http://localhost:8000/api/health> y documentación en
+  <http://localhost:8000/docs>. Por defecto solo escucha en este equipo
+  (`127.0.0.1`), porque la API no tiene autenticación; `MRLAB_BIND=0.0.0.0` en
+  `.env` la abre a la red local.
+- La carpeta `./data` del repositorio se monta en `/app/data`: la caché, los
+  estudios y los CSV subidos persisten entre reinicios. En Linux, el usuario del
+  contenedor tiene uid 1000; si `./data` es de otro usuario, ajusta `MRLAB_UID` y
+  `MRLAB_GID` en `.env`.
+- La configuración opcional va en `.env` (copia `.env.example`): por ejemplo
+  `MRLAB_JOB_WORKERS` o `MRLAB_MAX_UPLOAD_MB`. Las carpetas de datos del contenedor
+  son fijas.
+- `make docker-up` pasa el hash de git a la imagen (`GIT_COMMIT`), que se registra
+  en cada `run_config.json`; con `docker compose up` directamente, exporta antes
+  `GIT_COMMIT=$(git rev-parse HEAD)` o se registrará «desconocido».
+- `make docker-config` valida `docker-compose.yml` sin necesidad del daemon. El
+  servicio de la interfaz web se añadirá en la fase 3 (está indicado, comentado,
+  en `docker-compose.yml`).
+
 ## Fuentes de datos
 
 ### Yahoo Finance (proveedor por defecto)
@@ -426,10 +660,15 @@ variables con prefijo `MRLAB_` (ver `backend/src/mrlab/config.py`).
 ```text
 .
 ├── README.md
-├── Makefile                       # install, test, demo, fetch-example, lint
+├── Makefile                       # install, test, demo, lint, dev, api, openapi, docker-up…
+├── docker-compose.yml             # servicio backend (el frontend llega en la fase 3)
+├── .env.example                   # configuración opcional (MRLAB_*)
 ├── backend/
 │   ├── pyproject.toml             # dependencias, ruff, pytest
 │   ├── providers.toml             # registro de proveedores de datos
+│   ├── Dockerfile                 # imagen de la API (Python 3.12, usuario sin privilegios)
+│   ├── openapi.json               # esquema OpenAPI versionado (tipos TypeScript de la fase 3)
+│   ├── scripts/export_openapi.py  # lo regenera (make openapi)
 │   ├── src/mrlab/
 │   │   ├── domain/                # modelos compartidos y errores (mensajes en español)
 │   │   ├── data/                  # proveedores (Yahoo, CSV, sintético), caché, validación, calendarios, proxies
@@ -439,8 +678,9 @@ variables con prefijo `MRLAB_` (ver `backend/src/mrlab/config.py`).
 │   │   ├── backtest/              # división de la muestra, motor, costes, métricas
 │   │   ├── analysis/              # análisis de un par (estado y causas), ejecución desde run_config
 │   │   ├── reporting/             # run_config.json reproducible, exportación CSV/JSON
-│   │   └── api/                   # API FastAPI (fase 2)
-│   └── tests/                     # pruebas unitarias y de integración (pytest)
+│   │   ├── studies.py             # estudios: registro persistente de la prueba (data/studies/)
+│   │   └── api/                   # API FastAPI: routers, errores en español, trabajos, OpenAPI
+│   └── tests/                     # pruebas unitarias, de integración y de la API (pytest)
 ├── frontend/                      # interfaz web React + TypeScript (fase 3)
 ├── data/                          # cache/, studies/, uploads/: archivos locales, ignorados por git
 ├── docs/                          # especificación, arquitectura, decisiones, matemáticas
@@ -459,7 +699,9 @@ variables con prefijo `MRLAB_` (ver `backend/src/mrlab/config.py`).
 - [`docs/DECISIONS.md`](docs/DECISIONS.md): decisiones de diseño, con alternativas
   y justificación.
 - [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md): módulos, flujo de análisis y
-  contratos.
+  contratos de la API.
+- `/docs` de la API en ejecución (y `backend/openapi.json`): cada ruta, parámetro
+  y campo, en español.
 - [`docs/ESPECIFICACION.md`](docs/ESPECIFICACION.md): requisitos originales.
 - `docs/GUIA_ALUMNO.md`: recorrido guiado de 15 minutos (pendiente).
 

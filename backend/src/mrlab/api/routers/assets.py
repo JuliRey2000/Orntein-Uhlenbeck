@@ -6,12 +6,14 @@ CONTRATO:
 - GET /assets/metadata?provider=&symbol= → AssetMetadataOut {asset: AssetInfo,
   proxy: ProxySuggestion | None, requires_proxy: bool, synthetic, note (español)}. Para índices y
   futuros requires_proxy=True y se SUGIERE el proxy; nunca se sustituye.
-Los símbolos van por query (pueden contener ^ o =).
+- GET /assets/{provider}/{symbol} → lo mismo (forma de ARQUITECTURA §3; el símbolo va codificado
+  en la URL: «^GSPC» → «%5EGSPC»).
+Los símbolos van preferentemente por query (pueden contener ^ o =).
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Path, Query
 from pydantic import BaseModel, Field
 
 from mrlab.api.openapi_models import AssetInfoOut, ProxySuggestionOut
@@ -43,6 +45,8 @@ PROVIDER_QUERY = Query(
 
 
 class AssetMetadataOut(BaseModel):
+    """Metadatos de un activo, con el proxy SUGERIDO si no es ejecutable."""
+
     asset: AssetInfoOut = Field(description="Metadatos del activo.")
     requires_proxy: bool = Field(
         description=(
@@ -92,9 +96,13 @@ def metadata_note(asset: AssetInfo) -> tuple[bool, ProxySuggestionOut | None, st
                 f"debes confirmarlo. {suggestion.note}"
             )
             return True, proxy, note
-        return True, None, (
-            f"{base} No hay un proxy sugerido: elige un instrumento ejecutable que lo replique "
-            "(por ejemplo, un ETF)."
+        return (
+            True,
+            None,
+            (
+                f"{base} No hay un proxy sugerido: elige un instrumento ejecutable que lo replique "
+                "(por ejemplo, un ETF)."
+            ),
         )
     parts: list[str] = []
     if asset.is_synthetic:
@@ -163,14 +171,39 @@ def asset_metadata(
     provider: str | None = PROVIDER_QUERY,
     state: AppState = Depends(get_state),
 ) -> AssetMetadataOut:
+    return _metadata(state, provider or state.registry.default_name or "", symbol)
+
+
+@router.get(
+    "/assets/{provider}/{symbol}",
+    response_model=AssetMetadataOut,
+    summary="Metadatos de un activo (ruta)",
+    description=(
+        "Igual que /api/assets/metadata, con el proveedor y el símbolo en la ruta. Los caracteres "
+        "especiales del símbolo van codificados (p. ej. «^GSPC» → «%5EGSPC», «GC=F» → «GC%3DF»). "
+        "Nunca sustituye un índice por su proxy: solo lo sugiere."
+    ),
+    response_description=OK,
+    responses=PROVIDER_RESPONSES,
+)
+def asset_metadata_path(
+    provider: str = Path(..., min_length=1, max_length=40, description="Proveedor de datos."),
+    symbol: str = Path(
+        ..., min_length=1, max_length=MAX_SYMBOL_CHARS, description="Símbolo en el proveedor."
+    ),
+    state: AppState = Depends(get_state),
+) -> AssetMetadataOut:
+    return _metadata(state, provider, symbol)
+
+
+def _metadata(state: AppState, provider: str, symbol: str) -> AssetMetadataOut:
     sym = symbol.strip()
     if not sym:
         raise _invalid("symbol", "El símbolo está vacío: indica uno (p. ej. «KO»).")
-    source = state.registry.get(provider or state.registry.default_name or "")
-    asset = source.get_metadata(sym)
+    asset = state.registry.get(provider).get_metadata(sym)
     needs_proxy, proxy, note = metadata_note(asset)
     return AssetMetadataOut(
-        asset=AssetInfoOut(**asset.model_dump()),
+        asset=asset,  # type: ignore[arg-type]
         requires_proxy=needs_proxy,
         proxy=proxy,
         synthetic=asset.is_synthetic,

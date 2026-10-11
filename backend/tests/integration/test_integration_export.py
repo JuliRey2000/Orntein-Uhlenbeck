@@ -114,7 +114,7 @@ def test_readme_states_where_the_contamination_check_comes_from(synthetic_result
         "Prueba contaminada: no (según el historial registrado en run_config.json, la prueba "
         "solo se ha ejecutado con esta configuración)." in readme
     )
-    assert "fase 2" in readme  # el registro persistente de estudios llega después
+    assert "POST /api/studies" in readme  # el registro persistente son los estudios de la API
     config = files["SINTETICO_run_config.json"].decode("utf-8")
     assert '"include_test": true' in config
     assert synthetic_result.config.config_hash in config.split('"test_history"')[1]

@@ -1,5 +1,7 @@
 """Serialización de los resultados del núcleo para la API (DTO reutilizables por varios routers).
 
+- ``RunConfigIn`` (y sus partes): el ``RunConfig`` del núcleo con descripciones en español para
+  /docs; ``core_config(cfg)`` lo convierte en el ``RunConfig`` del núcleo (misma identidad/hash).
 - ``pair_analysis_out(analysis, show_test_period)`` → ``PairAnalysisOut``.
 - ``backtest_segment_out(bt)`` → ``BacktestSegmentOut``.
 - ``analysis_out(result)`` → ``AnalysisOut``; ``backtest_out(result)`` → ``BacktestOut``.
@@ -20,25 +22,27 @@ Reglas:
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from datetime import date, datetime
 from enum import Enum
 from typing import Annotated, Any, Literal
 
 import numpy as np
 import pandas as pd
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from mrlab.analysis.pair_pipeline import (
     STATUS_LABELS,
     STRATEGY_BLOCKING_CODES,
+    AnalysisConfig,
     Cause,
     PairAnalysis,
     PairStatus,
 )
 from mrlab.analysis.runner import RunResult
+from mrlab.api.openapi_models import EducationalOut, ValidationReportOut, describe
 from mrlab.api.schemas import (
     ColumnsOut,
-    Educational,
     SeriesOut,
     clean_float,
     frame_columns,
@@ -46,14 +50,14 @@ from mrlab.api.schemas import (
 )
 from mrlab.backtest.engine import DAILY_COLUMNS, EXECUTION_CONVENTION, BacktestResult, Event, Trade
 from mrlab.backtest.metrics import METRIC_HELP, Metrics
-from mrlab.backtest.split import SampleSplit
+from mrlab.backtest.split import SampleSplit, SplitConfig
 from mrlab.data.calendar import periods_per_year, time_unit_label
 from mrlab.data.validation import ValidationIssue, ValidationReport
 from mrlab.domain.models import AssetClass, CalendarType, DataOrigin, Segment, SpreadType
 from mrlab.model.diagnostics import OUStability, ResidualDiagnostics
 from mrlab.model.ou import BANDS_VS_INTERVALS_NOTE, OUFit, OUForecast, OUStatus
 from mrlab.model.spread import HedgeFit
-from mrlab.reporting.run_config import RunConfig
+from mrlab.reporting.run_config import PairSpec, RunConfig, SeriesRef
 from mrlab.stats.cointegration import (
     DIRECTION_ORDER,
     Direction,
@@ -62,6 +66,7 @@ from mrlab.stats.cointegration import (
     EGStability,
 )
 from mrlab.stats.integration import IntegrationResult
+from mrlab.strategy.params import CostParams, StrategyParams
 
 SEGMENT_LABELS = {
     Segment.TRAIN: "formación",
@@ -122,8 +127,9 @@ def _safe_issue(issue: ValidationIssue) -> ValidationIssue:
     return issue.model_copy(update={"details": json_safe(issue.details)})
 
 
-def _safe_report(report: ValidationReport) -> ValidationReport:
-    return report.model_copy(
+def _safe_report(report: ValidationReport) -> ValidationReportOut:
+    """Informe JSON-seguro (``details`` sin NaN) en su versión documentada para /docs."""
+    safe = report.model_copy(
         update={
             "issues": [_safe_issue(i) for i in report.issues],
             "series": [
@@ -132,6 +138,198 @@ def _safe_report(report: ValidationReport) -> ValidationReport:
             ],
         }
     )
+    return ValidationReportOut.model_validate(safe.model_dump())
+
+
+# --------------------------------------------------------------------------- entradas (/docs)
+#
+# Subclases de los modelos del núcleo que SOLO añaden descripciones en español al esquema
+# OpenAPI (mismos campos, tipos, valores por defecto y validadores). Antes de usarlas en el
+# núcleo se convierten con ``core_config``/``to_core``: el núcleo compara modelos por tipo y la
+# identidad (``config_hash``) se calcula sobre el ``RunConfig`` del núcleo.
+
+SERIES_REF_FIELDS = {
+    "provider": "Proveedor de datos (p. ej. «yahoo», «csv», «synthetic»).",
+    "symbol": "Símbolo de la serie en el proveedor (p. ej. «KO», «^GSPC», «SINT-COI-A»).",
+    "snapshot_id": (
+        "Instantánea de la caché local. Si se indica, se usa exactamente esa instantánea, sin "
+        "red (reproducción exacta). Las respuestas devuelven la configuración ya fijada."
+    ),
+    "start": "Inicio (AAAA-MM-DD). Obligatorio sin snapshot_id; con él, recorta la instantánea.",
+    "end": "Fin (AAAA-MM-DD). Obligatorio sin snapshot_id; con él, recorta la instantánea.",
+}
+PAIR_FIELDS = {
+    "a": "Serie A del par.",
+    "b": "Serie B del par.",
+    "exec_a": (
+        "Instrumento ejecutable (proxy) de la pierna A, para índices y futuros (p. ej. SPY para "
+        "^GSPC). Debe elegirse explícitamente: el laboratorio nunca sustituye un índice por su "
+        "proxy en silencio; sin él, la simulación queda bloqueada (PROXY_REQUERIDO)."
+    ),
+    "exec_b": "Instrumento ejecutable (proxy) de la pierna B (ver exec_a).",
+}
+SPLIT_FIELDS = {
+    "train": "Fracción de formación (por defecto 0,6): selección, α, β y OU.",
+    "validation": "Fracción de validación (por defecto 0,2): ajuste de umbrales.",
+    "test": (
+        "Fracción de prueba (por defecto 0,2): se evalúa UNA vez, solo dentro de un estudio. "
+        "Las tres fracciones deben sumar 1."
+    ),
+}
+ANALYSIS_FIELDS = {
+    "spread_type": "Tipo de spread: «log» (por defecto; log-precios) o «precio».",
+    "alpha_level": (
+        "Nivel α de las pruebas (por defecto 0,05). La evidencia de cointegración usa el p-value "
+        "AJUSTADO por pruebas múltiples de la dirección elegida."
+    ),
+    "fdr_q": "q de la corrección por pruebas múltiples (por defecto 0,05).",
+    "fdr_method": "Corrección: «bh» (Benjamini–Hochberg, por defecto) o «by» (Benjamini–Yekutieli).",
+    "maxlag": "Rezagos máximos de ADF y Engle–Granger, elegidos por AIC (por defecto 12).",
+    "direction": (
+        "Dirección de Engle–Granger: «a_sobre_b» (A dependiente) o «b_sobre_a». Null = automática "
+        "(la de menor p-value, indicada en la respuesta)."
+    ),
+    "split": "División cronológica formación/validación/prueba (60/20/20 por defecto).",
+    "min_train_obs": "Mínimo de observaciones comunes en formación (por defecto 500).",
+    "stability_window": "Ventana de estabilidad, en observaciones (por defecto 252).",
+    "stability_step": "Paso entre ventanas de estabilidad (por defecto 63).",
+    "max_fail_frac": (
+        "Fracción máxima de ventanas que no rechazan antes de declarar «resultado inestable» "
+        "(por defecto 0,40)."
+    ),
+    "half_life_max": "Vida media máxima operable, en días de negociación (por defecto 126).",
+    "half_life_min": "Vida media mínima operable, en días de negociación (por defecto 1).",
+    "correlation_filter": (
+        "Filtro exploratorio de correlación (por defecto desactivado). Nunca sustituye a la "
+        "prueba de cointegración."
+    ),
+    "correlation_min": "Correlación mínima del filtro, si está activado (por defecto 0,5).",
+    "forecast_horizons": "Horizontes de pronóstico del OU, en observaciones (por defecto 1, 5, 20).",
+    "forecast_level": "Nivel de los intervalos de pronóstico (por defecto 0,95).",
+}
+STRATEGY_EXTRA_FIELDS = {
+    "initial_capital": "Capital inicial asignado al par (por defecto 10.000, en su moneda).",
+    "allow_short": (
+        "Permitir ventas en corto (por defecto sí). Sin cortos, las señales que exigen vender "
+        "una pierna se registran como «señal no ejecutable»."
+    ),
+    "zscore_mode": (
+        "«fijo» (por defecto: μ y σ_eq fijos de formación) o «movil» (solo comparación pedagógica)."
+    ),
+    "rolling_window": "Ventana del z móvil (solo con zscore_mode = «movil»).",
+}
+RUN_CONFIG_FIELDS = {
+    "schema_version": "Versión del esquema de run_config.json.",
+    "pair": "Par analizado y, si hace falta, sus instrumentos ejecutables.",
+    "analysis": "Parámetros del análisis estadístico (todo se estima solo con la formación).",
+    "strategy": "Parámetros de la estrategia (umbrales en z, stops, capital, apalancamiento).",
+    "costs": "Costes de transacción, préstamo de cortos y financiación.",
+    "frozen_split": (
+        "Fechas de corte congeladas. Null = se calculan con «analysis.split» y la respuesta las "
+        "devuelve fijadas."
+    ),
+    "seeds": "Semillas usadas (datos SINTÉTICOS); la respuesta las completa.",
+    "include_test": (
+        "Incluir el segmento de prueba. En /pairs/analyze, /backtest y /export debe ser false: la "
+        "prueba solo se ejecuta dentro de un estudio (/api/studies)."
+    ),
+    "data_origin": "HISTORICO o SINTETICO; lo fija el laboratorio según los datos usados.",
+    "series": "Metadatos de las series usadas (los rellena el laboratorio; no forman parte del hash).",
+    "test_history": (
+        "Hashes de las configuraciones con las que ya se ejecutó la prueba (marca de prueba "
+        "contaminada; no forman parte del hash)."
+    ),
+    "code_version": "Versión del código (hash de git); la rellena el laboratorio.",
+    "config_hash": "SHA-256 de la configuración canónica; lo recalcula el laboratorio.",
+}
+
+
+#: Ejemplo para /docs: KO/PEP de Yahoo (cualquier par sirve; ninguno se asume cointegrado).
+RUN_CONFIG_EXAMPLE: dict[str, Any] = {
+    "pair": {
+        "a": {"provider": "yahoo", "symbol": "KO", "start": "2016-01-04", "end": "2021-12-31"},
+        "b": {"provider": "yahoo", "symbol": "PEP", "start": "2016-01-04", "end": "2021-12-31"},
+    },
+    "strategy": {"entry_z": 2.0, "exit_z": 0.5, "stop_z": 3.5},
+}
+
+
+def _with_example(
+    descriptions: dict[str, str], example: dict[str, Any]
+) -> Callable[[dict[str, Any], type], None]:
+    base = describe(descriptions)
+
+    def extra(schema: dict[str, Any], model: type) -> None:
+        base(schema, model)
+        schema["examples"] = [example]
+
+    return extra
+
+
+class SeriesRefIn(SeriesRef):
+    """Referencia a una serie: instantánea de la caché o proveedor + símbolo + rango."""
+
+    model_config = ConfigDict(json_schema_extra=describe(SERIES_REF_FIELDS))
+
+
+class PairSpecIn(PairSpec):
+    """Par analizado y sus instrumentos ejecutables (proxies) opcionales."""
+
+    model_config = ConfigDict(json_schema_extra=describe(PAIR_FIELDS))
+
+    a: SeriesRefIn
+    b: SeriesRefIn
+    exec_a: SeriesRefIn | None = None
+    exec_b: SeriesRefIn | None = None
+
+
+class SplitConfigIn(SplitConfig):
+    """Proporciones de la división cronológica (deben sumar 1)."""
+
+    model_config = ConfigDict(json_schema_extra=describe(SPLIT_FIELDS))
+
+
+class AnalysisConfigIn(AnalysisConfig):
+    """Parámetros del análisis estadístico del par."""
+
+    model_config = ConfigDict(json_schema_extra=describe(ANALYSIS_FIELDS))
+
+    split: SplitConfigIn = SplitConfigIn()
+
+
+class StrategyParamsIn(StrategyParams):
+    """Parámetros de la estrategia (sección 7.1)."""
+
+    model_config = ConfigDict(json_schema_extra=describe(STRATEGY_EXTRA_FIELDS))
+
+
+class CostParamsIn(CostParams):
+    """Costes (sección 9). Comisión y slippage en puntos básicos del nocional operado."""
+
+
+class RunConfigIn(RunConfig):
+    """Configuración completa y reproducible de una ejecución (``run_config.json``)."""
+
+    model_config = ConfigDict(
+        json_schema_extra=_with_example(RUN_CONFIG_FIELDS, RUN_CONFIG_EXAMPLE)
+    )
+
+    pair: PairSpecIn
+    analysis: AnalysisConfigIn = AnalysisConfigIn()
+    strategy: StrategyParamsIn = StrategyParamsIn()
+    costs: CostParamsIn = CostParamsIn()
+
+
+def to_core(model: BaseModel, cls: type[BaseModel]) -> Any:
+    """Copia de ``model`` como instancia EXACTA de ``cls`` (clase del núcleo), revalidada."""
+    if type(model) is cls:
+        return model
+    return cls.model_validate(model.model_dump())
+
+
+def core_config(cfg: RunConfig) -> RunConfig:
+    """``RunConfigIn`` (o cualquier subclase) → ``RunConfig`` del núcleo."""
+    return to_core(cfg, RunConfig)
 
 
 # --------------------------------------------------------------------------- modelos
@@ -196,7 +394,7 @@ class OUValidOut(_OUCommon):
     """Ajuste OU válido: 0 < b < 1 y la prueba ADF rechaza la raíz unitaria (decisión O7)."""
 
     status: Literal["valido"] = Field(description="Estado del ajuste")
-    valid: Literal[True] = True
+    valid: Literal[True] = Field(True, description="Siempre true: el ajuste OU es válido.")
     lam: float = Field(description="λ: velocidad de reversión")
     mu: float = Field(description="μ: referencia estadística del modelo")
     sigma: float = Field(description="σ: volatilidad instantánea")
@@ -212,7 +410,9 @@ class OUInvalidOut(_OUCommon):
     status: Literal["no_estacionario", "b_no_positivo", "datos_insuficientes"] = Field(
         description="Motivo por el que no es un OU válido"
     )
-    valid: Literal[False] = False
+    valid: Literal[False] = Field(
+        False, description="Siempre false: sin λ, μ, σ, σ_eq, vida media ni bandas."
+    )
 
 
 OUOut = Annotated[OUValidOut | OUInvalidOut, Field(discriminator="status")]
@@ -237,7 +437,7 @@ class PairAnalysisOut(BaseModel):
     illustrative_only: bool = Field(description="True si el resultado es solo ilustrativo")
     illustrative_banner: str | None = Field(None, description="Banner «solo ilustrativo»")
     illustrative_reasons: list[str] = Field(description="Motivos del banner")
-    validation: ValidationReport = Field(description="Informe de validación de datos")
+    validation: ValidationReportOut = Field(description="Informe de validación de datos")
     calendar: CalendarType | None = Field(None, description="Calendario efectivo")
     time_unit: str | None = Field(None, description="Unidad de tiempo del OU")
     periods_per_year: int | None = Field(None, description="Periodos por año para anualizar")
@@ -279,15 +479,22 @@ class PairAnalysisOut(BaseModel):
     chart_note: str | None = Field(None, description="Por qué las series terminan en chart_end")
 
 
-class AnalysisOut(Educational):
+class AnalysisOut(EducationalOut):
     """Respuesta de /pairs/analyze."""
 
     data_origin: DataOrigin = Field(description="HISTORICO o SINTETICO")
-    config: RunConfig = Field(description="Configuración fijada (instantáneas y división)")
-    analysis: PairAnalysisOut
+    config: RunConfig = Field(
+        description=(
+            "Configuración fijada (instantáneas, fechas de corte, semillas y hash): reenviarla "
+            "reproduce exactamente el análisis"
+        )
+    )
+    analysis: PairAnalysisOut = Field(description="Análisis completo del par")
 
 
 class LegOut(BaseModel):
+    """Pierna del backtest."""
+
     symbol: str = Field(description="Instrumento operado")
     asset_class: AssetClass = Field(description="Clase de activo (decide el slippage)")
 
@@ -319,22 +526,30 @@ class BacktestSegmentOut(BaseModel):
     error: str | None = Field(None, description="Por qué no se pudo simular el segmento")
 
 
-class BacktestOut(Educational):
+class BacktestOut(EducationalOut):
     """Respuesta de /backtest (y del segmento de prueba de un estudio)."""
 
     data_origin: DataOrigin = Field(description="HISTORICO o SINTETICO")
     config: RunConfig = Field(description="Configuración fijada (instantáneas y división)")
-    symbol_a: str
-    symbol_b: str
-    exec_symbol_a: str | None = None
-    exec_symbol_b: str | None = None
+    symbol_a: str = Field(description="Símbolo de la serie A analizada")
+    symbol_b: str = Field(description="Símbolo de la serie B analizada")
+    exec_symbol_a: str | None = Field(
+        None, description="Instrumento ejecutable de A (proxy); null = se opera la propia serie"
+    )
+    exec_symbol_b: str | None = Field(
+        None, description="Instrumento ejecutable de B (proxy); null = se opera la propia serie"
+    )
     status: PairStatus = Field(description="Estado del par")
     status_label: str = Field(description="Etiqueta del estado en español")
     strategy_allowed: bool = Field(description="True si se puede simular la estrategia")
     illustrative_only: bool = Field(description="True si el resultado es solo ilustrativo")
     illustrative_banner: str | None = Field(None, description="Banner «solo ilustrativo»")
-    illustrative_reasons: list[str] = Field(default_factory=list)
-    discard_reasons: list[Cause] = Field(default_factory=list)
+    illustrative_reasons: list[str] = Field(
+        default_factory=list, description="Motivos del banner «solo ilustrativo»"
+    )
+    discard_reasons: list[Cause] = Field(
+        default_factory=list, description="Panel «¿Por qué se descartó este par?»"
+    )
     segments: dict[str, BacktestSegmentOut] = Field(
         default_factory=dict, description="Backtest por segmento (formacion, validacion, prueba)"
     )

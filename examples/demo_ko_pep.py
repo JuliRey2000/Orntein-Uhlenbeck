@@ -18,8 +18,8 @@ historial, no lo sobrescribe salvo con ``--reiniciar-historial`` (acción
 consciente: la marca deja de ver las ejecuciones anteriores). Limitación: si
 exportas en otra carpeta (``--output-dir``) o partes de un ``run_config.json``
 copiado antes de ejecutar la prueba, el historial de la carpeta original no viaja
-con él y la marca no puede detectarlo; el registro persistente de estudios llega
-en la fase 2.
+con él y la marca no puede detectarlo; para un registro persistente, ejecuta la
+prueba en un estudio de la API (POST /api/studies; ver el README).
 
 Índices y futuros no se pueden comprar ni vender directamente: para simular la
 estrategia hay que indicar el CSV del instrumento ejecutable (proxy, p. ej. un
@@ -627,7 +627,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
             "run_config.json que ya haya en la carpeta de destino si es del mismo par (también "
             "con --reproducir). Si exportas en otra carpeta (--output-dir) o partes de un "
             "run_config.json copiado antes de ejecutar la prueba, ese historial no viaja con él y "
-            "la marca no puede detectarlo (el registro persistente llega en la fase 2)."
+            "la marca no puede detectarlo (para un registro persistente, usa los estudios de la API: "
+            "POST /api/studies)."
         ),
     )
     parser.add_argument("--csv-a", type=Path, help="CSV de la serie A")

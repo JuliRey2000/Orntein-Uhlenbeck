@@ -22,13 +22,20 @@ from mrlab import DISCLAIMER
 
 
 class ErrorBody(BaseModel):
+    """Error de la API: código estable, mensaje en español y detalles."""
+
     code: str = Field(description="Código estable del error (para programas)")
     message: str = Field(description="Mensaje en español para el usuario")
-    details: dict[str, Any] = Field(default_factory=dict)
+    details: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Datos adicionales del error (p. ej. «campos» con cada dato no válido).",
+    )
 
 
 class ErrorResponse(BaseModel):
-    error: ErrorBody
+    """Formato único de los errores de la API."""
+
+    error: ErrorBody = Field(description="Error con código estable y mensaje en español.")
 
 
 #: Respuestas de error documentadas en OpenAPI para todos los endpoints.
@@ -49,14 +56,18 @@ class Educational(BaseModel):
 
 
 class SeriesOut(BaseModel):
-    dates: list[str]
-    values: list[float | None]
+    """Serie temporal en formato columnar."""
+
+    dates: list[str] = Field(description="Fechas (AAAA-MM-DD).")
+    values: list[float | None] = Field(description="Valores (null si no hay dato o no es finito).")
 
 
 class ColumnsOut(BaseModel):
     """Tabla columnar: ``columns[nombre] = lista``; todas las listas miden lo mismo."""
 
-    columns: dict[str, list[Any]]
+    columns: dict[str, list[Any]] = Field(
+        description="Columnas de la tabla: nombre → lista de valores (fechas AAAA-MM-DD; null si no hay dato)."
+    )
 
 
 def clean_float(x: Any) -> float | None:

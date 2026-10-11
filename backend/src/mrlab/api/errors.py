@@ -1,6 +1,8 @@
 """Manejo de errores: todo error sale como ``{"error": {"code", "message", "details"}}`` en español.
 
-- ``LabError`` y subclases → HTTP según clase y código (``lab_error_status``).
+- ``LabError`` y subclases → HTTP según clase y código (``lab_error_status``). Las rutas de las
+  carpetas locales del servidor (caché, estudios…) se sustituyen por una etiqueta
+  (``redact_paths``): son información interna.
 - Errores de validación de la petición → 422 ``PETICION_INVALIDA`` con un resumen en español
   (nunca el texto de pydantic en inglés).
 - Errores HTTP de Starlette (ruta inexistente, método no permitido, cuerpo demasiado grande…)
@@ -12,6 +14,8 @@
 from __future__ import annotations
 
 import logging
+import math
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -101,6 +105,60 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+# --------------------------------------------------------------------------- rutas del servidor
+
+#: Etiqueta con la que se sustituye cada carpeta local en los errores que llegan al cliente.
+_PATH_LABELS = (
+    ("cache_dir", "[caché del servidor]"),
+    ("studies_dir", "[estudios del servidor]"),
+    ("uploads_dir", "[archivos subidos al servidor]"),
+    ("data_dir", "[datos del servidor]"),
+)
+
+
+def server_path_replacements(settings: Any) -> list[tuple[str, str]]:
+    """(ruta absoluta, etiqueta) de las carpetas locales del servidor, las más largas primero.
+
+    Los mensajes del núcleo incluyen a veces la ruta de la caché (útil en la línea de comandos);
+    en la API esa ruta es información interna del servidor y se sustituye por una etiqueta."""
+    from mrlab.config import REPO_ROOT
+
+    pairs: set[tuple[str, str]] = set()
+    sources = [(getattr(settings, attr, None), label) for attr, label in _PATH_LABELS]
+    sources.append((REPO_ROOT, "[carpeta del laboratorio]"))
+    for raw, label in sources:
+        if raw is None:
+            continue
+        path = Path(raw)
+        # Solo rutas ABSOLUTAS: una relativa («data») sustituiría cualquier palabra igual en
+        # el mensaje (y no revela nada del servidor).
+        candidates = [path.resolve()] + ([path] if path.is_absolute() else [])
+        for candidate in candidates:
+            for form in (str(candidate), candidate.as_posix()):
+                if len(Path(form).parts) > 1:  # nunca la raíz del sistema («/» o una unidad)
+                    pairs.add((form, label))
+    return sorted(pairs, key=lambda item: len(item[0]), reverse=True)
+
+
+def redact_paths(value: Any, replacements: list[tuple[str, str]]) -> Any:
+    """Sustituye las rutas del servidor en textos, listas y diccionarios (para el cliente)."""
+    if isinstance(value, str):
+        for path, label in replacements:
+            if path in value:
+                value = value.replace(path, label)
+        return value
+    if isinstance(value, dict):
+        return {k: redact_paths(v, replacements) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_paths(v, replacements) for v in value]
+    return value
+
+
+def _replacements_for(request: Request) -> list[tuple[str, str]]:
+    lab = getattr(request.app.state, "lab", None)
+    return server_path_replacements(lab.settings) if lab is not None else []
+
+
 # --------------------------------------------------------------------------- validación
 
 _PYDANTIC_REASONS: dict[str, str] = {
@@ -178,9 +236,41 @@ def _expected_es(expected: Any) -> str:
     return str(expected).replace(" or ", " o ")
 
 
+def format_number(value: Any) -> str:
+    """Número en formato español del laboratorio: ``2520`` → «2.520», ``0.5`` → «0,5».
+
+    Agrupa siempre los miles con punto (también con 4 cifras, como el resto de la interfaz) y
+    usa coma decimal. Lo que no es un número se devuelve como texto."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return str(value)
+        if value.is_integer() and abs(value) < 1e15:
+            value = int(value)
+        else:
+            return repr(value).replace(".", ",")
+    sign = "-" if value < 0 else ""
+    return sign + f"{abs(value):,}".replace(",", ".")
+
+
+def _is_body_root(err: dict[str, Any]) -> bool:
+    loc = tuple(err.get("loc", ()))
+    return loc in ((), ("body",))
+
+
 def _reason(err: dict[str, Any]) -> str:
     etype = str(err.get("type", ""))
     ctx = err.get("ctx") or {}
+    if etype == "missing" and _is_body_root(err):
+        return "falta el cuerpo de la petición: envía un objeto JSON con los campos requeridos"
+    if etype == "model_attributes_type" and isinstance(err.get("input"), (bytes, bytearray)):
+        return (
+            "el cuerpo debe ser un objeto JSON enviado con la cabecera "
+            "«Content-Type: application/json»"
+        )
+    if etype == "date_from_datetime_inexact" and not isinstance(err.get("input"), str):
+        return "fecha inválida: usa el formato AAAA-MM-DD (como texto)"
     if etype in ("greater_than", "greater_than_equal", "less_than", "less_than_equal"):
         op = {
             "greater_than": "mayor que",
@@ -189,7 +279,7 @@ def _reason(err: dict[str, Any]) -> str:
             "less_than_equal": "menor o igual que",
         }[etype]
         limit = next(iter(ctx.values()), "")
-        return f"debe ser {op} {limit}"
+        return f"debe ser {op} {format_number(limit)}"
     if etype in ("enum", "literal_error"):
         expected = ctx.get("expected")
         return (
@@ -203,13 +293,13 @@ def _reason(err: dict[str, Any]) -> str:
         near = f" (error cerca del carácter {pos})" if pos is not None else ""
         return f"el cuerpo no es un JSON válido{near}"
     if etype == "too_short" and "min_length" in ctx:
-        return f"debe tener al menos {ctx['min_length']} elemento(s)"
+        return f"debe tener al menos {format_number(ctx['min_length'])} elemento(s)"
     if etype == "too_long" and "max_length" in ctx:
-        return f"admite como máximo {ctx['max_length']} elemento(s)"
+        return f"admite como máximo {format_number(ctx['max_length'])} elemento(s)"
     if etype == "string_too_short" and "min_length" in ctx:
-        return f"el texto debe tener al menos {ctx['min_length']} carácter(es)"
+        return f"el texto debe tener al menos {format_number(ctx['min_length'])} carácter(es)"
     if etype == "string_too_long" and "max_length" in ctx:
-        return f"el texto admite como máximo {ctx['max_length']} carácter(es)"
+        return f"el texto admite como máximo {format_number(ctx['max_length'])} carácter(es)"
     if etype in ("value_error", "assertion_error"):
         # Los validadores lanzan RequestValueError o LabError (en español), a veces envuelto en
         # un ValueError.
@@ -232,7 +322,8 @@ def _received(err: dict[str, Any]) -> Any:
     if "input" not in err or err.get("type") == "missing":
         return None
     value = err["input"]
-    if isinstance(value, (dict, list)):
+    # Ni objetos ni el cuerpo crudo: solo valores simples, acotados.
+    if value is None or isinstance(value, (dict, list, tuple, bytes, bytearray)):
         return None
     text = str(value)
     return text if len(text) <= _MAX_RECEIVED_CHARS else text[: _MAX_RECEIVED_CHARS - 1] + "…"
@@ -266,7 +357,11 @@ def validation_summary(errors: list[dict[str, Any]]) -> tuple[str, list[dict[str
 # --------------------------------------------------------------------------- HTTP
 
 _HTTP_MESSAGES: dict[int, tuple[str, str]] = {
-    400: ("PETICION_INVALIDA", "La petición no es válida."),
+    400: (
+        "PETICION_INVALIDA",
+        "La petición no es válida: no se pudo interpretar el cuerpo. Revisa el formato (JSON o "
+        "formulario multipart) y vuelve a intentarlo.",
+    ),
     401: ("NO_AUTORIZADO", "No autorizado."),
     403: ("PROHIBIDO", "No tienes permiso para esta operación."),
     404: (
@@ -286,12 +381,13 @@ _HTTP_MESSAGES: dict[int, tuple[str, str]] = {
 
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(LabError)
-    async def _lab_error(_: Request, exc: LabError) -> JSONResponse:
+    async def _lab_error(request: Request, exc: LabError) -> JSONResponse:
         status = lab_error_status(exc)
         headers = {"Retry-After": str(RETRY_AFTER_SECONDS)} if status == 429 else None
+        payload = error_payload(exc.code, exc.message, _json_safe(exc.details))
         return JSONResponse(
             status_code=status,
-            content=error_payload(exc.code, exc.message, _json_safe(exc.details)),
+            content=redact_paths(payload, _replacements_for(request)),
             headers=headers,
         )
 

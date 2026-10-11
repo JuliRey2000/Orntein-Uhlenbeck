@@ -1,0 +1,18 @@
+# Contexto de la imagen del backend: solo pyproject.toml, src/ y providers.toml.
+**/__pycache__
+**/*.py[cod]
+*.egg-info
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+tests/
+scripts/
+openapi.json
+Dockerfile
+.dockerignore
+.env
+*.log

@@ -1,0 +1,59 @@
+# Laboratorio de Reversión a la Media — servicios.
+#
+#   docker compose up --build      (o `make docker-up`, que además registra el hash de git)
+#   API:            http://localhost:8000/api/health
+#   Documentación:  http://localhost:8000/docs
+#
+# La configuración opcional va en .env (copia .env.example). Las carpetas de datos del
+# contenedor son fijas (/app/data, montada desde ./data): las rutas MRLAB_*_DIR del .env
+# solo se usan fuera de Docker.
+
+name: laboratorio-reversion-media
+
+services:
+  backend:
+    build:
+      context: ./backend
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-}
+        MRLAB_UID: ${MRLAB_UID:-1000}
+        MRLAB_GID: ${MRLAB_GID:-1000}
+    image: mrlab-backend:local
+    # Un solo proceso: caché y estudios en disco con locks por proceso (decisión F1).
+    command: ["uvicorn", "mrlab.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+    ports:
+      # Solo en este equipo por defecto (la API no tiene autenticación). Para abrirla en la
+      # red local: MRLAB_BIND=0.0.0.0 en .env.
+      - "${MRLAB_BIND:-127.0.0.1}:${MRLAB_PORT:-8000}:8000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      MRLAB_DATA_DIR: /app/data
+      MRLAB_CACHE_DIR: /app/data/cache
+      MRLAB_STUDIES_DIR: /app/data/studies
+      MRLAB_UPLOADS_DIR: /app/data/uploads
+      MRLAB_PROVIDERS_FILE: /app/providers.toml
+      MRLAB_CORS_ORIGINS: ${MRLAB_CORS_ORIGINS:-http://localhost:5173,http://localhost:8080}
+      MRLAB_LOG_LEVEL: ${MRLAB_LOG_LEVEL:-INFO}
+      MRLAB_JOB_WORKERS: ${MRLAB_JOB_WORKERS:-2}
+      MRLAB_MAX_UPLOAD_MB: ${MRLAB_MAX_UPLOAD_MB:-10}
+      MRLAB_YAHOO_MAX_RETRIES: ${MRLAB_YAHOO_MAX_RETRIES:-4}
+      MRLAB_YAHOO_BACKOFF_BASE_SECONDS: ${MRLAB_YAHOO_BACKOFF_BASE_SECONDS:-1.0}
+    volumes:
+      # Caché de precios, estudios (registro de la prueba) y CSV subidos: persisten en ./data.
+      - ./data:/app/data
+    restart: unless-stopped
+
+  # frontend:
+  #   # Fase 3: interfaz React + TypeScript + Vite servida por nginx en :8080 (decisión I6).
+  #   # Los tipos TypeScript se generan desde backend/openapi.json (`make openapi`).
+  #   build:
+  #     context: ./frontend
+  #   image: mrlab-frontend:local
+  #   ports:
+  #     - "${MRLAB_BIND:-127.0.0.1}:8080:80"
+  #   depends_on:
+  #     backend:
+  #       condition: service_healthy
+  #   restart: unless-stopped

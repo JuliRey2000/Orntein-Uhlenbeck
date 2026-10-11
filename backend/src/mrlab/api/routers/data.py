@@ -3,19 +3,23 @@
 CONTRATO:
 - POST /data/load  LoadRequest {provider, symbols: list[str] (1..30, sin duplicados),
   start: date, end: date, refresh: bool=False} → LoadResponse {series: list[SeriesMeta],
-  errors: list[{symbol, status, error: ErrorBody}], cached, synthetic, disclaimer} (fallos
-  parciales por símbolo con su error en español; si fallan TODOS → el error del primero con su
-  HTTP: ERROR_RED 503, LIMITE_PETICIONES 429 con Retry-After, símbolo inexistente 404). Usa la
-  caché (``DataService``); ``refresh`` fuerza la descarga.
+  errors: list[{symbol, status, error: ErrorBody}], cached, notices, synthetic, disclaimer}
+  (fallos parciales por símbolo con su error en español; si fallan TODOS → el error del primero
+  con su HTTP: ERROR_RED 503, LIMITE_PETICIONES 429 con Retry-After, símbolo inexistente 404).
+  Usa la caché (``DataService``); ``refresh`` fuerza la descarga. Se carga SIEMPRE el símbolo
+  pedido: un índice o futuro nunca se sustituye por su proxy; ``notices`` lo explica y sugiere el
+  proxy (también avisa de datos SINTÉTICOS y de cripto spot).
 - POST /data/csv  multipart: file (UploadFile) + campos de formulario symbol, name, currency,
   asset_class, price_type, origin (opcional), seed (opcional) → CSVUploadOut {series: SeriesMeta,
   synthetic, synthetic_forced, notices, disclaimer} del CSV registrado y cargado en caché
   (CSVProvider.register(content, meta, filename=file.filename), luego DataService.load con el
   rango completo). Límite de tamaño settings.max_upload_mb → 413 ARCHIVO_DEMASIADO_GRANDE en
   español: se rechaza por la cabecera Content-Length antes de leer el cuerpo y, si no, al leer el
-  archivo en bloques (nunca se carga entero en memoria si supera el límite). Metadatos inválidos →
-  422 CSV_METADATOS_INVALIDOS (build_metadata). Un CSV con la columna tipo_datos = SINTETICO o con
-  nombre SINTETICO_* queda SINTÉTICO aunque el formulario diga histórico, y la respuesta lo avisa.
+  archivo en bloques (nunca se carga entero en memoria si supera el límite); sin Content-Length
+  (transferencia por bloques) se cuentan los bytes a medida que llegan y se corta al superar el
+  límite. Metadatos inválidos → 422 CSV_METADATOS_INVALIDOS (build_metadata). Un CSV con la
+  columna tipo_datos = SINTETICO o con nombre SINTETICO_* queda SINTÉTICO aunque el formulario
+  diga histórico, y la respuesta lo avisa.
 - POST /data/synthetic  SyntheticRequest → SyntheticOut {a, b, label: "SINTÉTICO", note, ...}:
   registra en el SyntheticProvider y carga ambas series por DataService (quedan en caché,
   reproducibles con su snapshot_id).
@@ -38,10 +42,18 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Reques
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from starlette.responses import Response
+from starlette.types import Message
 
 from mrlab import DISCLAIMER
-from mrlab.api.errors import RequestValueError, json_safe, lab_error_status
+from mrlab.api.errors import (
+    RequestValueError,
+    json_safe,
+    lab_error_status,
+    redact_paths,
+    server_path_replacements,
+)
 from mrlab.api.openapi_models import EducationalOut, SeriesMetaOut, ValidationReportOut
+from mrlab.api.routers.assets import metadata_note
 from mrlab.api.schemas import ERROR_RESPONSES, ErrorBody, ErrorResponse, SeriesOut, series_out
 from mrlab.api.state import AppState, get_state
 from mrlab.config import Settings
@@ -58,7 +70,14 @@ from mrlab.data.providers.synthetic import (
 from mrlab.data.service import DataService
 from mrlab.data.validation import MIN_TRAIN_OBS, validate_pair
 from mrlab.domain.errors import ConfigError, LabError
-from mrlab.domain.models import AssetClass, DataOrigin, PriceSeries, PriceType, SpreadType
+from mrlab.domain.models import (
+    AssetClass,
+    DataOrigin,
+    PriceSeries,
+    PriceType,
+    SeriesMeta,
+    SpreadType,
+)
 
 OK = "Respuesta correcta."
 MAX_SYMBOLS = 30
@@ -76,9 +95,14 @@ DATA_RESPONSES: dict[int | str, dict[str, Any]] = {
     503: {"model": ErrorResponse, "description": "Sin conexión con el proveedor de datos"},
 }
 UPLOAD_RESPONSES: dict[int | str, dict[str, Any]] = {
-    **ERROR_RESPONSES,
+    **{k: v for k, v in ERROR_RESPONSES.items() if k != 502},
     413: {"model": ErrorResponse, "description": "El archivo supera el tamaño máximo"},
 }
+
+
+def _pick(*codes: int) -> dict[int | str, dict[str, Any]]:
+    """Subconjunto de las respuestas de error documentadas."""
+    return {code: ERROR_RESPONSES[code] for code in codes}
 
 
 def _values(enum: Any) -> str:
@@ -127,18 +151,42 @@ def read_limited(stream: BinaryIO, limit: int, settings: Settings) -> bytes:
     return b"".join(chunks)
 
 
+def max_body_bytes(settings: Settings) -> int:
+    """Tamaño máximo del cuerpo multipart: el límite del archivo más un margen para los campos."""
+    return max_upload_bytes(settings) + MULTIPART_OVERHEAD
+
+
 class UploadLimitRoute(APIRoute):
-    """Rechaza con 413 por Content-Length ANTES de que se lea y procese el cuerpo multipart."""
+    """Rechaza con 413 ANTES de procesar un cuerpo multipart demasiado grande.
+
+    1. Por la cabecera ``Content-Length``, sin leer el cuerpo.
+    2. Si no la hay (``Transfer-Encoding: chunked``) o miente, contando los bytes a medida que
+       llegan: al superar el límite se corta la lectura, de modo que un archivo enorme nunca se
+       termina de recibir ni de volcar a disco.
+    """
 
     def get_route_handler(self):  # type: ignore[no-untyped-def]
         handler = super().get_route_handler()
 
         async def limited(request: Request) -> Response:
             settings: Settings = request.app.state.lab.settings
+            limit = max_body_bytes(settings)
             length = request.headers.get("content-length", "")
-            if length.isdigit() and int(length) > max_upload_bytes(settings) + MULTIPART_OVERHEAD:
+            if length.isdigit() and int(length) > limit:
                 raise too_large(settings)
-            return await handler(request)
+            receive = request.receive
+            received = 0
+
+            async def counting_receive() -> Message:
+                nonlocal received
+                message = await receive()
+                if message["type"] == "http.request":
+                    received += len(message.get("body", b""))
+                    if received > limit:
+                        raise too_large(settings)
+                return message
+
+            return await handler(Request(request.scope, counting_receive))
 
         return limited
 
@@ -150,7 +198,7 @@ _upload_router = APIRouter(route_class=UploadLimitRoute)
 # --------------------------------------------------------------------------- modelos
 
 
-class SeriesRefIn(BaseModel):
+class SeriesQueryIn(BaseModel):
     """Referencia a una serie: por instantánea de la caché o por proveedor + rango."""
 
     provider: str = Field(
@@ -173,7 +221,7 @@ class SeriesRefIn(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _check_range(self) -> SeriesRefIn:
+    def _check_range(self) -> SeriesQueryIn:
         if not self.snapshot_id and (self.start is None or self.end is None):
             raise RequestValueError(
                 "sin «snapshot_id» hay que indicar «start» y «end» (formato AAAA-MM-DD) para "
@@ -187,7 +235,7 @@ class SeriesRefIn(BaseModel):
         return self
 
 
-def load_ref(data: DataService, ref: SeriesRefIn, role: str) -> PriceSeries:
+def load_ref(data: DataService, ref: SeriesQueryIn, role: str) -> PriceSeries:
     """Carga una referencia: con ``snapshot_id`` solo desde la caché; si no, caché o proveedor."""
     if ref.snapshot_id:
         series = data.load_snapshot(ref.snapshot_id, ref.start, ref.end)
@@ -208,6 +256,8 @@ def load_ref(data: DataService, ref: SeriesRefIn, role: str) -> PriceSeries:
 
 
 class LoadRequest(BaseModel):
+    """Símbolos y rango de fechas a cargar de un proveedor."""
+
     model_config = ConfigDict(extra="forbid")
 
     provider: str | None = Field(
@@ -218,7 +268,7 @@ class LoadRequest(BaseModel):
     symbols: list[str] = Field(
         min_length=1,
         max_length=MAX_SYMBOLS,
-        description="Símbolos a cargar (de 1 a 30, sin repetir), p. ej. [\"KO\", \"PEP\"].",
+        description='Símbolos a cargar (de 1 a 30, sin repetir), p. ej. ["KO", "PEP"].',
     )
     start: date = Field(description="Fecha de inicio (AAAA-MM-DD), inclusive.")
     end: date = Field(description="Fecha de fin (AAAA-MM-DD), inclusive.")
@@ -266,12 +316,16 @@ class LoadRequest(BaseModel):
 
 
 class SymbolErrorOut(BaseModel):
+    """Error de un símbolo que no se pudo cargar (los demás sí se cargaron)."""
+
     symbol: str = Field(description="Símbolo que no se pudo cargar.")
     status: int = Field(description="Código HTTP que tendría este error por sí solo.")
     error: ErrorBody = Field(description="Error en español (code, message, details).")
 
 
 class LoadResponse(EducationalOut):
+    """Series cargadas (con su snapshot_id), errores por símbolo y avisos."""
+
     series: list[SeriesMetaOut] = Field(
         description="Series cargadas (en el orden pedido), con su snapshot_id."
     )
@@ -282,9 +336,18 @@ class LoadResponse(EducationalOut):
         default_factory=list,
         description="Símbolos servidos desde la caché local, sin descargar.",
     )
+    notices: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Avisos en español: índices o futuros no ejecutables (con el proxy SUGERIDO, que "
+            "nunca se aplica en silencio), datos SINTÉTICOS, cripto spot…"
+        ),
+    )
 
 
 class CSVUploadOut(EducationalOut):
+    """Serie del CSV registrada y guardada en la caché."""
+
     series: SeriesMetaOut = Field(description="Serie registrada y guardada en la caché.")
     synthetic_forced: bool = Field(
         False,
@@ -308,7 +371,9 @@ class SyntheticRequest(BaseModel):
     n_obs: int = Field(1500, ge=2, le=MAX_OBS, description="Observaciones (días hábiles).")
     start: date = Field(date(2018, 1, 1), description="Primera fecha (lunes a viernes).")
     seed: int = Field(7, ge=0, le=2**63 - 1, description="Semilla (entero ≥ 0): reproducible.")
-    alpha: float = Field(0.0, allow_inf_nan=False, description="α de la relación log A = α + β·log B + X.")
+    alpha: float = Field(
+        0.0, allow_inf_nan=False, description="α de la relación log A = α + β·log B + X."
+    )
     beta: float = Field(1.0, allow_inf_nan=False, description="β de la relación de cointegración.")
     ou_lambda: float = Field(
         0.1, gt=0, allow_inf_nan=False, description="λ del spread OU (1/día); vida media ln2/λ."
@@ -327,15 +392,23 @@ class SyntheticRequest(BaseModel):
         0.01, ge=0, allow_inf_nan=False, description="Volatilidad de A (no cointegrados)."
     )
     rho: float = Field(
-        0.9, ge=-1, le=1, allow_inf_nan=False, description="Correlación de los incrementos (correlado no cointegrado)."
+        0.9,
+        ge=-1,
+        le=1,
+        allow_inf_nan=False,
+        description="Correlación de los incrementos (correlado no cointegrado).",
     )
-    b_start_price: float = Field(100.0, gt=0, allow_inf_nan=False, description="Precio inicial de B.")
+    b_start_price: float = Field(
+        100.0, gt=0, allow_inf_nan=False, description="Precio inicial de B."
+    )
     a_start_price: float = Field(
         100.0, gt=0, allow_inf_nan=False, description="Precio inicial de A (no cointegrados)."
     )
 
 
 class SyntheticOut(EducationalOut):
+    """Par SINTÉTICO generado y guardado en la caché."""
+
     synthetic: bool = Field(True, description="Siempre True: datos SINTÉTICOS.")
     label: str = Field(SYNTHETIC_LABEL, description="Etiqueta permanente: «SINTÉTICO».")
     a: SeriesMetaOut = Field(description="Serie A (con snapshot_id en la caché).")
@@ -347,6 +420,8 @@ class SyntheticOut(EducationalOut):
 
 
 class SeriesDataOut(EducationalOut):
+    """Precios de cierre de una instantánea de la caché."""
+
     meta: SeriesMetaOut = Field(description="Metadatos de la serie.")
     close: SeriesOut = Field(
         description=(
@@ -357,10 +432,12 @@ class SeriesDataOut(EducationalOut):
 
 
 class ValidateRequest(BaseModel):
+    """Par a validar y parámetros del informe de validación."""
+
     model_config = ConfigDict(extra="forbid")
 
-    a: SeriesRefIn = Field(description="Serie A.")
-    b: SeriesRefIn = Field(description="Serie B.")
+    a: SeriesQueryIn = Field(description="Serie A.")
+    b: SeriesQueryIn = Field(description="Serie B.")
     spread_type: SpreadType = Field(
         SpreadType.LOG, description="Tipo de spread: «log» (por defecto) o «precio»."
     )
@@ -425,7 +502,16 @@ def load_data(req: LoadRequest, state: AppState = Depends(get_state)) -> LoadRes
                 SymbolErrorOut(
                     symbol=sym,
                     status=lab_error_status(exc),
-                    error=ErrorBody(code=exc.code, message=exc.message, details=json_safe(exc.details)),
+                    error=ErrorBody(
+                        **redact_paths(
+                            {
+                                "code": exc.code,
+                                "message": exc.message,
+                                "details": json_safe(exc.details),
+                            },
+                            server_path_replacements(state.settings),
+                        )
+                    ),
                 )
             )
             continue
@@ -439,7 +525,19 @@ def load_data(req: LoadRequest, state: AppState = Depends(get_state)) -> LoadRes
         errors=errors,
         cached=cached,
         synthetic=any(m.is_synthetic for m in loaded),
+        notices=_load_notices(loaded),
     )
+
+
+def _load_notices(loaded: list[SeriesMeta]) -> list[str]:
+    """Avisos de las series cargadas: el símbolo cargado es SIEMPRE el pedido (un índice nunca se
+    sustituye por su proxy); si no es ejecutable, se explica y se sugiere el proxy."""
+    notices: list[str] = []
+    for meta in loaded:
+        needs_proxy, _, note = metadata_note(meta.asset)
+        if needs_proxy or meta.is_synthetic or meta.asset.asset_class == AssetClass.CRYPTO:
+            notices.append(note)
+    return notices
 
 
 def _csv_provider(state: AppState) -> tuple[str, CSVProvider]:
@@ -481,7 +579,10 @@ def upload_csv(
         ..., description="Archivo CSV (UTF-8 o Windows-1252; fechas AAAA-MM-DD)."
     ),
     symbol: str = Form(
-        ..., min_length=1, max_length=MAX_SYMBOL_CHARS, description="Símbolo de la serie (p. ej. «KO»)."
+        ...,
+        min_length=1,
+        max_length=MAX_SYMBOL_CHARS,
+        description="Símbolo de la serie (p. ej. «KO»).",
     ),
     currency: str = Form(..., description="Moneda: código ISO de 3 letras (p. ej. USD, EUR, MXN)."),
     asset_class: str = Form(..., description=f"Clase de activo: {_values(AssetClass)}."),
@@ -580,7 +681,7 @@ def _synthetic_provider(state: AppState) -> tuple[str, SyntheticProvider]:
         "etiqueta SINTÉTICO y nunca modifican datos históricos."
     ),
     response_description=OK,
-    responses=ERROR_RESPONSES,
+    responses=_pick(400, 404, 422, 500),
 )
 def generate_synthetic(req: SyntheticRequest, state: AppState = Depends(get_state)) -> SyntheticOut:
     # Solo los campos indicados: el escenario aplica sus valores por defecto al resto.
@@ -617,12 +718,14 @@ def generate_synthetic(req: SyntheticRequest, state: AppState = Depends(get_stat
         "opcional por proveedor y símbolo. Nunca descarga."
     ),
     response_description=OK,
-    responses=ERROR_RESPONSES,
+    responses=_pick(400, 422, 500),
 )
 def list_cache(
     provider: str | None = Query(None, max_length=40, description="Filtrar por proveedor."),
     symbol: str | None = Query(
-        None, max_length=MAX_SYMBOL_CHARS, description="Filtrar por símbolo (sin distinguir mayúsculas)."
+        None,
+        max_length=MAX_SYMBOL_CHARS,
+        description="Filtrar por símbolo (sin distinguir mayúsculas).",
     ),
     state: AppState = Depends(get_state),
 ) -> list[Any]:
@@ -639,7 +742,7 @@ def list_cache(
         "instantánea no existe → 404 SNAPSHOT_NO_ENCONTRADO."
     ),
     response_description=OK,
-    responses=ERROR_RESPONSES,
+    responses=_pick(404, 422, 500),
 )
 def series_data(
     snapshot_id: str = Query(..., min_length=1, max_length=200, description="Instantánea."),

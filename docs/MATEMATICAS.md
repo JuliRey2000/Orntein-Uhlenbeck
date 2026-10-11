@@ -1264,10 +1264,10 @@ acciones. Exposición bruta: `83,68·60 + 29,29·170 ≈ 10.000` USD.
 - Cada segmento se simula por separado, empezando sin posición y con el capital
   inicial. Una posición abierta al final queda como no realizada.
 - Si se cambian los umbrales después de ver la prueba, el resultado queda marcado
-  como «prueba contaminada» de forma permanente (decisión S10). En la fase 1, el
-  historial de configuraciones con que se ejecutó la prueba viaja dentro de
-  `run_config.json` (`test_history`, decisión S10a); el registro persistente de
-  estudios llega en la fase 2.
+  como «prueba contaminada» de forma permanente (decisión S10). El historial de
+  configuraciones con que se ejecutó la prueba viaja dentro de `run_config.json`
+  (`test_history`, decisión S10a), y los estudios de la API lo guardan además en
+  un registro persistente (`data/studies/`, decisiones S10 y F2).
 
 ### 13.2 Convención de ejecución t → t+1
 

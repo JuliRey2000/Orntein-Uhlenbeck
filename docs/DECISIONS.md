@@ -673,8 +673,9 @@ el responsable del proyecto.
 - **Alternativas:** solo un aviso en la sesión del navegador.
 - **Justificación:** la marca debe sobrevivir a recargas y viajar con los resultados.
 - **Fecha:** 2026-10-10
-- **Nota:** el registro persistente en `data/studies/` llega en la fase 2; la
-  versión mínima de la fase 1 es S10a.
+- **Nota:** el registro persistente en `data/studies/` se implementó en la fase 2
+  (F2 y F3); la versión mínima de la fase 1, que sigue viajando en
+  `run_config.json`, es S10a.
 
 ### S10a — Prueba contaminada en la fase 1 (complementa S10)
 - **Decisión:** `RunConfig.test_history` guarda los `config_hash` con los que se
@@ -1270,4 +1271,302 @@ el responsable del proyecto.
   que dice).
 - **Justificación:** las correcciones cambiaban contratos compartidos (`OUFit`,
   `OUWindow`, `OUStability`, `STRATEGY_BLOCKING_CODES`, el informe de validación).
+- **Fecha:** 2026-10-10
+
+## API (fase 2)
+
+### F1 — Un solo proceso de uvicorn
+- **Decisión:** la API se sirve con un único proceso de uvicorn (`--workers 1` en
+  `make api`, en el `CMD` de la imagen y en `docker-compose.yml`). La concurrencia
+  viene de los hilos de FastAPI (endpoints síncronos) y del gestor de trabajos
+  (`MRLAB_JOB_WORKERS` hilos, I2).
+- **Alternativas:** varios procesos (`--workers N`) con locks de archivo
+  (`fcntl`/`msvcrt`) o una base de datos para la caché y los estudios.
+- **Justificación:** la caché de instantáneas (`index.json`) y los estudios se
+  escriben en disco con locks **por proceso** (`threading.RLock`) y escritura
+  atómica; con varios procesos, dos escrituras simultáneas del índice o de un
+  estudio podrían perder una actualización, y los trabajos en memoria no se verían
+  entre procesos. Es una herramienta local y educativa: un proceso basta, funciona
+  igual en Windows, macOS y Linux y no añade dependencias.
+- **Fecha:** 2026-10-10
+
+### F2 — Estudios: registro persistente de la prueba (implementa S10)
+- **Decisión:** `mrlab.studies.StudyStore` guarda cada estudio en
+  `data/studies/<id>.json` (id = uuid4 hexadecimal; otro formato → 404
+  `ESTUDIO_NO_ENCONTRADO`, sin tocar rutas arbitrarias), con escritura atómica y un
+  lock por estudio. Crear un estudio ejecuta el análisis sin la prueba y congela la
+  configuración fijada (instantáneas y fechas de corte); `POST /studies/{id}/test`
+  es la ÚNICA vía de la API para ejecutar la prueba y registra cada ejecución (hash
+  con la prueba incluida, fecha y origen). Cualquier cambio de parámetros después de
+  verla marca el estudio como contaminado de forma permanente, con el motivo; la
+  marca llega al LEEME y a `pruebas_estadisticas.csv` de la exportación del estudio.
+  Un estudio creado desde un `run_config.json` con `test_history` importa esas
+  ejecuciones (nace contaminado si alguna es de otra configuración). Si la
+  estrategia está bloqueada o no hay periodo de prueba, la ejecución no se registra
+  (`PRUEBA_NO_SIMULABLE`, `SIN_PERIODO_PRUEBA`).
+- **Alternativas:** solo el historial dentro de `run_config.json` (S10a); estado en
+  el navegador; una base de datos.
+- **Justificación:** S10 exige que la marca sobreviva a recargas y reinicios y viaje
+  con los resultados; un archivo JSON por estudio es auditable y no añade
+  dependencias. Cierra las limitaciones declaradas en S10a y S10b.
+- **Fecha:** 2026-10-10
+
+### F3 — Contaminación entre estudios del mismo par
+- **Decisión:** un estudio importa como `otro_estudio` las ejecuciones de la prueba
+  de otros estudios (también eliminados) del mismo par (series A y B en cualquier
+  orden, por proveedor y símbolo, sin distinguir mayúsculas) cuyo periodo de prueba
+  se solapa con el suyo y que ocurrieron antes de fijar su configuración actual. Si
+  alguna usó otra configuración, queda contaminado. Borrar un estudio con
+  ejecuciones propias de la prueba lo quita de la lista pero conserva su registro en
+  `data/studies/eliminados/`.
+- **Alternativas:** registro solo por estudio (permitía «lavar» la marca creando
+  otro estudio con umbrales ajustados, o borrando y recreando el estudio);
+  identidad por `snapshot_id` (se evade descargando de nuevo); bloquear la creación
+  de un segundo estudio del mismo par.
+- **Justificación:** S10 exige una marca permanente. Límite declarado: los mismos
+  precios subidos como CSV con otro símbolo no se detectan.
+- **Fecha:** 2026-10-10
+
+### F4 — `/pairs/analyze` ejecuta el análisis con los backtests de formación y validación
+- **Decisión:** `/pairs/analyze` usa `run_pair` sin la prueba (el mismo cálculo que
+  `/backtest`), en lugar de una función de análisis sin backtests.
+- **Alternativas:** `analyze_config` sin simular.
+- **Justificación:** las razones de descarte que solo aparecen al simular
+  (`COSTES_SUPERAN_BRUTO`, `SIMULACION_NO_POSIBLE`) deben estar en el panel
+  «¿Por qué se descartó?» y en el aviso «solo ilustrativo» (O5a), y así el análisis
+  nunca contradice al backtest de la misma configuración. Cuesta unos 0,3 s.
+- **Fecha:** 2026-10-10
+
+### F5 — Gráficos del análisis sin el periodo de prueba
+- **Decisión:** las series para gráficos de `PairAnalysisOut` (precios, spread, z)
+  terminan al final de la validación salvo cuando la ejecución incluye la prueba de
+  un estudio; `chart_note` lo explica. Las estimaciones no cambian (solo usan la
+  formación).
+- **Alternativas:** enviar toda la muestra.
+- **Justificación:** no mirar el periodo de prueba antes de congelar la
+  configuración (8.1 y sección 17).
+- **Fecha:** 2026-10-10
+
+### F6 — Reproducción desde `run_config.json` solo con la caché
+- **Decisión:** `/runs/replay` (ZIP idéntico byte a byte) y `/runs/replay/json`
+  exigen que todas las series tengan `snapshot_id` (si no, 400
+  `RUN_CONFIG_SIN_INSTANTANEAS`), verifican el hash como `load_run_config` (núcleo:
+  `parse_run_config`, compatible) y, si `include_test = true`, que el propio
+  `config_hash` figure en `test_history` (si no, 400 `PRUEBA_SOLO_EN_ESTUDIO`). Una
+  instantánea ausente da 404 `SNAPSHOT_NO_ENCONTRADO`; nunca se descarga.
+- **Alternativas:** reproducir cualquier `run_config.json`, descargando lo que falte.
+- **Justificación:** reproducir nunca descarga en silencio (D7), y un archivo
+  escrito a mano con otros umbrales no puede ejecutar una prueba nueva fuera de un
+  estudio: reproducir es volver a ver la misma prueba, no evaluarla de nuevo.
+- **Fecha:** 2026-10-10
+
+### F7 — Cambios parciales de un estudio
+- **Decisión:** `PUT /studies/{id}/config` cambia solo los campos enviados de cada
+  sección (`strategy`, `costs`, `analysis`) y valida la sección completa
+  resultante (errores 422 con la ruta del campo, p. ej. `strategy.entry_z`). Los
+  datos del par y las instantáneas no cambian; cambiar `analysis.split` da 400
+  `DIVISION_CONGELADA`. Un cambio sin diferencias no se registra.
+- **Alternativas:** reemplazar la sección entera (los campos omitidos volverían a su
+  valor por defecto).
+- **Justificación:** evita reinicios accidentales de umbrales, que contaminarían la
+  prueba sin que el usuario lo quisiera.
+- **Fecha:** 2026-10-10
+
+### F8 — Comparación de pares en segundo plano
+- **Decisión:** `/backtest/compare` (2 a 10 pares) valida todas las configuraciones
+  antes de crear el trabajo (`include_test` → 400 con el índice) y responde 202 con
+  el `job_id`. Dentro del trabajo, el error de un par queda en su fila y los demás
+  continúan; un par bloqueado (p. ej. monedas distintas, ⛔) no es un error, su
+  fila dice por qué no se simuló. Las filas conservan el orden de la petición
+  (nunca se ordenan por PnL) y sus métricas son de validación.
+- **Alternativas:** respuesta síncrona; abortar todo el trabajo con el primer error;
+  ordenar por resultado.
+- **Justificación:** varios pares pueden tardar (I2), un fallo de un proveedor no
+  debe ocultar los demás resultados, y ordenar por PnL retrospectivo invita a
+  elegir el par que mejor salió por azar (sección 12).
+- **Fecha:** 2026-10-10
+
+### F9 — Exportación de un estudio
+- **Decisión:** `GET /studies/{id}/export` incluye el segmento de prueba solo si la
+  prueba se ejecutó en ESE estudio (origen `prueba` o `exportacion`), no si solo se
+  vio en otro estudio del mismo par. El archivo se llama
+  `<base>_estudio_<8 primeros caracteres del id>.zip`. Si la configuración cambió
+  después de ver la prueba, exportar vuelve a ejecutar la prueba con la
+  configuración nueva y la registra con origen `exportacion` (el estudio ya está
+  contaminado y el LEEME lo dice).
+- **Alternativas:** exportar siempre la última configuración probada; no incluir la
+  prueba en la exportación.
+- **Justificación:** la exportación debe reflejar la configuración actual del
+  estudio y no ocultar ninguna evaluación de la prueba: cada vez que se calcula,
+  queda registrada.
+- **Fecha:** 2026-10-10
+
+### F10 — Entradas documentadas como subclases del núcleo
+- **Decisión:** las entradas de la API (`RunConfigIn`, `SeriesRefIn`, `PairSpecIn`,
+  `AnalysisConfigIn`, `SplitConfigIn`, `StrategyParamsIn`, `CostParamsIn`) son
+  subclases de los modelos del núcleo que solo añaden descripciones en español; se
+  convierten al `RunConfig` del núcleo (`core_config`) antes de usarlas. Las
+  referencias de `/data/validate` y `/correlations` (con fechas obligatorias sin
+  `snapshot_id`) son otro modelo, `SeriesQueryIn`.
+- **Alternativas:** añadir las descripciones directamente en `run_config.py` y
+  `pair_pipeline.py`.
+- **Justificación:** no tocar los modelos del núcleo (librería pura de la fase 1);
+  el hash de la configuración no cambia. `SeriesQueryIn` evita dos esquemas
+  OpenAPI con el mismo nombre (`mrlab__…__SeriesRefIn`), que darían tipos
+  TypeScript ilegibles.
+- **Fecha:** 2026-10-10
+
+### F11 — Modelos de respuesta que aceptan los objetos del núcleo
+- **Decisión:** los modelos `*Out` de `api/openapi_models.py` usan
+  `from_attributes=True`: un campo declarado como `SeriesMetaOut` acepta
+  directamente un `SeriesMeta` del núcleo.
+- **Alternativas:** convertir a mano con `model_validate(obj.model_dump())` en cada
+  endpoint.
+- **Justificación:** pydantic v2 no acepta una instancia de la clase madre en un
+  campo de una subclase; eso provocaba 500 en `/data/load` y `/data/synthetic`.
+- **Fecha:** 2026-10-10
+
+### F12 — Límite de tamaño de los archivos subidos en tres capas
+- **Decisión:** `/data/csv`, `/runs/replay` y `/runs/replay/json` usan
+  `UploadLimitRoute`: (1) la cabecera Content-Length frente al límite más 64 KiB
+  para los campos del formulario, antes de leer el cuerpo; (2) sin Content-Length
+  (transferencia por bloques), se cuentan los bytes a medida que llegan; (3) el
+  archivo se lee en bloques de 64 KiB con el límite exacto
+  (`MRLAB_MAX_UPLOAD_MB`). Al superarlo: 413 `ARCHIVO_DEMASIADO_GRANDE` en español.
+- **Alternativas:** confiar solo en Content-Length; dejar que Starlette vuelque el
+  archivo a disco y comprobarlo después.
+- **Justificación:** no recibir ni guardar archivos enormes sin límite; con
+  transferencia por bloques, Starlette recibiría el archivo completo.
+- **Fecha:** 2026-10-10
+
+### F13 — Metadatos de un activo por ruta y por consulta
+- **Decisión:** `GET /assets/{provider}/{symbol}` (forma de ARQUITECTURA §3, con el
+  símbolo codificado: `%5EGSPC`) y `GET /assets/metadata?provider=&symbol=`, con la
+  misma lógica.
+- **Alternativas:** solo una de las dos.
+- **Justificación:** la forma con ruta es la documentada; la de consulta evita
+  codificar símbolos con `^` o `=` (`^GSPC`, `GC=F`).
+- **Fecha:** 2026-10-10
+
+### F14 — Avisos al cargar datos
+- **Decisión:** `/data/load` carga SIEMPRE el símbolo pedido y su respuesta trae
+  `notices`: si es un índice o futuro, explica que no es ejecutable y SUGIERE el
+  proxy (sin aplicarlo); también avisa de datos SINTÉTICOS y de cripto spot.
+- **Alternativas:** dejar ese aviso solo a `/assets/metadata`.
+- **Justificación:** sección 17 (nunca sustituir un índice en silencio) y la
+  pantalla de carga muestra el aviso sin otra petición.
+- **Fecha:** 2026-10-10
+
+### F15 — Errores de validación en español
+- **Decisión:** todo error de validación de la petición sale como 422
+  `PETICION_INVALIDA` con `details.campos = [{campo, motivo, recibido}]` (máximo 8
+  en el mensaje, luego «y N problema(s) más»). Los límites se escriben con el
+  formato del laboratorio («2.520», «0,5»); cuerpo ausente → «falta el cuerpo de la
+  petición…»; cuerpo sin `Content-Type: application/json` → se indica la cabecera;
+  `recibido` nunca repite el cuerpo crudo, objetos ni `None`; un 400 por cuerpo
+  ilegible explica que no se pudo leer. Los errores HTTP de Starlette (404, 405,
+  413…) también salen en español con el mismo formato, y cualquier excepción no
+  prevista da 500 `ERROR_INTERNO` sin traza.
+- **Alternativas:** los mensajes de pydantic/FastAPI en inglés; textos genéricos.
+- **Justificación:** sección 0 (errores claros que digan qué hacer) e I6 (formato
+  numérico).
+- **Fecha:** 2026-10-10
+
+### F16 — Rutas locales del servidor fuera de las respuestas
+- **Decisión:** las rutas absolutas de las carpetas del servidor (caché, estudios,
+  subidas, datos y la carpeta del laboratorio) se sustituyen por una etiqueta
+  («[caché del servidor]»…) en todo error que llega al cliente: el manejador de
+  `LabError`, los errores por símbolo de `/data/load` y los resultados y errores de
+  los trabajos (`redact_paths`). Los mensajes del núcleo no cambian (en la línea de
+  comandos la ruta es útil).
+- **Alternativas:** quitar las rutas de los mensajes del núcleo; dejarlas.
+- **Justificación:** no son claves, pero revelan la estructura del servidor; el
+  usuario de la API no las necesita para corregir el problema.
+- **Fecha:** 2026-10-10
+
+### F17 — Simulación OU: estadísticas con todas las trayectorias, recorte de las devueltas
+- **Decisión:** `/ou/simulate` calcula medias, bandas, histograma del tiempo de
+  cruce y vida media empírica con las `n_paths` trayectorias (máx. 500, horizonte
+  máx. 2.520), pero devuelve solo `paths_returned` (por defecto 50) para dibujar,
+  con `n_paths_returned` y una nota. El histograma usa intervalos alineados a días
+  (como máximo 40). λ y σ > 0 y valores finitos (si no, 422); X₀ = μ → 400
+  `X0_IGUAL_A_MU`.
+- **Alternativas:** devolver siempre todas las trayectorias (500 × 2.521 números,
+  varios MB); calcular las estadísticas solo con las devueltas.
+- **Justificación:** la respuesta se mantiene ligera para la interfaz sin cambiar
+  ninguna estadística.
+- **Fecha:** 2026-10-10
+
+### F18 — Documentación de `/docs` completa y en español
+- **Decisión:** cada endpoint declara `summary`, `description` y
+  `response_description` en español y solo los errores que puede devolver, todos
+  con el modelo `ErrorResponse`; todo endpoint con parámetros declara su 422 propio
+  (así FastAPI no añade su «Validation Error» ni el esquema `HTTPValidationError`).
+  Los modelos del núcleo que aparecen en las respuestas (`Metrics`, `Trade`,
+  `EGResult`…) reciben sus descripciones al generar el esquema
+  (`api/openapi_docs.py`: copia las de su versión `…In`/`…Out` y añade las de
+  `CORE_FIELDS`, `METRIC_HELP` y las enumeraciones), y los formularios multipart
+  pasan a llamarse `CSVUploadForm`, `ReplayForm` y `ReplayJsonForm` (en lugar de
+  `Body_<operación>`). Una prueba recorre el esquema: resumen propio en cada ruta,
+  descripción en cada modelo y cada campo, ningún texto por defecto de FastAPI y
+  ningún valor de enumeración o ejemplo en inglés.
+- **Alternativas:** añadir `Field(description=…)` en los modelos del núcleo; dejar
+  los esquemas del núcleo sin descripciones.
+- **Justificación:** `/docs` es parte del entregable de la fase 2, y el núcleo
+  (librería pura de la fase 1) no cambia. Swagger UI y ReDoc cargan sus estilos de
+  un CDN (FastAPI no los incluye): sin internet el esquema sigue disponible en
+  `/openapi.json` y en `backend/openapi.json`.
+- **Fecha:** 2026-10-10
+
+### F19 — Esquema OpenAPI versionado
+- **Decisión:** `backend/scripts/export_openapi.py` (o `make openapi`) escribe
+  `backend/openapi.json` (UTF-8 sin escapar, sangría de 2, LF); `--check` termina
+  con código 1 si no está al día. Una prueba compara el archivo versionado con el
+  esquema generado y comprueba que no depende de la configuración local.
+- **Alternativas:** generar los tipos TypeScript contra la API en ejecución.
+- **Justificación:** la fase 3 genera los tipos con `openapi-typescript` desde un
+  archivo estable y revisable en cada cambio, sin arrancar el backend.
+- **Fecha:** 2026-10-10
+
+### F20 — Arranque sin efectos y proveedores con la configuración de la app
+- **Decisión:** importar `mrlab.api.main` construye la aplicación sin usar la red ni
+  crear carpetas: la caché, los estudios y las subidas se crean en el primer uso
+  (una prueba lo verifica en un proceso aparte, con la red bloqueada).
+  `build_state` construye el registro de proveedores con la configuración de la
+  app (`ProviderRegistry.from_toml(..., settings=settings)`), y `CSVProvider`
+  define `defaults_from_settings` (carpeta de subidas), como ya hacía
+  `YahooProvider` (I7).
+- **Alternativas:** crear las carpetas al arrancar; que los proveedores lean
+  siempre la configuración del entorno.
+- **Justificación:** importar la app (pruebas, exportación del esquema, `uvicorn`
+  con `--reload`) no debe dejar carpetas en el directorio de trabajo; y con
+  `create_app(settings)` los CSV se guardaban en la carpeta del entorno, no en la de
+  esa configuración.
+- **Fecha:** 2026-10-10
+
+### F21 — Imagen Docker del backend
+- **Decisión:** `backend/Dockerfile` sobre `python:3.12-slim` (I1) instala el
+  paquete con `pip install ".[api]"` (no editable) y fija por variables de entorno
+  las rutas del contenedor (`MRLAB_DATA_DIR=/app/data`, caché, estudios, subidas y
+  `MRLAB_PROVIDERS_FILE=/app/providers.toml`, porque instalado fuera del repositorio
+  `BACKEND_ROOT` apunta a `site-packages`). Usuario sin privilegios con uid/gid
+  configurables (`MRLAB_UID`/`MRLAB_GID`, por defecto 1000) para poder escribir en
+  el volumen `./data → /app/data`; `GIT_COMMIT` como `ARG`/`ENV` (`make docker-up`
+  lo calcula); `HEALTHCHECK` a `/api/health` con Python (la imagen slim no trae
+  curl; sin proxy). `docker-compose.yml` publica el puerto en `127.0.0.1` por
+  defecto (`MRLAB_BIND`), lee `.env` si existe y deja comentado el servicio
+  `frontend` de la fase 3.
+- **Alternativas:** instalación editable con el repositorio montado; ejecutar como
+  root; publicar el puerto en todas las interfaces.
+- **Justificación:** imagen reproducible y mínima; la API no tiene autenticación,
+  así que por defecto solo es accesible desde el propio equipo.
+- **Fecha:** 2026-10-10
+
+### F22 — Cancelación de trabajos sin carrera
+- **Decisión:** `JobManager.cancel` comprueba el estado del trabajo DENTRO del lock
+  antes de cancelarlo o marcar `cancel_requested`.
+- **Alternativas:** comprobarlo antes de tomar el lock (versión anterior).
+- **Justificación:** si el trabajo terminaba entre la comprobación y el lock, se
+  marcaba `cancel_requested` sobre un trabajo ya completado y el DELETE respondía
+  200 en lugar de 409 `TRABAJO_YA_TERMINADO`.
 - **Fecha:** 2026-10-10

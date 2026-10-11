@@ -63,6 +63,8 @@ CORRELATION_NOTE = (
 
 
 class HealthOut(BaseModel):
+    """Estado del servicio y versión del código."""
+
     status: Literal["ok"] = Field("ok", description="«ok» si el servicio responde.")
     version: str = Field(description="Versión del laboratorio.")
     code_version: str = Field(
@@ -75,6 +77,8 @@ class HealthOut(BaseModel):
 
 
 class ProviderOut(BaseModel):
+    """Proveedor de datos habilitado (sin claves ni variables de entorno)."""
+
     name: str = Field(description="Nombre del proveedor (se usa en las peticiones).")
     label: str = Field(description="Nombre para mostrar.")
     description: str = Field(description="Descripción en español.")
@@ -92,6 +96,8 @@ class ProviderOut(BaseModel):
 
 
 class GlossaryOut(BaseModel):
+    """Textos en español para tooltips y explicaciones."""
+
     disclaimer: str = Field(DISCLAIMER, description="Aviso educativo obligatorio.")
     concepts: dict[str, str] = Field(
         description="Correlación, cointegración y aptitud para OU: tres conceptos distintos."
@@ -163,8 +169,10 @@ def _notices(name: str, kind: str) -> list[str]:
         return [SYNTHETIC_NOTE]
     if kind == "archivo":
         return [CSV_NOTICE]
-    return ["Fuente de datos externa: puede fallar o limitar peticiones; los datos se guardan "
-            "en la caché local para poder reproducir cada análisis."]
+    return [
+        "Fuente de datos externa: puede fallar o limitar peticiones; los datos se guardan "
+        "en la caché local para poder reproducir cada análisis."
+    ]
 
 
 # --------------------------------------------------------------------------- endpoints
@@ -225,9 +233,7 @@ def providers(state: AppState = Depends(get_state)) -> list[ProviderOut]:
 )
 def examples(state: AppState = Depends(get_state)) -> list[ExampleOut]:
     enabled = set(state.registry.names())
-    return [
-        ExampleOut(**p.model_dump(), available=p.provider in enabled) for p in PRESET_PAIRS
-    ]
+    return [ExampleOut(**p.model_dump(), available=p.provider in enabled) for p in PRESET_PAIRS]
 
 
 @router.get(

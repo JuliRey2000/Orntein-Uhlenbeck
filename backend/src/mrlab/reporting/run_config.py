@@ -13,6 +13,8 @@ CONTRATO:
 - ``save_run_config(cfg, path)`` escribe JSON legible (indentado, claves
   ordenadas, LF, con ``config_hash`` rellenado); ``load_run_config(path)`` lo
   lee y verifica el hash (ConfigError si no coincide: archivo editado a mano).
+  ``parse_run_config(contenido, nombre)`` hace lo mismo desde el contenido (archivo subido a la
+  API), con los mismos errores.
 
 Precisiones de la implementación:
 - NaN e infinitos no son JSON válido: ``canonical_json`` los rechaza con
@@ -30,8 +32,8 @@ Precisiones de la implementación:
 - ``include_test`` (forma parte del hash): si la ejecución incluye el segmento
   de prueba. ``test_history``: hashes de las configuraciones con las que se ha
   ejecutado la prueba; el runner lo usa para marcar «prueba contaminada»
-  (decisión S10, versión mínima de la fase 1: el registro viaja dentro del
-  archivo; el registro persistente de estudios llega en la fase 2).
+  (decisión S10a: el registro viaja dentro del archivo; el registro persistente
+  son los estudios de la API, ``mrlab.studies``).
 - Versión de esquema 2 (añade ``include_test`` y ``test_history`` y cambia la
   definición del hash). Un archivo de la versión 1 se verifica con la
   definición de entonces (el JSON tal como se guardó, sin
@@ -52,7 +54,7 @@ import os
 import subprocess
 from datetime import date, datetime
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 from pydantic import BaseModel, Field, ValidationError
@@ -310,25 +312,40 @@ def load_run_config(path: Path | str) -> RunConfig:
     """Lee un ``run_config.json`` y verifica que su hash corresponda a su contenido."""
     path = Path(path)
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        content = path.read_bytes()
     except FileNotFoundError as exc:
         raise ConfigError(
             f"No se encontró el archivo de configuración {path}.",
             code="RUN_CONFIG_NO_ENCONTRADO",
             details={"path": str(path)},
         ) from exc
+    return parse_run_config(content, path.name, location=str(path))
+
+
+def parse_run_config(
+    content: bytes | str, name: str = "run_config.json", *, location: str | None = None
+) -> RunConfig:
+    """Como ``load_run_config``, pero desde el contenido (p. ej. un archivo subido a la API).
+
+    ``name`` es el nombre que citan los mensajes; ``location`` (por defecto ``name``) va en
+    ``details["path"]``. Mismas verificaciones y mismos errores que ``load_run_config``."""
+    path = PurePath(name or "run_config.json")
+    where = location if location is not None else path.name
+    try:
+        text = content.decode("utf-8") if isinstance(content, bytes) else content
+        raw = json.loads(text)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ConfigError(
             f"El archivo {path.name} no es un JSON válido ({exc}). Si lo editaste a mano, revisa "
             "comas y comillas, o vuelve a exportarlo desde el laboratorio.",
             code="RUN_CONFIG_INVALIDO",
-            details={"path": str(path)},
+            details={"path": where},
         ) from exc
     if not isinstance(raw, dict):
         raise ConfigError(
             f"El archivo {path.name} no contiene una configuración (se esperaba un objeto JSON).",
             code="RUN_CONFIG_INVALIDO",
-            details={"path": str(path)},
+            details={"path": where},
         )
     version = raw.get("schema_version", SCHEMA_VERSION)
     if not isinstance(version, int) or isinstance(version, bool) or version > SCHEMA_VERSION:
@@ -336,7 +353,7 @@ def load_run_config(path: Path | str) -> RunConfig:
             f"El archivo {path.name} usa la versión de esquema {version!r}, más nueva que la que "
             f"entiende esta versión del laboratorio ({SCHEMA_VERSION}). Actualiza el laboratorio.",
             code="RUN_CONFIG_VERSION",
-            details={"path": str(path), "schema_version": version},
+            details={"path": where, "schema_version": version},
         )
     try:
         cfg = RunConfig.model_validate(raw)
@@ -349,13 +366,13 @@ def load_run_config(path: Path | str) -> RunConfig:
             f"El archivo {path.name} no tiene el formato de un run_config.json: {listed}. Si lo "
             "editaste a mano, corrige esos campos o vuelve a exportarlo desde el laboratorio.",
             code="RUN_CONFIG_INVALIDO",
-            details={"path": str(path), "errores": problems},
+            details={"path": where, "errores": problems},
         ) from None
     except LabError as exc:  # coherencia de parámetros (umbrales, costes…)
         raise ConfigError(
             f"El archivo {path.name} tiene parámetros no válidos: {exc.message}",
             code=exc.code,
-            details={**exc.details, "path": str(path)},
+            details={**exc.details, "path": where},
         ) from exc
 
     legacy = cfg.schema_version < SCHEMA_VERSION
@@ -368,7 +385,7 @@ def load_run_config(path: Path | str) -> RunConfig:
             "reproducir un análisis usa el archivo original; si quieres cambiar parámetros, hazlo "
             "desde el laboratorio para obtener una configuración nueva con su propio hash.",
             code="RUN_CONFIG_HASH_DISTINTO",
-            details={"path": str(path), "guardado": cfg.config_hash, "calculado": stored_def},
+            details={"path": where, "guardado": cfg.config_hash, "calculado": stored_def},
         )
     if legacy:
         cfg = cfg.model_copy(update={"schema_version": SCHEMA_VERSION})

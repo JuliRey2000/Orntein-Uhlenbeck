@@ -23,8 +23,12 @@ Plan aprobado el 2026-10-10. Las decisiones de detalle están en
 │   │   ├── backtest/               # división de la muestra, motor, costes, métricas
 │   │   ├── analysis/               # orquestación de un par (estado + causas), ejecución desde RunConfig
 │   │   ├── reporting/              # run_config (hash, git), exportación CSV/JSON/ZIP (HTML en fase 3)
-│   │   └── api/                    # FastAPI (fase 2)
-│   └── tests/{unit,integration}/
+│   │   ├── studies.py              # estudios: registro persistente de la prueba (fase 2)
+│   │   └── api/                    # FastAPI (fase 2): routers, DTO, errores, trabajos, OpenAPI
+│   ├── scripts/export_openapi.py   # backend/openapi.json (make openapi)
+│   ├── Dockerfile
+│   └── tests/{unit,integration,api}/
+├── docker-compose.yml              # servicio backend (frontend en la fase 3)
 ├── frontend/                       # React + TS + Vite (fase 3)
 ├── data/cache/  data/studies/  data/uploads/   # locales, ignorados por git
 ├── docs/                           # ARQUITECTURA, MATEMATICAS, DECISIONS, GUIA_ALUMNO
@@ -49,7 +53,7 @@ Un único `RunConfig` (pydantic) parametriza todo; se serializa como
 ### Dependencias entre módulos
 
 ```
-domain ← data ← stats ← model ← strategy ← backtest ← analysis ← reporting ← api
+domain ← data ← stats ← model ← strategy ← backtest ← analysis ← reporting ← studies ← api
 ```
 
 (cada capa solo importa de capas a su izquierda; `data.providers.synthetic` usa
@@ -58,33 +62,58 @@ domain ← data ← stats ← model ← strategy ← backtest ← analysis ← r
 ## 3. Contratos de la API (fase 2)
 
 Prefijo `/api`. Las peticiones de análisis llevan el `RunConfig` completo (sin
-estado y deterministas); el único estado es el «estudio» para detectar prueba
-contaminada.
+estado y deterministas) y la respuesta devuelve la configuración **fijada**
+(instantáneas y fechas de corte); el único estado de la API es el **estudio**
+(registro persistente de la prueba, en `data/studies/`) y la lista de trabajos en
+segundo plano (en memoria). El contrato completo, con cada campo descrito en
+español, está en `/docs` y en `backend/openapi.json` (versionado; `make openapi`
+lo regenera y una prueba comprueba que está al día).
 
 | Método | Ruta | Entrada → salida |
 |---|---|---|
-| GET | `/health` | → versión, hash git |
-| GET | `/providers` | → proveedores y avisos (Yahoo no oficial) |
-| GET | `/assets/search?q=&provider=` | → `AssetInfo[]` |
-| GET | `/assets/{provider}/{symbol}` | → `AssetInfo` (ejecutable, proxy sugerido) |
-| GET | `/examples` | → pares precargados |
-| POST | `/data/load` | `{provider, symbols, start, end}` → `SeriesMeta[]` con `snapshot_id` |
-| POST | `/data/csv` | archivo + moneda, tipo de precio, clase de activo → `SeriesMeta` |
-| POST | `/data/synthetic` | escenario + parámetros + semilla → `SeriesMeta[]` |
-| POST | `/data/validate` | `SeriesRef[]` → `ValidationReport` |
-| POST | `/correlations` | series, ventana → Pearson/Spearman + n, correlación móvil, base 100 |
-| POST | `/pairs/analyze` | `RunConfig` → `PairAnalysis` |
-| POST | `/ou/simulate` | λ, μ, σ, X₀, horizonte, trayectorias ≤ 500, semilla → simulación |
-| POST | `/backtest` | `RunConfig` + segmento → `BacktestResult` |
-| POST | `/studies`, `/studies/{id}/test` | congela configuración; prueba una vez; marca contaminación |
-| POST | `/backtest/compare` | varios pares, cada uno con su capital |
-| POST | `/universe/rank` → `job_id`; GET `/jobs/{id}` | ranking con progreso (fase 4) |
+| GET | `/health` | → `HealthOut` {status, version, code_version (hash git), disclaimer} |
+| GET | `/providers` | → `ProviderOut[]` {name, label, description, kind, is_default, synthetic, notices} (sin claves) |
+| GET | `/examples` | → `ExampleOut[]` (pares precargados; ninguno se asume cointegrado) |
+| GET | `/proxies` | → `ProxySuggestionOut[]` (índice/futuro → proxy sugerido) |
+| GET | `/glossary` | → `GlossaryOut` (textos para tooltips) |
+| GET | `/assets/search?q=&provider=` | → `AssetInfoOut[]` |
+| GET | `/assets/metadata?provider=&symbol=` y `/assets/{provider}/{symbol}` | → `AssetMetadataOut` {asset, requires_proxy, proxy (sugerido), synthetic, note} |
+| POST | `/data/load` | `{provider, symbols (1..30), start, end, refresh}` → `LoadResponse` {series: `SeriesMeta[]` con `snapshot_id`, errors por símbolo, cached, notices} |
+| POST | `/data/csv` | multipart: archivo + symbol, currency, asset_class, price_type (origin, seed) → `CSVUploadOut` (413 si supera `MRLAB_MAX_UPLOAD_MB`) |
+| POST | `/data/synthetic` | escenario + parámetros + semilla → `SyntheticOut` {a, b: `SeriesMeta`, label «SINTÉTICO», params} |
+| GET | `/data/cache?provider=&symbol=` | → `SeriesMeta[]` de la caché (nunca descarga) |
+| GET | `/data/series?snapshot_id=&start=&end=` | → `SeriesDataOut` {meta, close} (solo caché; nunca rellena fechas) |
+| POST | `/data/validate` | `{a, b: SeriesQueryIn, spread_type, min_train_obs, train_fraction}` → `ValidationOut` (`ValidationReport` + series) |
+| POST | `/correlations` | `{series (2..30), window, pair}` → `CorrelationOut` (Pearson/Spearman + n, base 100, correlación móvil, rendimientos) |
+| POST | `/pairs/analyze` | `RunConfig` → `AnalysisOut` {config fijado, analysis: `PairAnalysisOut`} |
+| POST | `/ou/simulate` | λ, μ, σ, X₀, horizonte (≤ 2.520), trayectorias (≤ 500), semilla, paths_returned → `SimulationOut` |
+| POST | `/backtest` | `RunConfig` → `BacktestOut` (segmentos formación y validación; nunca la prueba) |
+| POST | `/backtest/compare` | `{configs: RunConfig[] (2..10)}` → 202 `JobAccepted`; resultado `CompareResult` en `/jobs/{id}` |
+| GET / DELETE | `/jobs`, `/jobs/{id}` | → `JobSummaryOut[]`, `JobOut` (progreso, resultado o error); DELETE cancela (409 si ya terminó) |
+| POST | `/studies` | `{config: RunConfig, name}` → 201 `StudyOut` (congela instantáneas y división) |
+| GET | `/studies`, `/studies/{id}` | → `StudySummaryOut[]`, `StudyOut` {study, test_viewed, contaminated, contamination_reason, contamination_text} |
+| PUT | `/studies/{id}/config` | `{strategy?, costs?, analysis?}` (cambios parciales) → `StudyOut` (+ `warning` si contamina) |
+| POST | `/studies/{id}/test` | → `StudyTestOut` {study, backtest con «prueba», contaminated, contamination_text} |
+| GET | `/studies/{id}/export?excel_es=` | → ZIP del estudio (con la marca de contaminación del registro) |
+| DELETE | `/studies/{id}` | → 204 (el registro de una prueba vista pasa a `data/studies/eliminados/`) |
+| POST | `/export` | `{config: RunConfig, excel_es}` → ZIP (prefijo `SINTETICO_` si aplica) |
+| POST | `/runs/replay`, `/runs/replay/json` | multipart `run_config.json` → mismo ZIP byte a byte / `ReplayOut` (solo caché) |
+| POST | `/universe/rank` → `job_id` | ranking con progreso (fase 4) |
 | POST | `/walkforward`, `/portfolio` | fases 4 y 5 |
-| POST | `/export` | → ZIP (CSV, JSON, HTML) |
-| POST | `/runs/replay` | `run_config.json` → mismo análisis desde la caché |
 
-Errores: `{"error": {"code": "...", "message": "<español>", "details": {...}}}`.
-Los tipos TypeScript se generan del OpenAPI (`openapi-typescript`).
+Errores: `{"error": {"code": "...", "message": "<español>", "details": {...}}}`
+(`api/errors.py`). Validación de la petición → 422 `PETICION_INVALIDA` con
+`details.campos = [{campo, motivo, recibido}]` (nunca el texto de pydantic en
+inglés). 404 recurso inexistente; 409 trabajo ya terminado; 413 archivo demasiado
+grande; 429 límite del proveedor (con `Retry-After`); 502 fallo del proveedor; 503
+sin conexión. Las rutas locales del servidor (caché, estudios) nunca llegan al
+cliente. Los tipos TypeScript se generan de `backend/openapi.json`
+(`openapi-typescript`, fase 3).
+
+Despliegue: un solo proceso de uvicorn (decisión F1). `backend/Dockerfile` (Python
+3.12, usuario sin privilegios, `HEALTHCHECK` a `/api/health`) y
+`docker-compose.yml` (servicio `backend`, volumen `./data → /app/data`, puerto
+8000; el servicio `frontend` entra en la fase 3).
 
 ## 4. Frontend (fase 3)
 

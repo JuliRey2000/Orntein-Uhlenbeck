@@ -672,6 +672,12 @@ class CSVProvider:
 
         self.directory = Path(directory) if directory else get_settings().uploads_dir
 
+    @classmethod
+    def defaults_from_settings(cls, settings: Any) -> dict[str, Any]:
+        """Carpeta de los archivos subidos según ``Settings`` (la usa ``ProviderRegistry``): así
+        la API guarda los CSV en la carpeta de SU configuración, no en la del entorno."""
+        return {"directory": settings.uploads_dir}
+
     def register(
         self, content: bytes | str, meta: CSVMetadata, filename: str | None = None
     ) -> PriceSeries:

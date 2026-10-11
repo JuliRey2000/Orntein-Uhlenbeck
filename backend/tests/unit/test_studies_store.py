@@ -335,3 +335,114 @@ def test_contamination_note_texts(store: StudyStore, study: Study, data: DataSer
     assert "no se cambió después de verla" in contamination_note(viewed)
     assert "no incluye la prueba" in contamination_note(viewed, included=False)
     assert contamination_text(viewed).startswith("Prueba no contaminada")
+
+
+# --------------------------------------------------------------------------- otros estudios
+
+
+def test_new_study_after_seeing_test_elsewhere_is_contaminated(
+    store: StudyStore, study: Study, data: DataService
+) -> None:
+    """Ver la prueba en un estudio y crear otro del mismo par con otros umbrales no «lava» la
+    marca: el estudio nuevo nace con la prueba vista y contaminado."""
+    store.run_test(study.id, data)
+    tuned = store.create(_config(strategy=StrategyParams(entry_z=2.5)), data, name="ajustado")
+    assert tuned.test_viewed and tuned.contaminated
+    (run,) = tuned.test_runs
+    assert run.source == "otro_estudio" and run.study_id == study.id
+    reason = tuned.contamination_reason or ""
+    assert "ya se había visto en el estudio «Par sintético»" in reason
+    _, result = store.run_test(tuned.id, data)
+    assert result.test_contaminated is True
+    # El estudio original no se contamina por lo que se hizo después en otro estudio.
+    _, original = store.run_test(study.id, data)
+    assert original.test_contaminated is False
+    assert not store.get(study.id).contaminated
+
+
+def test_new_study_with_same_config_is_not_contaminated(
+    store: StudyStore, study: Study, data: DataService
+) -> None:
+    store.run_test(study.id, data)
+    twin = store.create(_config(), data, name="gemelo")
+    assert twin.test_viewed and not twin.contaminated  # misma configuración: mismo hash
+    _, result = store.run_test(twin.id, data)
+    assert result.test_contaminated is False
+    assert "1 en otro estudio del mismo par" in contamination_text(store.get(twin.id))
+    # Cambiar parámetros después contamina (la prueba ya se vio, aunque fuera en otro estudio).
+    changed = store.update_config(twin.id, strategy=StrategyParams(entry_z=2.25))
+    assert changed.contaminated
+
+
+def test_reversed_pair_counts_as_same_pair(
+    store: StudyStore, study: Study, data: DataService
+) -> None:
+    store.run_test(study.id, data)
+    ref = {"provider": "synthetic", "start": START, "end": END}
+    reversed_cfg = RunConfig(
+        pair={
+            "a": SeriesRef(symbol="sint-coi-b", **ref),
+            "b": SeriesRef(symbol="SINT-COI-A", **ref),
+        }
+    )
+    created = store.create(reversed_cfg, data)
+    assert created.test_viewed and created.contaminated
+
+
+def test_test_seen_after_config_was_fixed_does_not_contaminate(
+    store: StudyStore, data: DataService
+) -> None:
+    """Un estudio cuya configuración se fijó ANTES de que otro estudio viera la prueba conserva
+    una evaluación válida; cambiarlo después sí lo contamina."""
+    first = store.create(_config(), data, name="primero")
+    second = store.create(_config(strategy=StrategyParams(entry_z=2.5)), data, name="segundo")
+    store.run_test(first.id, data)
+    _, result = store.run_test(second.id, data)
+    assert result.test_contaminated is False
+    assert [r.source for r in store.get(second.id).test_runs] == ["prueba"]
+    third = store.create(_config(strategy=StrategyParams(entry_z=2.25)), data, name="tercero")
+    assert third.contaminated  # creado después de ver la prueba en los otros dos
+    later = store.update_config(second.id, strategy=StrategyParams(entry_z=2.75))
+    assert later.contaminated
+
+
+def test_other_pair_or_other_test_period_is_independent(
+    store: StudyStore, data: DataService
+) -> None:
+    early = {"provider": "synthetic", "start": START, "end": "2021-06-30"}
+    late = {"provider": "synthetic", "start": "2021-07-01", "end": END}
+
+    def cfg(ref: dict, prefix: str = "SINT-COI", **extra) -> RunConfig:
+        return RunConfig(
+            pair={
+                "a": SeriesRef(symbol=f"{prefix}-A", **ref),
+                "b": SeriesRef(symbol=f"{prefix}-B", **ref),
+            },
+            **extra,
+        )
+
+    seen = store.create(cfg(early), data)
+    store.run_test(seen.id, data)
+    other_period = store.create(cfg(late, strategy=StrategyParams(entry_z=2.5)), data)
+    assert not other_period.test_viewed and not other_period.contaminated
+    other_pair = store.create(cfg(early, "SINT-CBC", strategy=StrategyParams(entry_z=2.5)), data)
+    assert not other_pair.test_viewed and not other_pair.contaminated
+
+
+def test_deleting_a_viewed_study_keeps_its_test_record(
+    store: StudyStore, study: Study, data: DataService
+) -> None:
+    store.run_test(study.id, data)
+    store.delete(study.id)
+    assert store.list() == []
+    with pytest.raises(DataError):
+        store.get(study.id)
+    assert (store.directory / "eliminados" / f"{study.id}.json").is_file()
+    recreated = store.create(_config(strategy=StrategyParams(entry_z=2.5)), data)
+    assert recreated.contaminated
+    assert "(eliminado)" in (recreated.contamination_reason or "")
+    # Un estudio sin prueba vista se borra del todo.
+    unseen = store.create(_config(), data)
+    store.delete(unseen.id)
+    assert not (store.directory / "eliminados" / f"{unseen.id}.json").exists()
+    assert not (store.directory / f"{unseen.id}.json").exists()

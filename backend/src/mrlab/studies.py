@@ -42,6 +42,14 @@ Precisiones de la implementación (decisiones de la fase 2 sobre estudios; ver D
   con la demo de la fase 1): esas ejecuciones quedan en ``test_runs`` con ``source =
   "run_config"`` y, si alguna es de otra configuración, el estudio nace contaminado. Así un
   estudio nuevo nunca «lava» un historial existente.
+- ``create`` también importa las ejecuciones de la prueba de OTROS estudios (incluidos los
+  eliminados) del mismo par (mismas series A y B, en cualquier orden, sin distinguir mayúsculas)
+  cuyo periodo de prueba se solapa con el del estudio nuevo, con ``source = "otro_estudio"``. Si
+  alguna es de otra configuración, el estudio nace contaminado: crear un estudio nuevo (o borrar
+  el anterior y volver a crearlo) con umbrales ajustados después de ver la prueba no «lava» la
+  marca. Con la misma configuración (mismo hash) no hay contaminación.
+- ``delete`` de un estudio con ejecuciones propias de la prueba lo quita de la lista pero conserva
+  su registro en ``<studies_dir>/eliminados/`` (solo para la regla anterior); los demás se borran.
 - ``update_config`` rechaza cambiar ``analysis.split`` (``DIVISION_CONGELADA``): la división
   está congelada en ``frozen_split`` y cambiarla no tendría efecto. Un cambio sin diferencias no
   se registra.
@@ -86,8 +94,10 @@ logger = logging.getLogger("mrlab.studies")
 
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _SUFFIX = ".json"
+#: Subcarpeta con el registro de los estudios eliminados cuya prueba ya se vio.
+DELETED_DIR = "eliminados"
 
-TestRunSource = Literal["prueba", "exportacion", "run_config"]
+TestRunSource = Literal["prueba", "exportacion", "run_config", "otro_estudio"]
 
 #: Regla de la prueba (para la interfaz y la API).
 STUDY_RULE_NOTE = (
@@ -99,6 +109,8 @@ STUDY_RULE_NOTE = (
 
 
 class StudyChange(BaseModel):
+    """Cambio de configuración registrado en un estudio."""
+
     at: datetime = Field(description="Fecha y hora del cambio (UTC)")
     fields: list[str] = Field(description="Campos modificados (p. ej. strategy.entry_z)")
     hash_before: str = Field(description="Hash de la configuración guardada antes del cambio")
@@ -114,31 +126,58 @@ class StudyChange(BaseModel):
 
 
 class StudyTestRun(BaseModel):
+    """Ejecución registrada de la prueba fuera de muestra."""
+
     at: datetime = Field(description="Fecha y hora de la ejecución (UTC)")
     config_hash: str = Field(description="Hash de la configuración con la que se ejecutó")
     source: TestRunSource = Field(
         "prueba",
         description=(
             "prueba: ejecución pedida; exportacion: ejecución al exportar con una configuración "
-            "nueva; run_config: ejecución anterior importada del test_history del run_config.json"
+            "nueva; run_config: ejecución anterior importada del test_history del run_config.json; "
+            "otro_estudio: ejecución de otro estudio del mismo par con un periodo de prueba que "
+            "se solapa"
         ),
+    )
+    study_id: str | None = Field(
+        None, description="Estudio donde se ejecutó (solo para source = otro_estudio)"
     )
 
 
 class Study(BaseModel):
-    id: str
-    name: str
-    created_at: datetime
-    updated_at: datetime
-    config: RunConfig
-    test_runs: list[StudyTestRun] = Field(default_factory=list)
-    changes: list[StudyChange] = Field(default_factory=list)
-    contaminated: bool = False
-    contamination_reason: str | None = None
+    id: str = Field(description="Identificador del estudio (32 caracteres hexadecimales)")
+    name: str = Field(description="Nombre del estudio")
+    created_at: datetime = Field(description="Creación (UTC)")
+    updated_at: datetime = Field(description="Última modificación (UTC)")
+    config: RunConfig = Field(
+        description=(
+            "Configuración congelada: instantáneas de datos y fechas de corte fijas; los "
+            "parámetros solo cambian con PUT /api/studies/{id}/config (y quedan registrados)"
+        )
+    )
+    test_runs: list[StudyTestRun] = Field(
+        default_factory=list, description="Ejecuciones registradas de la prueba"
+    )
+    changes: list[StudyChange] = Field(
+        default_factory=list, description="Cambios de configuración registrados"
+    )
+    contaminated: bool = Field(
+        False, description="True si la prueba está contaminada (marca permanente)"
+    )
+    contamination_reason: str | None = Field(
+        None, description="Motivo de la contaminación, en español"
+    )
 
     @property
     def test_viewed(self) -> bool:
+        """True si la prueba de este par y periodo ya se vio (aquí, en otro estudio o según el
+        historial del run_config.json)."""
         return bool(self.test_runs)
+
+    @property
+    def test_run_here(self) -> bool:
+        """True si la prueba se ejecutó en ESTE estudio (pedida o al exportar)."""
+        return any(r.source in ("prueba", "exportacion") for r in self.test_runs)
 
     @property
     def symbols(self) -> tuple[str, str]:
@@ -203,6 +242,28 @@ def _not_found(study_id: Any) -> DataError:
         code="ESTUDIO_NO_ENCONTRADO",
         details={"study_id": shown},
     )
+
+
+def _pair_key(config: RunConfig) -> frozenset[tuple[str, str]]:
+    """Identidad del par analizado (series A y B, en cualquier orden)."""
+    return frozenset(
+        (ref.provider.strip().lower(), ref.symbol.strip().upper())
+        for ref in (config.pair.a, config.pair.b)
+    )
+
+
+def _test_overlaps(x: RunConfig, y: RunConfig) -> bool:
+    sx, sy = x.frozen_split, y.frozen_split
+    if sx is None or sy is None:
+        return False
+    if None in (sx.test_start, sx.test_end, sy.test_start, sy.test_end):
+        return False
+    return sx.test_start <= sy.test_end and sy.test_start <= sx.test_end  # type: ignore[operator]
+
+
+def _config_fixed_at(study: Study) -> datetime:
+    """Momento en que se fijó la configuración actual (creación o último cambio)."""
+    return study.changes[-1].at if study.changes else study.created_at
 
 
 _locks: dict[tuple[str, str], threading.RLock] = {}
@@ -306,12 +367,126 @@ class StudyStore:
         return sorted(studies, key=lambda s: (s.created_at, s.id), reverse=True)
 
     def delete(self, study_id: str) -> None:
+        """Quita el estudio. Si su prueba ya se vio, su registro pasa a ``eliminados/``."""
         path = self._path(study_id)
         with self._study_lock(study_id), self._files_lock:
+            try:
+                study = self._read(path, study_id)
+            except DataError as exc:
+                if exc.code != "ESTUDIO_CORRUPTO":
+                    raise
+                study = None
+            # Solo hace falta conservar las ejecuciones PROPIAS (las copiadas de otros estudios
+            # siguen en su estudio de origen).
+            own = study is not None and any(r.source != "otro_estudio" for r in study.test_runs)
+            if own:
+                trash = self.directory / DELETED_DIR
+                trash.mkdir(parents=True, exist_ok=True)
+                os.replace(path, trash / path.name)
+                return
             try:
                 path.unlink()
             except FileNotFoundError:
                 raise _not_found(study_id) from None
+
+    # ------------------------------------------------------------------ otros estudios
+
+    def _study_files(self) -> Iterator[tuple[Path, str]]:
+        for folder in (self.directory, self.directory / DELETED_DIR):
+            if not folder.is_dir():
+                continue
+            for path in sorted(folder.glob(f"*{_SUFFIX}")):
+                study_id = path.name[: -len(_SUFFIX)]
+                if _ID_RE.fullmatch(study_id):
+                    yield path, study_id
+
+    def _foreign_runs(self, study: Study, until: datetime) -> list[StudyTestRun]:
+        """Ejecuciones de la prueba de OTROS estudios (también eliminados) del mismo par con un
+        periodo de prueba que se solapa, ocurridas hasta ``until``."""
+        key = _pair_key(study.config)
+        runs: list[StudyTestRun] = []
+        with self._files_lock:
+            for path, other_id in self._study_files():
+                if other_id == study.id:
+                    continue
+                try:
+                    other = self._read(path, other_id)
+                except DataError:
+                    continue
+                if not other.test_runs or _pair_key(other.config) != key:
+                    continue
+                if not _test_overlaps(other.config, study.config):
+                    continue
+                runs += [
+                    StudyTestRun(
+                        at=run.at,
+                        config_hash=run.config_hash,
+                        source="otro_estudio",
+                        study_id=other.id,
+                    )
+                    for run in other.test_runs
+                    # Las copias de otros estudios ya se leen en su estudio de origen.
+                    if run.source != "otro_estudio" and run.at <= until
+                ]
+        return runs
+
+    def _sync_foreign_runs(self, study: Study, until: datetime) -> bool:
+        """Añade a ``study.test_runs`` las ejecuciones ajenas que aún no tenía. True si añadió."""
+        known = {
+            (r.study_id, r.config_hash, r.at) for r in study.test_runs if r.source == "otro_estudio"
+        }
+        new = [
+            r
+            for r in self._foreign_runs(study, until)
+            if (r.study_id, r.config_hash, r.at) not in known
+        ]
+        study.test_runs.extend(sorted(new, key=lambda r: r.at))
+        return bool(new)
+
+    def _mark_other_config(self, study: Study, current: str, now: datetime) -> None:
+        """Contamina si alguna ejecución registrada usó otra configuración (con su motivo)."""
+        if study.contaminated:
+            return
+        differing = [r for r in study.test_runs if r.config_hash != current]
+        if not differing:
+            return
+        study.contaminated = True
+        foreign = next((r for r in differing if r.source == "otro_estudio"), None)
+        imported = any(r.source == "run_config" for r in differing)
+        if imported:
+            study.contamination_reason = (
+                "La configuración con la que se creó el estudio ya registraba ejecuciones de la "
+                "prueba con otra configuración (historial del run_config.json): la prueba ya se "
+                "había visto antes de congelar estos parámetros."
+            )
+        elif foreign is not None:
+            other_name = self._name_of(foreign.study_id)
+            study.contamination_reason = (
+                f"La prueba de este mismo par, en un periodo que se solapa, ya se había visto en "
+                f"el estudio {other_name} el {_date_text(foreign.at)} con otra configuración: "
+                "los parámetros de este estudio se fijaron después de verla, así que sus "
+                "resultados de prueba no son una evaluación fuera de muestra."
+            )
+        else:
+            study.contamination_reason = (
+                f"La prueba se volvió a ejecutar el {_date_text(now)} con una configuración "
+                f"distinta (hash {current[:12]}…) de la que ya se había evaluado: los "
+                "resultados de la prueba ya no son una evaluación fuera de muestra."
+            )
+
+    def _name_of(self, study_id: str | None) -> str:
+        if study_id is None:
+            return "(desconocido)"
+        for folder in (self.directory, self.directory / DELETED_DIR):
+            path = folder / f"{study_id}{_SUFFIX}"
+            if path.is_file():
+                try:
+                    other = self._read(path, study_id)
+                except DataError:
+                    break
+                deleted = " (eliminado)" if folder.name == DELETED_DIR else ""
+                return f"«{other.name}» ({study_id}){deleted}"
+        return f"({study_id})"
 
     def create(self, config: RunConfig, data: DataService, name: str = "") -> Study:
         if config.include_test:
@@ -336,15 +511,10 @@ class StudyStore:
             config=frozen,
             test_runs=[StudyTestRun(at=now, config_hash=h, source="run_config") for h in imported],
         )
-        current = hash_with_test(frozen)
-        if any(h != current for h in imported):
-            study.contaminated = True
-            study.contamination_reason = (
-                "La configuración con la que se creó el estudio ya registraba ejecuciones de la "
-                "prueba con otra configuración (historial del run_config.json): la prueba ya se "
-                "había visto antes de congelar estos parámetros."
-            )
-        self._write(study)
+        with self._files_lock:
+            self._sync_foreign_runs(study, now)
+            self._mark_other_config(study, hash_with_test(frozen), now)
+            self._write(study)
         return study
 
     def update_config(
@@ -358,7 +528,9 @@ class StudyStore:
         with self._study_lock(study_id):
             study = self.get(study_id)
             old = study.config
-            if analysis is not None and analysis.split != old.analysis.split:
+            if analysis is not None and (
+                analysis.split.model_dump() != old.analysis.split.model_dump()
+            ):
                 raise ConfigError(
                     "La división formación/validación/prueba de un estudio está congelada (sus "
                     "fechas de corte se fijaron al crearlo) y no se puede cambiar. Para otra "
@@ -380,6 +552,8 @@ class StudyStore:
             if not fields and hash_before == hash_after:
                 return study
             now = _now()
+            # Una prueba del mismo par vista en otro estudio antes de este cambio también cuenta.
+            self._sync_foreign_runs(study, now)
             after_test = study.test_viewed
             study.changes.append(
                 StudyChange(
@@ -453,19 +627,17 @@ class StudyStore:
             raise self._not_testable(result)
         current = result.config.config_hash
         assert current is not None
-        recorded = {r.config_hash for r in study.test_runs}
         now = _now()
-        if source == "prueba" or current not in recorded:
-            if recorded and any(h != current for h in recorded) and not study.contaminated:
-                study.contaminated = True
-                study.contamination_reason = (
-                    f"La prueba se volvió a ejecutar el {_date_text(now)} con una configuración "
-                    f"distinta (hash {current[:12]}…) de la que ya se había evaluado: los "
-                    "resultados de la prueba ya no son una evaluación fuera de muestra."
-                )
-            study.test_runs.append(StudyTestRun(at=now, config_hash=current, source=source))
-            study.updated_at = now
-            self._write(study)
+        with self._files_lock:
+            # Ejecuciones de otros estudios del mismo par vistas ANTES de fijar esta configuración.
+            synced = self._sync_foreign_runs(study, _config_fixed_at(study))
+            recorded = {r.config_hash for r in study.test_runs}
+            if source == "prueba" or current not in recorded or synced:
+                self._mark_other_config(study, current, now)
+                if source == "prueba" or current not in recorded:
+                    study.test_runs.append(StudyTestRun(at=now, config_hash=current, source=source))
+                study.updated_at = now
+                self._write(study)
         if result.test_contaminated and not study.contaminated:
             # Defensa: el historial del runner detectó otra configuración que el registro no
             # había marcado (no debería ocurrir; se registra igual para no perderlo).
@@ -501,13 +673,22 @@ class StudyStore:
 # --------------------------------------------------------------------------- textos
 
 
+def _times(study: Study, once: str) -> str:
+    """«1 vez», «3 veces» o «2 veces (1 en otro estudio del mismo par)»."""
+    n = len(study.test_runs)
+    text = once if n == 1 else f"{n} veces"
+    foreign = sum(r.source == "otro_estudio" for r in study.test_runs)
+    if foreign:
+        text += f" ({foreign} en otro estudio del mismo par)" if n > 1 else " (en otro estudio)"
+    return text
+
+
 def contamination_note(study: Study, *, included: bool = True) -> str:
     """Origen y motivo de la marca, para la exportación (línea «Prueba contaminada: …»).
 
     ``included`` = la exportación incluye el segmento de prueba."""
     where = f"según el registro persistente del estudio «{study.name}» ({study.id})"
-    n = len(study.test_runs)
-    times = "1 vez" if n == 1 else f"{n} veces"
+    times = _times(study, "1 vez")
     reason = study.contamination_reason or "La configuración cambió después de ver la prueba."
     if not included:
         if not study.test_viewed:
@@ -536,8 +717,7 @@ def contamination_text(study: Study) -> str:
             "La prueba aún no se ha ejecutado. Al ejecutarla quedará registrada; si después "
             "cambias cualquier parámetro, el estudio quedará marcado como «prueba contaminada»."
         )
-    n = len(study.test_runs)
-    times = "una vez" if n == 1 else f"{n} veces"
+    times = _times(study, "una vez")
     return (
         f"Prueba no contaminada: se ejecutó {times}, siempre con la configuración congelada, y la "
         "configuración no se cambió después de verla. Si cambias cualquier parámetro ahora, el "

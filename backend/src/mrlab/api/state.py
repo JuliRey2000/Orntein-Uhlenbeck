@@ -26,7 +26,9 @@ class AppState:
 
 def build_state(settings: Settings, registry: ProviderRegistry | None = None) -> AppState:
     """Construye el estado. ``registry`` permite inyectar proveedores falsos en pruebas."""
-    registry = registry or ProviderRegistry.from_toml(settings.providers_file)
+    # Con ``settings``: los proveedores toman SUS valores (carpeta de subidas, reintentos de
+    # Yahoo), no los del entorno. Construirlos no usa la red ni crea carpetas.
+    registry = registry or ProviderRegistry.from_toml(settings.providers_file, settings=settings)
     cache = SnapshotCache(settings.cache_dir)
     return AppState(
         settings=settings,

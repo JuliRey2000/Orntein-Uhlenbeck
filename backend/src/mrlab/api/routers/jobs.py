@@ -15,7 +15,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Path
 from pydantic import ConfigDict
 
-from mrlab.api.errors import json_safe
+from mrlab.api.errors import json_safe, redact_paths, server_path_replacements
 from mrlab.api.jobs import Job, JobSummary
 from mrlab.api.openapi_models import describe
 from mrlab.api.schemas import ERROR_RESPONSES, ErrorResponse
@@ -60,10 +60,12 @@ class JobSummaryOut(JobSummary):
 JOB_ID = Path(..., min_length=1, max_length=64, description="Identificador del trabajo.")
 
 
-def _out(job: Job) -> JobOut:
+def _out(job: Job, state: AppState) -> JobOut:
     data = job.model_dump()
-    data["result"] = json_safe(data.get("result"))
-    data["error"] = json_safe(data.get("error"))
+    paths = server_path_replacements(state.settings)  # nunca rutas locales del servidor
+    data["result"] = redact_paths(json_safe(data.get("result")), paths)
+    data["error"] = redact_paths(json_safe(data.get("error")), paths)
+    data["message"] = redact_paths(data.get("message"), paths)
     return JobOut(**data)
 
 
@@ -76,7 +78,16 @@ def _out(job: Job) -> JobOut:
     responses={500: ERROR_RESPONSES[500]},
 )
 def list_jobs(state: AppState = Depends(get_state)) -> list[JobSummary]:
-    return state.jobs.list()
+    paths = server_path_replacements(state.settings)
+    return [
+        job.model_copy(
+            update={
+                "message": redact_paths(job.message, paths),
+                "error": redact_paths(json_safe(job.error), paths),
+            }
+        )
+        for job in state.jobs.list()
+    ]
 
 
 @router.get(
@@ -88,10 +99,10 @@ def list_jobs(state: AppState = Depends(get_state)) -> list[JobSummary]:
         "Consulta periódicamente esta ruta para mostrar el progreso."
     ),
     response_description=OK,
-    responses={404: ERROR_RESPONSES[404], 500: ERROR_RESPONSES[500]},
+    responses={404: ERROR_RESPONSES[404], 422: ERROR_RESPONSES[422], 500: ERROR_RESPONSES[500]},
 )
 def get_job(job_id: str = JOB_ID, state: AppState = Depends(get_state)) -> JobOut:
-    return _out(state.jobs.get(job_id))
+    return _out(state.jobs.get(job_id), state)
 
 
 @router.delete(
@@ -107,6 +118,7 @@ def get_job(job_id: str = JOB_ID, state: AppState = Depends(get_state)) -> JobOu
     responses={
         404: ERROR_RESPONSES[404],
         409: {"model": ErrorResponse, "description": "El trabajo ya terminó"},
+        422: ERROR_RESPONSES[422],
         500: ERROR_RESPONSES[500],
     },
 )
@@ -120,7 +132,7 @@ def cancel_job(job_id: str = JOB_ID, state: AppState = Depends(get_state)) -> Jo
             status_code=409,
             detail={"code": exc.code, "message": exc.message, "details": json_safe(exc.details)},
         ) from exc
-    out = _out(job)
+    out = _out(job, state)
     if job.cancel_requested and job.status in ("pendiente", "en_curso"):
         out = out.model_copy(update={"message": CANCEL_REQUESTED_MESSAGE})
     return out
