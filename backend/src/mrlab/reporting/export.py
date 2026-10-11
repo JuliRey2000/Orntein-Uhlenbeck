@@ -35,7 +35,10 @@ Precisiones de la implementación:
   la prueba no se ejecutó», con una nota sobre el alcance del historial (el
   registro persistente de estudios llega en la fase 2). ``pruebas_estadisticas.csv``
   lo repite en la sección ``prueba`` (solicitada, ejecutada, contaminada,
-  configuraciones_en_historial).
+  configuraciones_en_historial). Si el resultado viene de un estudio (fase 2,
+  ``RunResult.test_contamination_note``), la marca y su motivo salen del registro
+  persistente del estudio (línea «Prueba contaminada: SÍ/no — …» y fila
+  ``registro_estudio``).
 - Un segmento que no se pudo simular (``RunResult.segment_errors``) figura en
   SEGMENTOS con su causa.
 """
@@ -168,6 +171,15 @@ TEST_HISTORY_NOTE = (
 )
 #: Valor de ``contaminada`` en ``pruebas_estadisticas.csv``.
 _CONTAMINATED_CELL = {True: "sí", False: "no", None: "no aplica"}
+#: Marca del LEEME cuando la decide el registro persistente de un estudio (fase 2).
+_STUDY_CONTAMINATED_WORD = {True: "SÍ", False: "no", None: "no aplica"}
+STUDY_REGISTRY_NOTE = (
+    "  Alcance: esta marca la decide el registro persistente del estudio en el laboratorio "
+    "(carpeta data/studies/), que conserva cada ejecución de la prueba y cada cambio de "
+    "configuración y sobrevive a reinicios. El historial de run_config.json incluye además las "
+    "configuraciones a las que se cambió después de ver la prueba, para que la marca se conserve "
+    "al reproducir este archivo fuera del estudio."
+)
 
 #: Nombres en español de los campos de los modelos exportados en ``pruebas_estadisticas.csv``.
 FIELD_NAMES_ES = {
@@ -423,6 +435,11 @@ def _stats_rows(result: RunResult) -> list[tuple[str, str, str, Any]]:
             ("ejecutada", Segment.TEST in result.backtests),
             ("contaminada", _CONTAMINATED_CELL[_contaminated(result)]),
             ("configuraciones_en_historial", len(result.config.test_history)),
+            *(
+                [("registro_estudio", result.test_contamination_note)]
+                if result.test_contamination_note
+                else []
+            ),
         ],
     )
 
@@ -633,6 +650,16 @@ def _contaminated(result: RunResult) -> bool | None:
     return None if flag is None else bool(flag)
 
 
+def _contamination_lines(result: RunResult) -> list[str]:
+    """«Prueba contaminada: …» y su alcance. Con ``test_contamination_note`` (registro
+    persistente de un estudio) la marca y su motivo salen de ese registro."""
+    flag = _contaminated(result)
+    note = result.test_contamination_note
+    if not note:
+        return [f"Prueba contaminada: {TEST_CONTAMINATED_TEXT[flag]}", TEST_HISTORY_NOTE]
+    return [f"Prueba contaminada: {_STUDY_CONTAMINATED_WORD[flag]} — {note}", STUDY_REGISTRY_NOTE]
+
+
 def _lower_first(text: str) -> str:
     return text[:1].lower() + text[1:]
 
@@ -689,8 +716,7 @@ def readme_txt(result: RunResult, excel_es: bool = False) -> str:
         "",
         "SEGMENTOS (fechas de corte congeladas en run_config.json)",
         *_segment_lines(result),
-        f"Prueba contaminada: {TEST_CONTAMINATED_TEXT[_contaminated(result)]}",
-        TEST_HISTORY_NOTE,
+        *_contamination_lines(result),
         "",
     ]
     bt = next(iter(result.backtests.values()), None)

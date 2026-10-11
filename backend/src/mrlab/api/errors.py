@@ -70,8 +70,19 @@ def error_payload(code: str, message: str, details: dict[str, Any] | None = None
     return {"error": {"code": code, "message": message, "details": details or {}}}
 
 
+class RequestValueError(ValueError):
+    """``ValueError`` cuyo mensaje (en español) se muestra tal cual al usuario.
+
+    Los validadores de los modelos de petición de la API lo lanzan para que el resumen del 422
+    muestre su texto (en lugar de un genérico «valor no válido»)."""
+
+
+def json_safe(value: Any) -> Any:
+    """Convierte ``details`` en algo serializable (fechas, enums, numpy…); NaN/±inf → None."""
+    return _json_safe(value)
+
+
 def _json_safe(value: Any) -> Any:
-    """Convierte ``details`` en algo serializable (fechas, enums, numpy…)."""
     if value is None or isinstance(value, (bool, int, str)):
         return value
     if isinstance(value, float):
@@ -120,12 +131,51 @@ _PYDANTIC_REASONS: dict[str, str] = {
     "value_error": "valor no válido",
     "assertion_error": "valor no válido",
     "uuid_parsing": "identificador no válido",
+    "uuid_type": "identificador no válido",
+    "model_attributes_type": "debe ser un objeto JSON con campos ({…})",
+    "string_pattern_mismatch": "el texto no tiene el formato esperado",
+    "string_unicode": "el texto no es Unicode válido",
+    "bytes_type": "debe ser un texto o un archivo",
+    "int_too_big": "el número es demasiado grande",
+    "multiple_of": "no es un múltiplo válido",
+    "date_from_datetime_inexact": "fecha inválida: indica solo el día (AAAA-MM-DD), sin hora",
+    "datetime_type": "fecha y hora inválidas (formato ISO)",
+    "datetime_from_date_parsing": "fecha y hora inválidas (formato ISO)",
+    "time_parsing": "hora inválida (formato HH:MM)",
+    "timedelta_parsing": "duración inválida",
+    "date_past": "la fecha debe estar en el pasado",
+    "date_future": "la fecha debe estar en el futuro",
+    "tuple_type": "debe ser una lista",
+    "set_type": "debe ser una lista",
+    "frozen_set_type": "debe ser una lista",
+    "iterable_type": "debe ser una lista",
+    "mapping_type": "debe ser un objeto",
+    "none_required": "debe ser null",
+    "decimal_parsing": "debe ser un número",
+    "decimal_type": "debe ser un número",
+    "url_parsing": "dirección (URL) no válida",
+    "url_type": "dirección (URL) no válida",
+    "union_tag_invalid": "tipo de objeto no reconocido",
+    "union_tag_not_found": "falta el campo que indica el tipo de objeto",
+    "frozen_field": "este campo no se puede modificar",
+    "is_instance_of": "tipo de valor no válido",
 }
+
+#: Partes del parámetro ``loc`` que no son nombres de campo.
+_LOC_SOURCES = ("body", "query", "path", "header", "form", "cookie")
+
+
+BODY_LABEL = "(cuerpo de la petición)"
 
 
 def _field_path(loc: tuple[Any, ...] | list[Any]) -> str:
-    parts = [str(p) for p in loc if p not in ("body", "query", "path", "header", "form", "cookie")]
-    return ".".join(parts) if parts else "(cuerpo de la petición)"
+    parts = [str(p) for p in loc if p not in _LOC_SOURCES]
+    return ".".join(parts) if parts else BODY_LABEL
+
+
+def _expected_es(expected: Any) -> str:
+    """«'log' or 'precio'» (texto de pydantic) → «'log' o 'precio'»."""
+    return str(expected).replace(" or ", " o ")
 
 
 def _reason(err: dict[str, Any]) -> str:
@@ -143,21 +193,36 @@ def _reason(err: dict[str, Any]) -> str:
     if etype in ("enum", "literal_error"):
         expected = ctx.get("expected")
         return (
-            f"opción no permitida; valores válidos: {expected}"
+            f"opción no permitida; valores válidos: {_expected_es(expected)}"
             if expected
             else "opción no permitida"
         )
+    if etype == "json_invalid":
+        where = err.get("loc", ())
+        pos = where[1] if len(where) > 1 and isinstance(where[1], int) else None
+        near = f" (error cerca del carácter {pos})" if pos is not None else ""
+        return f"el cuerpo no es un JSON válido{near}"
     if etype == "too_short" and "min_length" in ctx:
         return f"debe tener al menos {ctx['min_length']} elemento(s)"
     if etype == "too_long" and "max_length" in ctx:
         return f"admite como máximo {ctx['max_length']} elemento(s)"
+    if etype == "string_too_short" and "min_length" in ctx:
+        return f"el texto debe tener al menos {ctx['min_length']} carácter(es)"
+    if etype == "string_too_long" and "max_length" in ctx:
+        return f"el texto admite como máximo {ctx['max_length']} carácter(es)"
     if etype in ("value_error", "assertion_error"):
-        # Los validadores del laboratorio lanzan LabError (en español) envuelto en ValueError.
+        # Los validadores lanzan RequestValueError o LabError (en español), a veces envuelto en
+        # un ValueError.
         original = ctx.get("error")
         if isinstance(original, LabError):
             return original.message
-        if original is not None and getattr(original, "args", None):
-            text = str(original.args[0])
+        args = getattr(original, "args", None) or ()
+        if args and isinstance(args[0], LabError):
+            return args[0].message
+        if isinstance(original, RequestValueError) and args:
+            return str(args[0])
+        if args:
+            text = str(args[0])
             if text and not text.isascii():  # probablemente ya en español
                 return text
     return _PYDANTIC_REASONS.get(etype, "valor no válido")
@@ -173,11 +238,17 @@ def _received(err: dict[str, Any]) -> Any:
     return text if len(text) <= _MAX_RECEIVED_CHARS else text[: _MAX_RECEIVED_CHARS - 1] + "…"
 
 
+def _error_field(err: dict[str, Any]) -> str:
+    if err.get("type") == "json_invalid":
+        return BODY_LABEL  # loc = ("body", posición): la posición no es un campo
+    return _field_path(err.get("loc", ()))
+
+
 def validation_summary(errors: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
     """(mensaje en español, detalles por campo) a partir de los errores de pydantic."""
     items = [
         {
-            "campo": _field_path(err.get("loc", ())),
+            "campo": _error_field(err),
             "motivo": _reason(err),
             "recibido": _received(err),
         }

@@ -108,6 +108,10 @@ class RunResult:
     test_contaminated: bool | None = None
     #: Segmentos que no se pudieron simular → mensaje del error (en español).
     segment_errors: dict[Segment, str] = field(default_factory=dict)
+    #: Origen y motivo de ``test_contaminated`` cuando lo decide un registro externo al
+    #: ``run_config.json`` (el registro persistente de estudios de la fase 2, ``mrlab.studies``).
+    #: None = la marca sale solo del historial del run_config.json (decisión S10a).
+    test_contamination_note: str | None = None
 
     @property
     def data_origin(self) -> DataOrigin:
@@ -152,6 +156,12 @@ def _load(ref: SeriesRef, data: DataService, role: str) -> PriceSeries:
             details={"rol": role},
         )
     return data.load(ref.provider, ref.symbol, start, end)
+
+
+def load_ref(ref: SeriesRef, data: DataService, role: str = "serie") -> PriceSeries:
+    """Carga una referencia como lo hace ``run_pair``: la instantánea fijada si trae
+    ``snapshot_id`` (sin red); si no, el proveedor (con caché) en [start, end]."""
+    return _load(ref, data, role)
 
 
 def _pinned(ref: SeriesRef, series: PriceSeries) -> SeriesRef:

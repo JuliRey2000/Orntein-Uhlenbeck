@@ -94,3 +94,8 @@ def series_factory():
 def d():
     """Atajo para fechas: d("2020-01-02")."""
     return lambda s: date.fromisoformat(s)
+
+
+# Fixtures de la API. Viven en api_support.py (no en tests/api/conftest.py) porque las carpetas de
+# pruebas no son paquetes y dos archivos «conftest» chocarían en sys.modules.
+from api_support import app, client, fake_yahoo, lab_settings, registry  # noqa: E402, F401

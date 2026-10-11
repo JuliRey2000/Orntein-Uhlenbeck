@@ -44,6 +44,13 @@ CONTRATO:
 - ``index.json`` es un catálogo reconstruible: si falta o está dañado se
   regenera leyendo los metadatos de los Parquet.
 - Funciona en Windows/macOS/Linux (pathlib; sin caracteres prohibidos en nombres).
+- Concurrencia (la API atiende peticiones en paralelo y ejecuta trabajos en hilos): un lock
+  reentrante por carpeta raíz, compartido por todas las instancias del proceso que apuntan a la
+  misma carpeta, protege ``put`` completo (comprobación, escritura del Parquet y del índice) y
+  toda lectura o reescritura de ``index.json``. Los Parquet y el índice se escriben en un temporal
+  único y se publican con ``os.replace`` (atómico): un lector nunca ve un archivo a medias. Dos
+  ``put`` simultáneos de la misma serie dan el mismo id y un solo archivo. No protege entre
+  procesos distintos (la API corre en un solo proceso).
 """
 
 from __future__ import annotations
@@ -87,14 +94,18 @@ _WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {
     f"{p}{i}" for p in ("COM", "LPT") for i in range(1, 10)
 }
 
-_locks: dict[str, threading.Lock] = {}
+_locks: dict[str, threading.RLock] = {}
 _locks_guard = threading.Lock()
 
 
-def _lock_for(root: Path) -> threading.Lock:
-    key = str(root.resolve())
+def _lock_for(root: Path) -> threading.RLock:
+    """Lock reentrante del proceso para una carpeta raíz (misma ruta resuelta → mismo lock)."""
+    key = os.path.normcase(str(root.resolve()))
     with _locks_guard:
-        return _locks.setdefault(key, threading.Lock())
+        lock = _locks.get(key)
+        if lock is None:
+            lock = _locks[key] = threading.RLock()
+        return lock
 
 
 def safe_symbol(symbol: str) -> str:
@@ -193,6 +204,8 @@ def _sort_key(entry: dict[str, Any]) -> tuple[str, str, str]:
 class SnapshotCache:
     def __init__(self, root: Path | str):
         self.root = Path(root)
+        # Se resuelve una vez: un cambio posterior del directorio de trabajo no cambia el lock.
+        self._lock = _lock_for(self.root)
 
     # ------------------------------------------------------------------ API
 
@@ -210,7 +223,7 @@ class SnapshotCache:
         sid = make_snapshot_id(meta, data)
         meta = meta.model_copy(update={"snapshot_id": sid})
         path = self._path_for(meta)
-        with _lock_for(self.root):
+        with self._lock:
             index = self._load_index()
             if path.exists():
                 try:
@@ -251,7 +264,7 @@ class SnapshotCache:
     def list(
         self, provider: str | None = None, symbol: str | None = None
     ) -> builtins.list[SeriesMeta]:
-        with _lock_for(self.root):
+        with self._lock:
             index = self._load_index()
         wanted = symbol.strip().upper() if symbol else None
         entries = [
@@ -292,7 +305,7 @@ class SnapshotCache:
     def _locate(self, snapshot_id: str) -> Path | None:
         if not _VALID_ID.match(snapshot_id or ""):
             return None  # nunca construir rutas con ids arbitrarios (p. ej. «../»)
-        with _lock_for(self.root):
+        with self._lock:
             entry = self._load_index().get(snapshot_id)
         if entry is not None:
             path = self.root / entry["path"]

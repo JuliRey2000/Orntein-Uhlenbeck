@@ -1,4 +1,4 @@
-"""Fixtures de la API: aplicación con directorios temporales y un proveedor «yahoo» falso, sin red.
+"""Soporte de pruebas de la API: app con directorios temporales y un proveedor «yahoo» falso, sin red.
 
 Símbolos del proveedor falso (precios deterministas, días hábiles desde 2016-01-04, 1.500 obs.):
 - KO / PEP: par cointegrado (spread OU con vida media ≈ 7 días).
