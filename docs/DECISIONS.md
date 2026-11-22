@@ -1570,3 +1570,20 @@ el responsable del proyecto.
   marcaba `cancel_requested` sobre un trabajo ya completado y el DELETE respondía
   200 en lugar de 409 `TRABAJO_YA_TERMINADO`.
 - **Fecha:** 2026-10-10
+
+### F23 — Revisión adversarial del manejo de errores de la API
+- **Decisión:** (1) las excepciones no previstas se convierten en el 500
+  `ERROR_INTERNO` en `UnexpectedErrorMiddleware`, añadido por dentro de
+  `CORSMiddleware`, para que la respuesta lleve `Access-Control-Allow-Origin`; el
+  `exception_handler(Exception)` queda como último recurso. (2) La sustitución de
+  rutas del servidor (F16) se aplica también a los 422 de validación y a los
+  `HTTPException` con `detail` estructurado. (3) En la ruta de un campo solo se
+  descarta el PRIMER elemento de `loc` cuando es el origen (`body`, `query`…): un
+  campo llamado `path` o `query` se conserva. (4) `format_number` agrupa los miles
+  también en números con decimales («12.345,5»).
+- **Alternativas:** dejar el manejador de Starlette (corre en
+  `ServerErrorMiddleware`, fuera de CORS).
+- **Justificación:** sin cabeceras CORS el navegador de la interfaz web (fase 3,
+  otro origen) bloquea el 500 y el usuario ve un «error de red» en lugar del
+  mensaje; los demás puntos eran incoherencias con F15 y F16.
+- **Fecha:** 2026-11-22
