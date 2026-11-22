@@ -453,6 +453,9 @@ def test_lab_error_status_table():
         (-1234567, "-1.234.567"),
         (2**63 - 1, "9.223.372.036.854.775.807"),
         (1e-5, "1e-05"),
+        (12345.5, "12.345,5"),
+        (-2520.25, "-2.520,25"),
+        (1234567.125, "1.234.567,125"),
         ("abc", "abc"),
         (True, "True"),
     ],
@@ -486,3 +489,72 @@ def test_json_safe_handles_numpy_and_non_finite():
 
     out = json_safe({"a": np.float64("nan"), "b": np.int64(3), "c": (1, np.inf), 4: "x"})
     assert out == {"a": None, "b": 3, "c": [1, None], "4": "x"}
+
+
+# --------------------------------------------------------------------------- revisión adversarial
+
+
+@pytest.mark.parametrize(
+    ("loc", "field"),
+    [
+        (("body", "data", "path"), "data.path"),
+        (("body", "pair", "a", "query"), "pair.a.query"),
+        (("query", "body"), "body"),
+        (("path", "job_id"), "job_id"),
+        (("body",), "(cuerpo de la petición)"),
+        (("body", "pairs", 0, "symbol"), "pairs.0.symbol"),
+    ],
+)
+def test_field_names_equal_to_a_source_are_kept(loc, field):
+    _, items = validation_summary([{"type": "missing", "loc": loc, "input": {}}])
+    assert items[0]["campo"] == field
+
+
+def test_unexpected_500_keeps_cors_headers(raising_client):
+    """El 500 lo ve la interfaz web (otro origen): sin cabeceras CORS el navegador lo bloquea."""
+    origin = "http://localhost:5173"
+    r = raising_client.get("/api/_prueba/interno", headers={"Origin": origin})
+    assert_error_format(r, 500, "ERROR_INTERNO")
+    assert r.headers.get("access-control-allow-origin") == origin
+    # Los demás errores también la llevan (ya lo hacían: corren dentro de CORS).
+    r = raising_client.get("/api/_prueba/dato", headers={"Origin": origin})
+    assert r.headers.get("access-control-allow-origin") == origin
+
+
+def test_server_paths_are_redacted_in_validation_and_http_errors(app, lab_settings):
+    from pydantic import BaseModel, field_validator
+
+    from mrlab.api.errors import RequestValueError
+
+    cache = str(lab_settings.cache_dir.resolve())
+
+    class Cuerpo(BaseModel):
+        x: int
+
+        @field_validator("x")
+        @classmethod
+        def _check(cls, v: int) -> int:
+            raise RequestValueError(f"no se pudo leer {cache}/a.parquet")
+
+    def con_cuerpo(body):  # pragma: no cover - el validador siempre falla
+        return {}
+
+    # Anotación real (no texto): con «from __future__ import annotations» FastAPI no resolvería
+    # un modelo local.
+    con_cuerpo.__annotations__ = {"body": Cuerpo}
+
+    def con_detalle():
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "CONFLICTO_PRUEBA", "message": f"Bloqueado en {cache}/lock"},
+        )
+
+    app.add_api_route("/api/_prueba/ruta_validacion", con_cuerpo, methods=["POST"])
+    app.add_api_route("/api/_prueba/ruta_http", con_detalle, methods=["GET"])
+    with TestClient(app, raise_server_exceptions=False) as c:
+        r = c.post("/api/_prueba/ruta_validacion", json={"x": 1})
+        err = assert_error_format(r, 422, "PETICION_INVALIDA")
+        assert cache not in r.text and "[caché del servidor]" in err["message"]
+        r = c.get("/api/_prueba/ruta_http")
+        err = assert_error_format(r, 409, "CONFLICTO_PRUEBA")
+        assert cache not in r.text and "[caché del servidor]" in err["message"]

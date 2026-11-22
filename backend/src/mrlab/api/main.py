@@ -19,7 +19,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from mrlab import DISCLAIMER, __version__
-from mrlab.api.errors import register_exception_handlers
+from mrlab.api.errors import UnexpectedErrorMiddleware, register_exception_handlers
 from mrlab.api.openapi_docs import install_openapi
 from mrlab.api.routers import (
     analysis,
@@ -103,6 +103,8 @@ def create_app(
         openapi_tags=TAGS,
     )
     app.state.lab = state
+    # Primero (queda por dentro de CORS): los 500 no previstos llevan las cabeceras CORS.
+    app.add_middleware(UnexpectedErrorMiddleware)
     origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,

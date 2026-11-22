@@ -227,8 +227,12 @@ BODY_LABEL = "(cuerpo de la petición)"
 
 
 def _field_path(loc: tuple[Any, ...] | list[Any]) -> str:
-    parts = [str(p) for p in loc if p not in _LOC_SOURCES]
-    return ".".join(parts) if parts else BODY_LABEL
+    # Solo el PRIMER elemento indica el origen («body», «query»…): un campo que se llame igual
+    # («data.path», un parámetro «query») es un nombre de campo y se conserva.
+    parts = list(loc)
+    if parts and parts[0] in _LOC_SOURCES:
+        parts = parts[1:]
+    return ".".join(str(p) for p in parts) if parts else BODY_LABEL
 
 
 def _expected_es(expected: Any) -> str:
@@ -249,7 +253,12 @@ def format_number(value: Any) -> str:
         if value.is_integer() and abs(value) < 1e15:
             value = int(value)
         else:
-            return repr(value).replace(".", ",")
+            text = repr(abs(value))
+            sign = "-" if value < 0 else ""
+            if "e" in text or "E" in text:  # notación científica: solo la coma decimal
+                return sign + text.replace(".", ",")
+            whole, _, frac = text.partition(".")
+            return sign + f"{int(whole):,}".replace(",", ".") + ("," + frac if frac else "")
     sign = "-" if value < 0 else ""
     return sign + f"{abs(value):,}".replace(",", ".")
 
@@ -392,15 +401,16 @@ def register_exception_handlers(app: FastAPI) -> None:
         )
 
     @app.exception_handler(RequestValidationError)
-    async def _validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+    async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
         message, items = validation_summary(list(exc.errors()))
+        # Los motivos pueden repetir el mensaje de un LabError (que a veces lleva una ruta).
+        payload = error_payload("PETICION_INVALIDA", message, {"campos": _json_safe(items)})
         return JSONResponse(
-            status_code=422,
-            content=error_payload("PETICION_INVALIDA", message, {"campos": _json_safe(items)}),
+            status_code=422, content=redact_paths(payload, _replacements_for(request))
         )
 
     @app.exception_handler(StarletteHTTPException)
-    async def _http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:
+    async def _http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
         detail = exc.detail
         if isinstance(detail, dict) and "code" in detail and "message" in detail:
             # Un router puede lanzar HTTPException(detail={"code", "message", "details"}).
@@ -412,16 +422,60 @@ def register_exception_handlers(app: FastAPI) -> None:
                 exc.status_code, ("ERROR_HTTP", f"Error HTTP {exc.status_code}.")
             )
             payload = error_payload(code, message)
-        return JSONResponse(status_code=exc.status_code, content=payload, headers=exc.headers)
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=redact_paths(payload, _replacements_for(request)),
+            headers=exc.headers,
+        )
 
     @app.exception_handler(Exception)
     async def _unexpected(request: Request, exc: Exception) -> JSONResponse:
+        # Último recurso (fuera de CORS): normalmente UnexpectedErrorMiddleware ya respondió.
         logger.exception("Error no controlado en %s %s", request.method, request.url.path)
-        return JSONResponse(
-            status_code=500,
-            content=error_payload(
-                "ERROR_INTERNO",
-                "Ocurrió un error interno inesperado. Si se repite, revisa los registros del "
-                "servidor e informa los pasos para reproducirlo.",
-            ),
-        )
+        return internal_error_response()
+
+
+INTERNAL_ERROR_MESSAGE = (
+    "Ocurrió un error interno inesperado. Si se repite, revisa los registros del servidor e "
+    "informa los pasos para reproducirlo."
+)
+
+
+def internal_error_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=500, content=error_payload("ERROR_INTERNO", INTERNAL_ERROR_MESSAGE)
+    )
+
+
+class UnexpectedErrorMiddleware:
+    """Convierte una excepción no prevista en el 500 ``ERROR_INTERNO`` DENTRO de CORS.
+
+    El manejador ``exception_handler(Exception)`` de Starlette corre en el middleware más
+    externo (``ServerErrorMiddleware``), por fuera de ``CORSMiddleware``: su respuesta sale sin
+    ``Access-Control-Allow-Origin`` y el navegador de la interfaz web (otro origen) la bloquea,
+    así que el usuario veía un «error de red» en lugar del mensaje. Este middleware se añade
+    ANTES que CORS (queda por dentro) para que el 500 lleve las cabeceras CORS. La excepción se
+    registra en el log; si la respuesta ya había empezado, se vuelve a lanzar."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = False
+
+        async def _send(message: Any) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive, _send)
+        except Exception:
+            if started:
+                raise
+            logger.exception("Error no controlado en %s %s", scope.get("method"), scope.get("path"))
+            await internal_error_response()(scope, receive, send)
